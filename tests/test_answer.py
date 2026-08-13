@@ -7,12 +7,16 @@ from raizuinu.handbook import HandbookLoader
 
 
 REAL_URL = "https://docs.google.com/document/d/abc123/edit"
+FREEE_URL = "https://www.freee.co.jp/kb/kb-accounting/entertainment-expenses/"
 
 
 def make_handbook(tmp_path):
     (tmp_path / "銀行明細取得.md").write_text("# 銀行明細取得\n手順\n", encoding="utf-8")
     (tmp_path / "マニュアルリンク集.md").write_text(
         f"# リンク集\n| 銀行明細取得 |  | {REAL_URL} |\n", encoding="utf-8"
+    )
+    (tmp_path / "会計基礎知識リンク集_freee.md").write_text(
+        f"# 会計リンク集\n| 交際費 | {FREEE_URL} |\n", encoding="utf-8"
     )
     return HandbookLoader([tmp_path], ["*.md"], [], 300).load()
 
@@ -189,9 +193,9 @@ class TestAnswerGenerator:
     def _general_knowledge_stage1(self):
         return {
             "intent": "general_knowledge",
-            "reference_url": REAL_URL,
+            "reference_url": FREEE_URL,
             "has_answer": False,
-            "answer": f"社内ハンドブックには記載がありません。参考記事: {REAL_URL}",
+            "answer": f"社内ハンドブックには記載がありません。参考記事: {FREEE_URL}",
             "sources": [],
             "suggested_file": "",
             "reported_manuals": [],
@@ -223,11 +227,11 @@ class TestAnswerGenerator:
         assert answer.has_answer
         assert "800万円" in answer.text
         assert answer.sources == [
-            {"file": "マニュアルリンク集.md", "heading": "", "url": REAL_URL}
+            {"file": "会計基礎知識リンク集_freee.md", "heading": "", "url": FREEE_URL}
         ]
         # 2段目にはweb_fetchツールが付き、URLがユーザーメッセージに入る
         assert client.kwargs["tools"][0]["type"] == "web_fetch_20260209"
-        assert REAL_URL in client.kwargs["messages"][0]["content"]
+        assert FREEE_URL in client.kwargs["messages"][0]["content"]
         assert answer.usage["input_tokens"] == 6000  # 両段の累積
 
     def test_general_knowledge_fetch_failure_falls_back_to_link(self, tmp_path):
@@ -241,14 +245,14 @@ class TestAnswerGenerator:
         gen = AnswerGenerator(config, client=client)
         answer = gen.generate("接待交際費の限度は？", handbook)
         assert not answer.has_answer  # 1段目の案内文のまま
-        assert REAL_URL in answer.text
+        assert FREEE_URL in answer.text
 
     def test_general_knowledge_disabled_skips_stage2(self, tmp_path):
         handbook = make_handbook(tmp_path)
         gen, client = make_generator(tmp_path, self._general_knowledge_stage1())
         answer = gen.generate("接待交際費の限度は？", handbook)  # 既定はweb_fetch無効
         assert client.calls == 1
-        assert REAL_URL in answer.text
+        assert FREEE_URL in answer.text
 
     def test_general_knowledge_fabricated_reference_url_skips_stage2(self, tmp_path):
         handbook = make_handbook(tmp_path)
@@ -295,6 +299,186 @@ class TestAnswerGenerator:
         gen = AnswerGenerator(config, client=FakeClient(response))
         answer = gen.generate("質問", handbook)
         assert answer.text == "最終回答"
+
+    def test_legal_knowledge_tool_loop(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["legal_enabled"] = True
+        config.data["body_url_allowlist"] = ["https://laws.e-gov.go.jp/"]
+
+        class FakeEgov:
+            def search(self, keyword):
+                return [{"law_id": "129AC0000000089", "law_title": "民法",
+                         "law_num": "明治二十九年法律第八十九号",
+                         "url": "https://laws.e-gov.go.jp/law/129AC0000000089", "snippets": []}]
+
+            def search_by_title(self, title):
+                return []
+
+            def get_article(self, law_id, article=None):
+                return {"law_title": "民法", "law_id": law_id, "article": article or "",
+                        "url": f"https://laws.e-gov.go.jp/law/{law_id}",
+                        "text": "第五百二十二条 契約は、申込みに対して相手方が承諾をしたときに成立する。"}
+
+        tool_use_response = SimpleNamespace(
+            stop_reason="tool_use",
+            content=[
+                SimpleNamespace(type="tool_use", id="tu_1", name="search_law",
+                                input={"keyword": "契約 成立"}),
+            ],
+            usage=SimpleNamespace(input_tokens=1000, output_tokens=50,
+                                  cache_creation_input_tokens=0, cache_read_input_tokens=0),
+        )
+        final_payload = {
+            "intent": "legal_knowledge",
+            "reference_url": "",
+            "has_answer": True,
+            "answer": "契約は承諾により成立します（民法第522条）。https://laws.e-gov.go.jp/law/129AC0000000089 ※e-Gov法令検索の条文に基づく一般的な情報です。",
+            "sources": [],
+            "suggested_file": "",
+            "reported_manuals": [],
+        }
+        client = FakeClient([tool_use_response, fake_response(final_payload)])
+        gen = AnswerGenerator(config, client=client, egov=FakeEgov())
+        answer = gen.generate("契約はいつ成立する？", handbook)
+
+        assert client.calls == 2
+        # ツール結果が2回目のリクエストに含まれる
+        tool_result_msg = client.kwargs["messages"][-1]
+        assert tool_result_msg["content"][0]["type"] == "tool_result"
+        assert "民法" in tool_result_msg["content"][0]["content"]
+        # legal_knowledgeはsources空でもhas_answer維持、e-Gov URLは除去されない
+        assert answer.has_answer
+        assert "laws.e-gov.go.jp" in answer.text
+
+    def test_general_knowledge_stage2_truncation_falls_back(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["web_fetch_enabled"] = True
+        config.data["web_fetch_allowed_domains"] = ["www.freee.co.jp"]
+        truncated = self._stage2_response("途中まで書かれた要約が突然")
+        truncated.stop_reason = "max_tokens"
+        client = FakeClient([fake_response(self._general_knowledge_stage1()), truncated])
+        gen = AnswerGenerator(config, client=client)
+        answer = gen.generate("接待交際費の限度は？", handbook)
+        # 途中切れの要約（免責文なし）は採用せず、URL案内文にフォールバック
+        assert not answer.has_answer
+        assert FREEE_URL in answer.text
+        assert "途中まで" not in answer.text
+
+    def test_general_knowledge_wrong_domain_skips_stage2(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["web_fetch_enabled"] = True
+        config.data["web_fetch_allowed_domains"] = ["www.freee.co.jp"]
+        payload = self._general_knowledge_stage1()
+        payload["reference_url"] = REAL_URL  # ハンドブックには実在するがfreee外ドメイン
+        client = FakeClient(fake_response(payload))
+        gen = AnswerGenerator(config, client=client)
+        gen.generate("質問", handbook)
+        assert client.calls == 1  # 取得できないドメインへの2段目は呼ばない
+
+    def test_general_knowledge_guidance_survives_downgrade(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["web_fetch_enabled"] = True
+        config.data["web_fetch_allowed_domains"] = ["www.freee.co.jp"]
+        payload = self._general_knowledge_stage1()
+        payload["has_answer"] = True  # モデルが原則から逸脱してtrueを返したケース
+        client = FakeClient([fake_response(payload), self._stage2_response("FETCH_FAILED")])
+        gen = AnswerGenerator(config, client=client)
+        answer = gen.generate("質問", handbook)
+        assert not answer.has_answer
+        assert FREEE_URL in answer.text  # URL案内文は定型失敗文に置き換えられない
+
+    def test_legal_intent_without_tool_use_is_downgraded(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["legal_enabled"] = True
+        payload = {
+            "intent": "legal_knowledge",
+            "reference_url": "",
+            "has_answer": True,
+            "answer": "民法第522条により契約は承諾で成立します（ツール未使用の断定）",
+            "sources": [],
+            "suggested_file": "",
+            "reported_manuals": [],
+        }
+
+        class NoopEgov:
+            pass
+
+        client = FakeClient(fake_response(payload))
+        gen = AnswerGenerator(config, client=client, egov=NoopEgov())
+        answer = gen.generate("契約はいつ成立する？", handbook)
+        # ツール未実行の法令回答はquestion扱いに降格→出典なしとして却下される
+        assert not answer.has_answer
+        assert "断定" not in answer.text
+
+    def test_tool_loop_exhaustion_returns_dedicated_error(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["legal_enabled"] = True
+
+        calls = {"count": 0}
+
+        class CountingEgov:
+            def search(self, keyword):
+                calls["count"] += 1
+                return [{"law_id": "129AC0000000089", "law_title": "民法",
+                         "law_num": "", "url": "https://laws.e-gov.go.jp/law/129AC0000000089",
+                         "snippets": []}]
+
+            def search_by_title(self, title):
+                return []
+
+        def tool_use_response():
+            return SimpleNamespace(
+                stop_reason="tool_use",
+                content=[SimpleNamespace(type="tool_use", id="tu", name="search_law",
+                                         input={"keyword": "x"})],
+                usage=SimpleNamespace(input_tokens=10, output_tokens=1,
+                                      cache_creation_input_tokens=0, cache_read_input_tokens=0),
+            )
+
+        client = FakeClient([tool_use_response() for _ in range(8)])
+        gen = AnswerGenerator(config, client=client, egov=CountingEgov())
+        answer = gen.generate("質問", handbook)
+        assert client.calls == 8
+        assert calls["count"] == 7  # 最終回は結果を送れないためツールを実行しない
+        assert not answer.has_answer
+        assert "上限" in answer.text
+
+    def test_truncated_url_fails_validation(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        gen, _ = make_generator(
+            tmp_path,
+            {
+                "has_answer": True,
+                "answer": "回答",
+                "sources": [{"file": "銀行明細取得.md", "heading": "",
+                             "url": REAL_URL[:-5]}],  # 実在URLの切り詰め
+                "suggested_file": "",
+            },
+        )
+        answer = gen.generate("質問", handbook)
+        assert answer.sources[0]["url"] == ""  # 部分一致では通さない（完全一致のみ）
+
+    def test_legal_tools_attached_when_enabled(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["legal_enabled"] = True
+
+        class NoopEgov:
+            pass
+
+        client = FakeClient(
+            fake_response({"has_answer": False, "answer": "-", "sources": [], "suggested_file": ""})
+        )
+        gen = AnswerGenerator(config, client=client, egov=NoopEgov())
+        gen.generate("質問", handbook)
+        names = [t["name"] for t in client.kwargs["tools"]]
+        assert names == ["search_law", "get_law_article"]
 
     def test_request_uses_cache_and_schema(self, tmp_path):
         handbook = make_handbook(tmp_path)

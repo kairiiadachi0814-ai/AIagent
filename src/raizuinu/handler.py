@@ -25,6 +25,7 @@ from .webhook import MentionEvent, SignatureError, parse_mention, verify_signatu
 
 FAILURE_MESSAGE = "処理に失敗しました。時間をおいてもう一度お試しください。"
 STOPPED_MESSAGE = "今月の利用上限に達したため、応答を停止しています。管理者にお問い合わせください。"
+BUSY_MESSAGE = "ただいま質問が混み合っています。少し時間をおいてもう一度お試しください。"
 
 _DEDUPE_MAX = 1000
 
@@ -66,6 +67,13 @@ class RaizuinuHandler:
         self._processed_ids: dict[str, None] = {}  # 挿入順を保つLRU代替
         self._dedupe_path = cfg.resolve_path(cfg.state_dir) / "processed_messages.json"
         self._load_dedupe()
+        # バースト時のコスト超過・スレッド枯渇を防ぐ（同時実行と滞留数を制限）
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._executor = ThreadPoolExecutor(
+            max_workers=int(cfg.webhook_max_concurrency), thread_name_prefix="raizuinu"
+        )
+        self._queue_slots = threading.Semaphore(int(cfg.webhook_max_queue))
 
     # --- エントリポイント ---
 
@@ -93,12 +101,18 @@ class RaizuinuHandler:
             return WebhookResult(200, "処理済みメッセージ")
 
         if self._config.webhook_async:
-            # daemon=Falseで通常終了時は処理完了を待つ。Cloud Runでは
-            # 「CPU always allocated」を有効にすること（README参照）。
-            thread = threading.Thread(
-                target=self._process_safely, args=(event,), daemon=False
-            )
-            thread.start()
+            if not self._queue_slots.acquire(blocking=False):
+                # 滞留上限超過。無言で捨てない（FR-06の趣旨）
+                try:
+                    self._chatwork.send_message(
+                        event.room_id,
+                        f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n"
+                        + BUSY_MESSAGE,
+                    )
+                except Exception:
+                    print("[warn] 混雑通知の送信に失敗", flush=True)
+                return WebhookResult(200, "滞留上限超過")
+            self._executor.submit(self._process_and_release, event)
             return WebhookResult(200, "受付（非同期処理中）")
         self._process_safely(event)
         return WebhookResult(200, "処理完了")
@@ -114,6 +128,12 @@ class RaizuinuHandler:
         }
 
     # --- 内部フロー ---
+
+    def _process_and_release(self, event: MentionEvent) -> None:
+        try:
+            self._process_safely(event)
+        finally:
+            self._queue_slots.release()
 
     def _process_safely(self, event: MentionEvent) -> None:
         try:
@@ -187,6 +207,16 @@ class RaizuinuHandler:
             raise RuntimeError(
                 "ハンドブックが1件も読み込めません。handbook.roots の設定を確認してください"
             )
+        # 生成直前に上限を再確認（コンテキスト取得の間に他リクエストが計上した分を反映）
+        status = self._cost.status()
+        if status.over_limit:
+            self._notify_stopped_once(status)
+            self._chatwork.send_message(
+                event.room_id,
+                f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n"
+                + STOPPED_MESSAGE,
+            )
+            return
         answer = self._generator.generate(question, handbook, context)
 
         # コストはAPI消費が確定した時点で計上する（送信失敗でも計上漏れさせない）

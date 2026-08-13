@@ -244,6 +244,18 @@ class TestHandleWebhook:
         handler.handle_webhook(body, sign(body))
         assert len(chatwork.sent) == 1  # 受領返信のみ（同室への二重通知はしない）
 
+    def test_queue_overflow_sends_busy_message(self, tmp_path, monkeypatch):
+        import threading
+
+        handler, chatwork, generator, _ = make_handler(tmp_path, monkeypatch)
+        handler._config.data["webhook_async"] = True
+        handler._queue_slots = threading.Semaphore(0)  # 滞留上限に達した状態を再現
+        body = payload(message_id="400001")
+        result = handler.handle_webhook(body, sign(body))
+        assert result.status == 200
+        assert generator.calls == []  # 処理はしない
+        assert any("混み合って" in sent[1] for sent in chatwork.sent)  # 無言で捨てない
+
     def test_stopped_notification_flag_only_on_success(self, tmp_path, monkeypatch):
         handler, chatwork, _, _ = make_handler(tmp_path, monkeypatch)
         handler._cost.add_usage({"output_tokens": 10_000_000_000})

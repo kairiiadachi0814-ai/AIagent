@@ -23,8 +23,8 @@ ANSWER_SCHEMA: dict[str, Any] = {
     "properties": {
         "intent": {
             "type": "string",
-            "enum": ["question", "manual_update_report", "general_knowledge"],
-            "description": "メッセージ種別。社内手順・ルールの質問=question／マニュアル更新の報告=manual_update_report／社内ルールではない一般的な会計・簿記・税務知識の質問=general_knowledge",
+            "enum": ["question", "manual_update_report", "general_knowledge", "legal_knowledge"],
+            "description": "メッセージ種別。社内手順・ルールの質問=question／マニュアル更新の報告=manual_update_report／一般的な会計・簿記・税務知識の質問=general_knowledge／法令・法律の知識に関する質問=legal_knowledge",
         },
         "reference_url": {
             "type": "string",
@@ -66,6 +66,46 @@ ANSWER_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+# e-Gov法令検索を叩くカスタムツール（実行はサーバー側 _execute_tool）
+LEGAL_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "search_law",
+        "description": (
+            "日本の法令（法律・政令・省令）をe-Gov法令検索で条文キーワード検索する。"
+            "法令・条文の特定に必ず使うこと。結果にはlaw_id・法令名・該当箇所の抜粋・"
+            "e-GovのURLが含まれる。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keyword": {
+                    "type": "string",
+                    "description": "検索キーワード（例: 下請代金 支払期日）",
+                }
+            },
+            "required": ["keyword"],
+        },
+    },
+    {
+        "name": "get_law_article",
+        "description": (
+            "law_idと条番号を指定して条文の原文を取得する（e-Gov法令検索）。"
+            "回答は必ずこの原文に基づくこと。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "law_id": {"type": "string", "description": "search_lawで得たlaw_id"},
+                "article": {
+                    "type": "string",
+                    "description": "条番号（例: '522'、'24条の5'。省略時は法令冒頭）",
+                },
+            },
+            "required": ["law_id"],
+        },
+    },
+]
+
 SYSTEM_INSTRUCTIONS = """あなたは株式会社ライズクリエイションの社内AIエージェント「{agent_name}」です。
 Chatworkで社員からの質問に、社内ハンドブック（経理・財務の業務手順書群）だけを根拠に日本語で回答します。
 
@@ -78,7 +118,9 @@ Chatworkで社員からの質問に、社内ハンドブック（経理・財務
 6. 会話履歴は文脈理解の参考とし、回答の根拠にはしないこと。
 7. 関連する原本文書・スプレッドシート・フォルダのURLがハンドブック（特に「マニュアルリンク集」）に記載されている場合は、回答本文またはsourcesのurlに含めて案内すること。URLは一字一句正確に転記し、加工・短縮・推測してはならない。ハンドブックに記載のないURLを作らないこと。
 8. メッセージ種別の判定: 利用者が質問ではなく「マニュアル（原本）を更新した・変更した」と明確に報告している場合のみ、intentをmanual_update_reportとし、reported_manualsに対象マニュアル名を入れること。その場合answerには報告内容の短い受領確認文（1〜2文。対象マニュアル名を復唱）を書き、has_answerはfalse、sourcesは空とする。更新の仕方に関する質問や迷うケースはquestionとして扱うこと。
-9. 一般的な会計・簿記・税務知識の質問（社内の手順・ルールではないもの）への対応: intentをgeneral_knowledgeとし、「会計基礎知識リンク集」に該当する解説記事があればreference_urlにそのURLを一字一句正確に転記すること。answerには「社内ハンドブックには記載がありません。参考記事: <URL>」の趣旨の案内文（税理士確認の注意書き付き）を書く。詳細な要約はシステム側が記事を取得して別途行うため、自身の知識だけで数値や限度額を断定して書いてはならない。該当記事がリンク集にない場合はreference_urlを空にし「記載なし」の回答とする。"""
+9. 一般的な会計・簿記・税務知識の質問（社内の手順・ルールではないもの）への対応: intentをgeneral_knowledgeとし、「会計基礎知識リンク集」に該当する解説記事があればreference_urlにそのURLを一字一句正確に転記すること。answerには「社内ハンドブックには記載がありません。参考記事: <URL>」の趣旨の案内文（税理士確認の注意書き付き）を書く。詳細な要約はシステム側が記事を取得して別途行うため、自身の知識だけで数値や限度額を断定して書いてはならない。該当記事がリンク集にない場合はreference_urlを空にし「記載なし」の回答とする。
+10. 法令・法律の知識に関する質問（社内手順ではないもの）: intentをlegal_knowledgeとし、必ずsearch_lawツールで法令を特定し、get_law_articleツールで条文の原文を取得したうえで、その原文に基づいて回答すること。ツールを使わず記憶だけで条文の内容や条番号を断定してはならない。回答には法令名・条番号を明記し、ツール結果に含まれるURL（laws.e-gov.go.jp）をそのまま含める。回答の最後に必ず「※e-Gov法令検索の条文に基づく一般的な情報です。法的判断や契約書の内容確認は、顧問弁護士への相談またはLegalForceでのリーガルチェックを経てください。」を付ける。この場合sourcesは空でよい（出典は本文中の法令名・条番号・URLで示す）。has_answerは条文を取得できた場合にtrue。
+11. 契約書の作成・ひな形に関する相談: 「ひな形リンク集」から該当するひな形のURLを案内し、あわせて「作成した契約書は締結前に必ずLegalForceでリーガルチェックを行う」こと（手順はハンドブック「LegalForce_リーガルチェック」参照）を必ず案内する。契約条項の妥当性を自ら断定してはならない。"""
 
 
 @dataclass
@@ -97,16 +139,23 @@ class Answer:
 class AnswerGenerator:
     """Claude API呼び出しと出典検証。"""
 
-    def __init__(self, config: Config, client: Any | None = None) -> None:
+    def __init__(
+        self, config: Config, client: Any | None = None, egov: Any | None = None
+    ) -> None:
         self._config = config
         if client is None:
             import anthropic
 
             client = anthropic.Anthropic()
         self._client = client
+        if egov is None and config.legal_enabled:
+            from .egov import EgovClient
+
+            egov = EgovClient()
+        self._egov = egov
 
     def generate(self, question: str, handbook: Handbook, context: str = "") -> Answer:
-        response, usage = self._create_message(question, handbook, context)
+        response, usage, tool_used = self._create_message(question, handbook, context)
 
         if getattr(response, "stop_reason", None) == "refusal":
             return Answer(
@@ -121,6 +170,14 @@ class AnswerGenerator:
             return Answer(
                 has_answer=False,
                 text="回答の生成が長さ上限に達しました。質問を分けてもう一度お試しください。",
+                usage=usage,
+            )
+
+        if getattr(response, "stop_reason", None) in ("tool_use", "pause_turn"):
+            # ツール反復の上限に到達。中間出力を回答として扱わない
+            return Answer(
+                has_answer=False,
+                text="参照処理の反復が上限に達し、回答を確定できませんでした。質問を絞ってもう一度お試しください。",
                 usage=usage,
             )
 
@@ -139,7 +196,16 @@ class AnswerGenerator:
             )
 
         intent = str(data.get("intent", "question"))
-        if intent not in ("question", "manual_update_report", "general_knowledge"):
+        if intent not in (
+            "question",
+            "manual_update_report",
+            "general_knowledge",
+            "legal_knowledge",
+        ):
+            intent = "question"
+        if intent == "legal_knowledge" and not (self._config.legal_enabled and tool_used):
+            # 実際にe-Govツールを使っていない「法令回答」は根拠がないため
+            # 通常質問扱いに降格し、出典検証（FR-03）を必ず通す
             intent = "question"
         answer = Answer(
             has_answer=bool(data.get("has_answer")),
@@ -156,10 +222,12 @@ class AnswerGenerator:
 
     # --- 内部 ---
 
-    def _create_message(self, question: str, handbook: Handbook, context: str) -> "tuple[Any, dict[str, int]]":
-        """API呼び出し。サーバーツール使用時のpause_turn継続まで面倒を見る。
+    def _create_message(
+        self, question: str, handbook: Handbook, context: str
+    ) -> "tuple[Any, dict[str, int], bool]":
+        """API呼び出し。ツール継続まで面倒を見る。
 
-        戻り値は (最終レスポンス, 全リクエスト累積のusage)。
+        戻り値は (最終レスポンス, 全リクエスト累積のusage, カスタムツール実行有無)。
         """
         cfg = self._config
         system = [
@@ -190,6 +258,8 @@ class AnswerGenerator:
                 "format": {"type": "json_schema", "schema": ANSWER_SCHEMA},
             },
         }
+        if cfg.legal_enabled and self._egov is not None:
+            kwargs["tools"] = LEGAL_TOOLS
         if cfg.fallback_enabled:
             # 安全クラシファイアによる拒否時に別モデルで再実行される（Opus 5/Fable 5系）
             kwargs["betas"] = ["server-side-fallback-2026-07-01"]
@@ -197,7 +267,34 @@ class AnswerGenerator:
             create = self._client.beta.messages.create
         else:
             create = self._client.messages.create
-        return _call_with_continuation(create, kwargs, messages)
+        return _call_with_continuation(
+            create, kwargs, messages, tool_executor=self._execute_tool
+        )
+
+    def _execute_tool(self, name: str, tool_input: dict) -> str:
+        """カスタムツール（e-Gov法令検索）を実行し、結果をJSON文字列で返す。"""
+        from .egov import EgovError
+
+        try:
+            if name == "search_law" and self._egov is not None:
+                keyword = str(tool_input.get("keyword", "")).strip()
+                results = self._egov.search(keyword)
+                if not results:
+                    results = self._egov.search_by_title(keyword)
+                if not results:
+                    return "該当する法令が見つかりませんでした。キーワードを変えて再検索してください。"
+                return json.dumps(results, ensure_ascii=False)
+            if name == "get_law_article" and self._egov is not None:
+                result = self._egov.get_article(
+                    str(tool_input.get("law_id", "")),
+                    str(tool_input.get("article") or "") or None,
+                )
+                return json.dumps(result, ensure_ascii=False)
+            return f"エラー: 未知のツール {name}"
+        except EgovError as exc:
+            return f"エラー: {exc}"
+        except Exception as exc:  # ツール失敗で回答全体を落とさない
+            return f"エラー: 条文の取得に失敗しました（{exc}）"
 
     def _enrich_general_knowledge(
         self, answer: Answer, question: str, handbook: Handbook
@@ -206,13 +303,18 @@ class AnswerGenerator:
 
         取得に失敗した場合は1段目のURL案内文のまま返す（安全側）。
         """
+        from urllib.parse import urlparse
+
         cfg = self._config
         url = answer.reference_url
+        allowed_hosts = {d.lower() for d in cfg.web_fetch_allowed_domains}
+        host = (urlparse(url).hostname or "").lower() if url else ""
         if (
             answer.intent != "general_knowledge"
             or not cfg.web_fetch_enabled
-            or not cfg.web_fetch_allowed_domains
+            or not allowed_hosts
             or not url
+            or host not in allowed_hosts  # 取得できないドメインへの無駄な2段目を防ぐ
             or not _url_in_handbook(url, handbook)
         ):
             return answer
@@ -245,7 +347,7 @@ class AnswerGenerator:
         )
         kwargs: dict[str, Any] = {
             "model": cfg.model,
-            "max_tokens": 2048,
+            "max_tokens": 8192,  # 思考+本文の合計上限。小さいと途中切れする
             "system": system,
             "output_config": {"effort": "low"},
             "tools": [
@@ -260,9 +362,12 @@ class AnswerGenerator:
             ],
         }
         messages = [{"role": "user", "content": f"質問: {question}\n参考記事URL: {url}"}]
-        response, usage = _call_with_continuation(
+        response, usage, _ = _call_with_continuation(
             self._client.messages.create, kwargs, messages
         )
+        if getattr(response, "stop_reason", None) != "end_turn":
+            # max_tokens（途中切れ）・refusal等の要約は採用しない（免責文欠落の防止）
+            return "", usage
         text = next(
             (b.text for b in reversed(response.content) if getattr(b, "type", "") == "text"),
             "",
@@ -271,9 +376,9 @@ class AnswerGenerator:
             return "", usage
         return text, usage
 
-    @staticmethod
-    def _validate_citations(answer: Answer, handbook: Handbook) -> Answer:
+    def _validate_citations(self, answer: Answer, handbook: Handbook) -> Answer:
         """出典を実在ファイル・実在見出し・実在URLと突合する（出典の捏造防止・FR-03）。"""
+        allowlist = list(self._config.body_url_allowlist or [])
         headings_by_file = {f.name: set(f.headings) for f in handbook.files}
         valid: list[dict[str, str]] = []
         for src in answer.sources:
@@ -288,14 +393,22 @@ class AnswerGenerator:
                 url = ""  # ハンドブックに記載のないURLは出典に載せない（捏造防止）
             valid.append({"file": normalized, "heading": heading, "url": url})
         answer.sources = valid
-        answer.text = _scrub_body_urls(answer.text, handbook)
-        if answer.has_answer and not valid:
-            # 出典なしの回答は返さない（ガードレール1）
+        answer.text = _scrub_body_urls(answer.text, handbook, allowlist)
+        if answer.has_answer and not valid and answer.intent != "legal_knowledge":
+            # 出典なしの回答は返さない（ガードレール1）。
+            # legal_knowledgeはe-Govツール実行済みの場合のみ（generateで担保）例外とし、
+            # 出典は本文中の法令名・条番号・URLで示す
             answer.has_answer = False
-            answer.text = (
-                "ハンドブック内に確かな根拠を特定できませんでした。"
-                "担当者に直接ご確認いただくか、質問を具体的にしてもう一度お試しください。"
+            keep_guidance = (
+                answer.intent == "general_knowledge"
+                and answer.reference_url
+                and _url_in_handbook(answer.reference_url, handbook)
             )
+            if not keep_guidance:  # 参考URL案内文は破壊しない（2段目失敗時の受け皿）
+                answer.text = (
+                    "ハンドブック内に確かな根拠を特定できませんでした。"
+                    "担当者に直接ご確認いただくか、質問を具体的にしてもう一度お試しください。"
+                )
         return answer
 
 
@@ -304,30 +417,59 @@ def _accumulate_usage(total: dict[str, int], usage: dict[str, int]) -> None:
         total[key] = total.get(key, 0) + value
 
 
+_MAX_LOOP_STEPS = 8
+
+
 def _call_with_continuation(
-    create: Any, kwargs: dict[str, Any], messages: list[dict[str, Any]]
-) -> "tuple[Any, dict[str, int]]":
-    """API呼び出し。サーバーツールの反復上限（pause_turn）を最大3回まで自動継続する。"""
+    create: Any,
+    kwargs: dict[str, Any],
+    messages: list[dict[str, Any]],
+    tool_executor: Any | None = None,
+) -> "tuple[Any, dict[str, int], bool]":
+    """API呼び出しループ。戻り値は (最終レスポンス, 累積usage, ツール実行有無)。
+
+    - pause_turn（サーバーツールの反復上限）: そのまま再送して継続
+    - tool_use（カスタムツール）: tool_executorで実行し結果を返して継続
+    - 最終回では実行・継続せずに返す（結果を送れないツール実行をしない）
+    """
     usage_total: dict[str, int] = {}
     response = None
-    for _ in range(4):
+    tool_used = False
+    for attempt in range(_MAX_LOOP_STEPS):
         response = create(messages=messages, **kwargs)
         _accumulate_usage(usage_total, _usage_dict(response))
-        if getattr(response, "stop_reason", None) != "pause_turn":
-            break
-        messages = messages + [{"role": "assistant", "content": response.content}]
-    return response, usage_total
+        stop_reason = getattr(response, "stop_reason", None)
+        is_last = attempt == _MAX_LOOP_STEPS - 1
+        if stop_reason == "pause_turn" and not is_last:
+            messages = messages + [{"role": "assistant", "content": response.content}]
+            continue
+        if stop_reason == "tool_use" and tool_executor is not None and not is_last:
+            tool_results = []
+            for block in response.content:
+                if getattr(block, "type", "") == "tool_use":
+                    result = tool_executor(block.name, dict(block.input or {}))
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result,
+                        }
+                    )
+            if not tool_results:
+                break
+            tool_used = True
+            messages = messages + [
+                {"role": "assistant", "content": response.content},
+                {"role": "user", "content": tool_results},
+            ]
+            continue
+        break
+    return response, usage_total, tool_used
 
 
 def _find_url_file(url: str, handbook: Handbook) -> str | None:
     """URLが記載されているハンドブックファイル名を返す（出典表示用）。"""
-    candidates = {url, url.rstrip("/")}
-    if not url.endswith("/"):
-        candidates.add(url + "/")
-    for f in handbook.files:
-        if any(c in f.content for c in candidates):
-            return f.name
-    return None
+    return _handbook_url_map(handbook).get(url.rstrip("/"))
 
 
 def _usage_dict(response: Any) -> dict[str, int]:
@@ -350,18 +492,40 @@ def _usage_dict(response: Any) -> dict[str, int]:
 _URL_RE = re.compile(r"https?://[^\s<>\"」』】）\)。、！？]+")
 
 
+def _handbook_url_map(handbook: Handbook) -> dict[str, str]:
+    """ハンドブック本文から抽出したURL（末尾スラッシュ正規化）→ファイル名の対応表。
+
+    完全一致で照合するための集合（部分文字列一致だと切り詰めURLが通ってしまう）。
+    Handbookインスタンスにキャッシュする。
+    """
+    cached = getattr(handbook, "_url_map", None)
+    if cached is not None:
+        return cached
+    mapping: dict[str, str] = {}
+    for f in handbook.files:
+        for match in _URL_RE.finditer(f.content):
+            mapping.setdefault(match.group(0).rstrip("/"), f.name)
+    handbook._url_map = mapping  # type: ignore[attr-defined]
+    return mapping
+
+
 def _url_in_handbook(url: str, handbook: Handbook) -> bool:
-    candidates = {url, url.rstrip("/")}
-    if not url.endswith("/"):
-        candidates.add(url + "/")
-    return any(any(c in f.content for c in candidates) for f in handbook.files)
+    return url.rstrip("/") in _handbook_url_map(handbook)
 
 
-def _scrub_body_urls(text: str, handbook: Handbook) -> str:
-    """本文中のURLのうち、ハンドブックに記載のないものを除去する（捏造リンク対策）。"""
+def _scrub_body_urls(
+    text: str, handbook: Handbook, allowlist: list[str] | None = None
+) -> str:
+    """本文中のURLのうち、ハンドブック・許可リストのいずれにも無いものを除去する。
+
+    許可リスト（例: laws.e-gov.go.jp）はツール実行結果由来のURL向け。
+    """
+    allowlist = allowlist or []
 
     def repl(match: re.Match) -> str:
         url = match.group(0)
+        if any(url.startswith(prefix) for prefix in allowlist):
+            return url
         return url if _url_in_handbook(url, handbook) else "（URL省略）"
 
     return _URL_RE.sub(repl, text)
