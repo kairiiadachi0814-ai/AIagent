@@ -1,0 +1,10 @@
+.git/
+.claude/
+.gitignore
+tests/
+logs/
+state/
+docs/
+__pycache__/
+.pytest_cache/
+run_local.py

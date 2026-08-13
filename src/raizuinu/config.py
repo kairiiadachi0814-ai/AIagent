@@ -70,6 +70,14 @@ class Config:
             base_dir = config_path.resolve().parents[1]
         else:
             base_dir = Path.cwd()
+        # デプロイ環境向けの上書き（Cloud RunでGCSマウント先を指す等）
+        for env_name, key in (
+            ("RAIZUINU_STATE_DIR", "state_dir"),
+            ("RAIZUINU_AUDIT_LOG_DIR", "audit_log_dir"),
+        ):
+            value = os.environ.get(env_name)
+            if value:
+                merged[key] = value
         return cls(data=merged, base_dir=base_dir)
 
     def __getattr__(self, name: str) -> Any:
