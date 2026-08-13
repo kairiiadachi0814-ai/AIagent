@@ -186,18 +186,82 @@ class TestAnswerGenerator:
         assert client.calls == 2  # pause_turn後に自動継続
         assert answer.usage["input_tokens"] == 2000  # 1000 + 1000 の累積
 
-    def test_web_fetch_tool_enabled_by_config(self, tmp_path):
-        handbook = make_handbook(tmp_path)
-        gen, client = make_generator(
-            tmp_path,
-            {"has_answer": False, "answer": "-", "sources": [], "suggested_file": ""},
+    def _general_knowledge_stage1(self):
+        return {
+            "intent": "general_knowledge",
+            "reference_url": REAL_URL,
+            "has_answer": False,
+            "answer": f"社内ハンドブックには記載がありません。参考記事: {REAL_URL}",
+            "sources": [],
+            "suggested_file": "",
+            "reported_manuals": [],
+        }
+
+    @staticmethod
+    def _stage2_response(text):
+        return SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text=text)],
+            usage=SimpleNamespace(
+                input_tokens=5000, output_tokens=200,
+                cache_creation_input_tokens=0, cache_read_input_tokens=0,
+            ),
         )
-        gen._config.data["web_fetch_enabled"] = True
-        gen._config.data["web_fetch_allowed_domains"] = ["www.freee.co.jp"]
-        gen.generate("質問", handbook)
-        tools = client.kwargs["tools"]
-        assert tools[0]["type"] == "web_fetch_20260209"
-        assert tools[0]["allowed_domains"] == ["www.freee.co.jp"]
+
+    def test_general_knowledge_two_stage_summary(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["web_fetch_enabled"] = True
+        config.data["web_fetch_allowed_domains"] = ["www.freee.co.jp"]
+        summary = "限度額は年800万円です。※社外の一般解説（freee会計）に基づく情報です。"
+        client = FakeClient(
+            [fake_response(self._general_knowledge_stage1()), self._stage2_response(summary)]
+        )
+        gen = AnswerGenerator(config, client=client)
+        answer = gen.generate("接待交際費の限度は？", handbook)
+        assert client.calls == 2
+        assert answer.has_answer
+        assert "800万円" in answer.text
+        assert answer.sources == [
+            {"file": "マニュアルリンク集.md", "heading": "", "url": REAL_URL}
+        ]
+        # 2段目にはweb_fetchツールが付き、URLがユーザーメッセージに入る
+        assert client.kwargs["tools"][0]["type"] == "web_fetch_20260209"
+        assert REAL_URL in client.kwargs["messages"][0]["content"]
+        assert answer.usage["input_tokens"] == 6000  # 両段の累積
+
+    def test_general_knowledge_fetch_failure_falls_back_to_link(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["web_fetch_enabled"] = True
+        config.data["web_fetch_allowed_domains"] = ["www.freee.co.jp"]
+        client = FakeClient(
+            [fake_response(self._general_knowledge_stage1()), self._stage2_response("FETCH_FAILED")]
+        )
+        gen = AnswerGenerator(config, client=client)
+        answer = gen.generate("接待交際費の限度は？", handbook)
+        assert not answer.has_answer  # 1段目の案内文のまま
+        assert REAL_URL in answer.text
+
+    def test_general_knowledge_disabled_skips_stage2(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        gen, client = make_generator(tmp_path, self._general_knowledge_stage1())
+        answer = gen.generate("接待交際費の限度は？", handbook)  # 既定はweb_fetch無効
+        assert client.calls == 1
+        assert REAL_URL in answer.text
+
+    def test_general_knowledge_fabricated_reference_url_skips_stage2(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["web_fetch_enabled"] = True
+        config.data["web_fetch_allowed_domains"] = ["www.freee.co.jp"]
+        payload = self._general_knowledge_stage1()
+        payload["reference_url"] = "https://www.freee.co.jp/kb/kb-accounting/not-in-handbook/"
+        payload["answer"] = "記載がありません"
+        client = FakeClient(fake_response(payload))
+        gen = AnswerGenerator(config, client=client)
+        answer = gen.generate("質問", handbook)
+        assert client.calls == 1  # 実在検証に落ちたURLでは記事取得しない
 
     def test_fabricated_url_in_body_is_scrubbed(self, tmp_path):
         handbook = make_handbook(tmp_path)

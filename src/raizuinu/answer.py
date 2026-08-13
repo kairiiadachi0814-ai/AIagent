@@ -23,8 +23,12 @@ ANSWER_SCHEMA: dict[str, Any] = {
     "properties": {
         "intent": {
             "type": "string",
-            "enum": ["question", "manual_update_report"],
-            "description": "メッセージ種別。マニュアル（原本）を更新した旨の報告ならmanual_update_report、それ以外はquestion",
+            "enum": ["question", "manual_update_report", "general_knowledge"],
+            "description": "メッセージ種別。社内手順・ルールの質問=question／マニュアル更新の報告=manual_update_report／社内ルールではない一般的な会計・簿記・税務知識の質問=general_knowledge",
+        },
+        "reference_url": {
+            "type": "string",
+            "description": "general_knowledgeの場合のみ: 会計基礎知識リンク集に記載の該当記事URLを一字一句正確に転記。該当がなければ空文字。他のintentでは空文字",
         },
         "reported_manuals": {
             "type": "array",
@@ -58,7 +62,7 @@ ANSWER_SCHEMA: dict[str, Any] = {
             "description": "記載が無い場合に追記先として提案するファイル名。無ければ空文字",
         },
     },
-    "required": ["intent", "reported_manuals", "has_answer", "answer", "sources", "suggested_file"],
+    "required": ["intent", "reference_url", "reported_manuals", "has_answer", "answer", "sources", "suggested_file"],
     "additionalProperties": False,
 }
 
@@ -74,7 +78,7 @@ Chatworkで社員からの質問に、社内ハンドブック（経理・財務
 6. 会話履歴は文脈理解の参考とし、回答の根拠にはしないこと。
 7. 関連する原本文書・スプレッドシート・フォルダのURLがハンドブック（特に「マニュアルリンク集」）に記載されている場合は、回答本文またはsourcesのurlに含めて案内すること。URLは一字一句正確に転記し、加工・短縮・推測してはならない。ハンドブックに記載のないURLを作らないこと。
 8. メッセージ種別の判定: 利用者が質問ではなく「マニュアル（原本）を更新した・変更した」と明確に報告している場合のみ、intentをmanual_update_reportとし、reported_manualsに対象マニュアル名を入れること。その場合answerには報告内容の短い受領確認文（1〜2文。対象マニュアル名を復唱）を書き、has_answerはfalse、sourcesは空とする。更新の仕方に関する質問や迷うケースはquestionとして扱うこと。
-9. 一般的な会計・簿記・税務知識の質問（社内の手順・ルールではないもの）への対応: 「会計基礎知識リンク集」に該当する解説記事がある場合、必ずweb_fetchツールでその記事URLを取得すること。取得できたら、記事の内容に基づいて質問への答え（該当する数値・条件・区分など）を2〜6行で具体的に回答する（has_answer=true、sourcesのfileは会計基礎知識リンク集_freee.md、urlは記事URL）。URLの案内だけで回答を済ませてよいのは取得に失敗した場合のみ。このとき (a)回答は要点の短い要約に留め、記事の長い引用・転載はしない (b)回答末尾に「社外の一般解説に基づく情報です。当社での具体的な取り扱い・税務判断は税理士にご確認ください」の趣旨を必ず添える (c)該当記事がリンク集にない場合は「記載なし」とする。リンク集にないURLへのアクセスや、記事を取得せず自身の知識だけで断定回答することはしないこと。"""
+9. 一般的な会計・簿記・税務知識の質問（社内の手順・ルールではないもの）への対応: intentをgeneral_knowledgeとし、「会計基礎知識リンク集」に該当する解説記事があればreference_urlにそのURLを一字一句正確に転記すること。answerには「社内ハンドブックには記載がありません。参考記事: <URL>」の趣旨の案内文（税理士確認の注意書き付き）を書く。詳細な要約はシステム側が記事を取得して別途行うため、自身の知識だけで数値や限度額を断定して書いてはならない。該当記事がリンク集にない場合はreference_urlを空にし「記載なし」の回答とする。"""
 
 
 @dataclass
@@ -87,6 +91,7 @@ class Answer:
     refused: bool = False
     intent: str = "question"
     reported_manuals: list[str] = field(default_factory=list)
+    reference_url: str = ""
 
 
 class AnswerGenerator:
@@ -134,7 +139,7 @@ class AnswerGenerator:
             )
 
         intent = str(data.get("intent", "question"))
-        if intent not in ("question", "manual_update_report"):
+        if intent not in ("question", "manual_update_report", "general_knowledge"):
             intent = "question"
         answer = Answer(
             has_answer=bool(data.get("has_answer")),
@@ -144,8 +149,10 @@ class AnswerGenerator:
             usage=usage,
             intent=intent,
             reported_manuals=[str(m) for m in (data.get("reported_manuals") or []) if str(m).strip()],
+            reference_url=str(data.get("reference_url", "")).strip(),
         )
-        return self._validate_citations(answer, handbook)
+        answer = self._validate_citations(answer, handbook)
+        return self._enrich_general_knowledge(answer, question, handbook)
 
     # --- 内部 ---
 
@@ -183,16 +190,6 @@ class AnswerGenerator:
                 "format": {"type": "json_schema", "schema": ANSWER_SCHEMA},
             },
         }
-        if cfg.web_fetch_enabled and cfg.web_fetch_allowed_domains:
-            # 参照先はリンク集記載ドメインのみに制限（任意サイトの閲覧は不可）
-            kwargs["tools"] = [
-                {
-                    "type": "web_fetch_20260209",
-                    "name": "web_fetch",
-                    "max_uses": cfg.web_fetch_max_uses,
-                    "allowed_domains": cfg.web_fetch_allowed_domains,
-                }
-            ]
         if cfg.fallback_enabled:
             # 安全クラシファイアによる拒否時に別モデルで再実行される（Opus 5/Fable 5系）
             kwargs["betas"] = ["server-side-fallback-2026-07-01"]
@@ -200,16 +197,77 @@ class AnswerGenerator:
             create = self._client.beta.messages.create
         else:
             create = self._client.messages.create
+        return _call_with_continuation(create, kwargs, messages)
 
-        usage_total: dict[str, int] = {}
-        response = None
-        for _ in range(4):  # サーバーツールの反復上限到達（pause_turn）は最大3回まで継続
-            response = create(messages=messages, **kwargs)
-            _accumulate_usage(usage_total, _usage_dict(response))
-            if getattr(response, "stop_reason", None) != "pause_turn":
-                break
-            messages = messages + [{"role": "assistant", "content": response.content}]
-        return response, usage_total
+    def _enrich_general_knowledge(
+        self, answer: Answer, question: str, handbook: Handbook
+    ) -> Answer:
+        """一般会計知識の質問: 検証済み参考記事URLをweb_fetchで取得し要点回答に差し替える。
+
+        取得に失敗した場合は1段目のURL案内文のまま返す（安全側）。
+        """
+        cfg = self._config
+        url = answer.reference_url
+        if (
+            answer.intent != "general_knowledge"
+            or not cfg.web_fetch_enabled
+            or not cfg.web_fetch_allowed_domains
+            or not url
+            or not _url_in_handbook(url, handbook)
+        ):
+            return answer
+        try:
+            text, usage2 = self._summarize_article(question, url)
+        except Exception:
+            return answer  # 要約失敗時は案内文のまま（呼び出し元で失敗扱いにしない）
+        _accumulate_usage(answer.usage, usage2)
+        if not text:
+            return answer
+        source_file = _find_url_file(url, handbook)
+        answer.text = _scrub_body_urls(text, handbook)
+        answer.has_answer = True
+        answer.sources = [
+            {"file": source_file or "", "heading": "", "url": url}
+        ] if source_file else answer.sources
+        return answer
+
+    def _summarize_article(self, question: str, url: str) -> "tuple[str, dict[str, int]]":
+        """記事をweb_fetchで取得し、質問への要点回答を生成する（2段目・軽量呼び出し）。"""
+        cfg = self._config
+        system = (
+            "あなたは社内アシスタント。ユーザーの質問と参考記事URLが与えられる。"
+            "web_fetchツールで記事を取得し、記事の内容に基づいて質問への答え"
+            "（該当する数値・条件・区分など）を日本語で2〜6行に簡潔にまとめること。"
+            "記事の長い引用・転載はしない。記事に書かれていないことは書かない。"
+            "回答の最後に必ず「※社外の一般解説（freee会計）に基づく情報です。"
+            "当社での具体的な取り扱い・税務判断は税理士にご確認ください。」を付けること。"
+            "記事を取得できなかった場合は FETCH_FAILED とだけ出力すること。"
+        )
+        kwargs: dict[str, Any] = {
+            "model": cfg.model,
+            "max_tokens": 2048,
+            "system": system,
+            "output_config": {"effort": "low"},
+            "tools": [
+                {
+                    "type": "web_fetch_20260209",
+                    "name": "web_fetch",
+                    "max_uses": cfg.web_fetch_max_uses,
+                    "allowed_domains": cfg.web_fetch_allowed_domains,
+                }
+            ],
+        }
+        messages = [{"role": "user", "content": f"質問: {question}\n参考記事URL: {url}"}]
+        response, usage = _call_with_continuation(
+            self._client.messages.create, kwargs, messages
+        )
+        text = next(
+            (b.text for b in reversed(response.content) if getattr(b, "type", "") == "text"),
+            "",
+        ).strip()
+        if not text or "FETCH_FAILED" in text:
+            return "", usage
+        return text, usage
 
     @staticmethod
     def _validate_citations(answer: Answer, handbook: Handbook) -> Answer:
@@ -242,6 +300,32 @@ class AnswerGenerator:
 def _accumulate_usage(total: dict[str, int], usage: dict[str, int]) -> None:
     for key, value in usage.items():
         total[key] = total.get(key, 0) + value
+
+
+def _call_with_continuation(
+    create: Any, kwargs: dict[str, Any], messages: list[dict[str, Any]]
+) -> "tuple[Any, dict[str, int]]":
+    """API呼び出し。サーバーツールの反復上限（pause_turn）を最大3回まで自動継続する。"""
+    usage_total: dict[str, int] = {}
+    response = None
+    for _ in range(4):
+        response = create(messages=messages, **kwargs)
+        _accumulate_usage(usage_total, _usage_dict(response))
+        if getattr(response, "stop_reason", None) != "pause_turn":
+            break
+        messages = messages + [{"role": "assistant", "content": response.content}]
+    return response, usage_total
+
+
+def _find_url_file(url: str, handbook: Handbook) -> str | None:
+    """URLが記載されているハンドブックファイル名を返す（出典表示用）。"""
+    candidates = {url, url.rstrip("/")}
+    if not url.endswith("/"):
+        candidates.add(url + "/")
+    for f in handbook.files:
+        if any(c in f.content for c in candidates):
+            return f.name
+    return None
 
 
 def _usage_dict(response: Any) -> dict[str, int]:
