@@ -4,8 +4,8 @@
   "effort": "medium",
   "max_tokens": 16000,
   "context_message_count": 20,
-  "allowed_room_ids": [],
-  "admin_room_id": null,
+  "allowed_room_ids": [444781726],
+  "admin_room_id": 444781726,
   "agent_account_id": null,
   "handbook": {
     "roots": ["."],
