@@ -254,6 +254,8 @@ class AnswerGenerator:
                     "name": "web_fetch",
                     "max_uses": cfg.web_fetch_max_uses,
                     "allowed_domains": cfg.web_fetch_allowed_domains,
+                    # 記事ページのナビ等による入力トークン肥大を抑える
+                    "max_content_tokens": cfg.web_fetch_max_content_tokens,
                 }
             ],
         }

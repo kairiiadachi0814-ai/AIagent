@@ -38,6 +38,7 @@ _DEFAULTS: dict[str, Any] = {
     "web_fetch_enabled": False,
     "web_fetch_allowed_domains": [],
     "web_fetch_max_uses": 3,
+    "web_fetch_max_content_tokens": 30000,
     "monthly_cost_limit_jpy": 10000,
     "cost_alert_threshold": 0.7,
     "usd_jpy_rate": 155.0,
