@@ -32,15 +32,17 @@ def fake_response(payload: dict, stop_reason: str = "end_turn"):
 
 class FakeClient:
     def __init__(self, response):
-        self._response = response
+        self._responses = list(response) if isinstance(response, list) else [response]
         self.kwargs = None
+        self.calls = 0
         beta_messages = SimpleNamespace(create=self._create)
         self.beta = SimpleNamespace(messages=beta_messages)
         self.messages = SimpleNamespace(create=self._create)
 
     def _create(self, **kwargs):
         self.kwargs = kwargs
-        return self._response
+        self.calls += 1
+        return self._responses.pop(0) if len(self._responses) > 1 else self._responses[0]
 
 
 def make_generator(tmp_path, payload, stop_reason="end_turn"):
@@ -163,6 +165,72 @@ class TestAnswerGenerator:
         answer = gen.generate("質問", make_handbook(tmp_path))
         assert not answer.has_answer
         assert handbook is not None
+
+    def test_pause_turn_is_continued_and_usage_accumulated(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        paused = SimpleNamespace(
+            stop_reason="pause_turn",
+            content=[SimpleNamespace(type="server_tool_use")],
+            usage=SimpleNamespace(
+                input_tokens=1000, output_tokens=100,
+                cache_creation_input_tokens=0, cache_read_input_tokens=0,
+            ),
+        )
+        final = fake_response(
+            {"has_answer": False, "answer": "回答", "sources": [], "suggested_file": ""}
+        )
+        config = Config.load(tmp_path / "no-config.json")
+        client = FakeClient([paused, final])
+        gen = AnswerGenerator(config, client=client)
+        answer = gen.generate("質問", handbook)
+        assert client.calls == 2  # pause_turn後に自動継続
+        assert answer.usage["input_tokens"] == 2000  # 1000 + 1000 の累積
+
+    def test_web_fetch_tool_enabled_by_config(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        gen, client = make_generator(
+            tmp_path,
+            {"has_answer": False, "answer": "-", "sources": [], "suggested_file": ""},
+        )
+        gen._config.data["web_fetch_enabled"] = True
+        gen._config.data["web_fetch_allowed_domains"] = ["www.freee.co.jp"]
+        gen.generate("質問", handbook)
+        tools = client.kwargs["tools"]
+        assert tools[0]["type"] == "web_fetch_20260209"
+        assert tools[0]["allowed_domains"] == ["www.freee.co.jp"]
+
+    def test_fabricated_url_in_body_is_scrubbed(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        gen, _ = make_generator(
+            tmp_path,
+            {
+                "has_answer": True,
+                "answer": f"参考: {REAL_URL} と https://example.com/fake-article を見てください",
+                "sources": [{"file": "銀行明細取得.md", "heading": "", "url": ""}],
+                "suggested_file": "",
+            },
+        )
+        answer = gen.generate("質問", handbook)
+        assert REAL_URL in answer.text  # ハンドブック記載URLは残る
+        assert "example.com" not in answer.text  # 未記載URLは除去
+        assert "（URL省略）" in answer.text
+
+    def test_last_text_block_is_used(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        payload = {"has_answer": False, "answer": "最終回答", "sources": [], "suggested_file": ""}
+        response = SimpleNamespace(
+            stop_reason="end_turn",
+            content=[
+                SimpleNamespace(type="text", text="記事を確認します"),
+                SimpleNamespace(type="server_tool_use"),
+                SimpleNamespace(type="text", text=json.dumps(payload, ensure_ascii=False)),
+            ],
+            usage=None,
+        )
+        gen = AnswerGenerator(config, client=FakeClient(response))
+        answer = gen.generate("質問", handbook)
+        assert answer.text == "最終回答"
 
     def test_request_uses_cache_and_schema(self, tmp_path):
         handbook = make_handbook(tmp_path)

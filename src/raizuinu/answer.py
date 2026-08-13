@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -72,7 +73,8 @@ Chatworkで社員からの質問に、社内ハンドブック（経理・財務
 5. パスワード等の認証情報がハンドブックに残っている場合でも、回答本文に転記しないこと。
 6. 会話履歴は文脈理解の参考とし、回答の根拠にはしないこと。
 7. 関連する原本文書・スプレッドシート・フォルダのURLがハンドブック（特に「マニュアルリンク集」）に記載されている場合は、回答本文またはsourcesのurlに含めて案内すること。URLは一字一句正確に転記し、加工・短縮・推測してはならない。ハンドブックに記載のないURLを作らないこと。
-8. メッセージ種別の判定: 利用者が質問ではなく「マニュアル（原本）を更新した・変更した」と明確に報告している場合のみ、intentをmanual_update_reportとし、reported_manualsに対象マニュアル名を入れること。その場合answerには報告内容の短い受領確認文（1〜2文。対象マニュアル名を復唱）を書き、has_answerはfalse、sourcesは空とする。更新の仕方に関する質問や迷うケースはquestionとして扱うこと。"""
+8. メッセージ種別の判定: 利用者が質問ではなく「マニュアル（原本）を更新した・変更した」と明確に報告している場合のみ、intentをmanual_update_reportとし、reported_manualsに対象マニュアル名を入れること。その場合answerには報告内容の短い受領確認文（1〜2文。対象マニュアル名を復唱）を書き、has_answerはfalse、sourcesは空とする。更新の仕方に関する質問や迷うケースはquestionとして扱うこと。
+9. 一般的な会計・簿記・税務知識の質問（社内の手順・ルールではないもの）への対応: 「会計基礎知識リンク集」に該当する解説記事がある場合、web_fetchツールでその記事URLを取得し、記事の内容に基づいて要点を簡潔に回答してよい（has_answer=true、sourcesのfileは会計基礎知識リンク集_freee.md、urlは記事URL）。このとき (a)回答は短い要約に留め、記事の長い引用・転載はしない (b)回答末尾に「社外の一般解説に基づく情報です。当社での具体的な取り扱い・税務判断は税理士にご確認ください」の趣旨を必ず添える (c)取得に失敗した場合や該当記事がない場合は、記事URLの案内のみ、または「記載なし」とする。リンク集にないURLへのアクセスや、自身の知識だけでの断定回答はしないこと。"""
 
 
 @dataclass
@@ -99,9 +101,7 @@ class AnswerGenerator:
         self._client = client
 
     def generate(self, question: str, handbook: Handbook, context: str = "") -> Answer:
-        response = self._create_message(question, handbook, context)
-
-        usage = _usage_dict(response)
+        response, usage = self._create_message(question, handbook, context)
 
         if getattr(response, "stop_reason", None) == "refusal":
             return Answer(
@@ -119,8 +119,10 @@ class AnswerGenerator:
                 usage=usage,
             )
 
+        # ツール使用時は途中に説明テキストが挟まるため、最後のtextブロックを回答とする
         text = next(
-            (b.text for b in response.content if getattr(b, "type", "") == "text"), ""
+            (b.text for b in reversed(response.content) if getattr(b, "type", "") == "text"),
+            "",
         )
         try:
             data = json.loads(text)
@@ -147,7 +149,11 @@ class AnswerGenerator:
 
     # --- 内部 ---
 
-    def _create_message(self, question: str, handbook: Handbook, context: str) -> Any:
+    def _create_message(self, question: str, handbook: Handbook, context: str) -> "tuple[Any, dict[str, int]]":
+        """API呼び出し。サーバーツール使用時のpause_turn継続まで面倒を見る。
+
+        戻り値は (最終レスポンス, 全リクエスト累積のusage)。
+        """
         cfg = self._config
         system = [
             {
@@ -167,22 +173,43 @@ class AnswerGenerator:
                 "## 直近の会話（文脈参考用）\n" + context + "\n\n## 質問\n" + question
             )
 
+        messages: list[dict[str, Any]] = [{"role": "user", "content": user_content}]
         kwargs: dict[str, Any] = {
             "model": cfg.model,
             "max_tokens": cfg.max_tokens,
             "system": system,
-            "messages": [{"role": "user", "content": user_content}],
             "output_config": {
                 "effort": cfg.effort,
                 "format": {"type": "json_schema", "schema": ANSWER_SCHEMA},
             },
         }
+        if cfg.web_fetch_enabled and cfg.web_fetch_allowed_domains:
+            # 参照先はリンク集記載ドメインのみに制限（任意サイトの閲覧は不可）
+            kwargs["tools"] = [
+                {
+                    "type": "web_fetch_20260209",
+                    "name": "web_fetch",
+                    "max_uses": cfg.web_fetch_max_uses,
+                    "allowed_domains": cfg.web_fetch_allowed_domains,
+                }
+            ]
         if cfg.fallback_enabled:
-            # 安全クラシファイアによる拒否時に別モデルで再実行される（推奨設定）
+            # 安全クラシファイアによる拒否時に別モデルで再実行される（Opus 5/Fable 5系）
             kwargs["betas"] = ["server-side-fallback-2026-07-01"]
             kwargs["fallbacks"] = "default"
-            return self._client.beta.messages.create(**kwargs)
-        return self._client.messages.create(**kwargs)
+            create = self._client.beta.messages.create
+        else:
+            create = self._client.messages.create
+
+        usage_total: dict[str, int] = {}
+        response = None
+        for _ in range(4):  # サーバーツールの反復上限到達（pause_turn）は最大3回まで継続
+            response = create(messages=messages, **kwargs)
+            _accumulate_usage(usage_total, _usage_dict(response))
+            if getattr(response, "stop_reason", None) != "pause_turn":
+                break
+            messages = messages + [{"role": "assistant", "content": response.content}]
+        return response, usage_total
 
     @staticmethod
     def _validate_citations(answer: Answer, handbook: Handbook) -> Answer:
@@ -201,6 +228,7 @@ class AnswerGenerator:
                 url = ""  # ハンドブックに記載のないURLは出典に載せない（捏造防止）
             valid.append({"file": normalized, "heading": heading, "url": url})
         answer.sources = valid
+        answer.text = _scrub_body_urls(answer.text, handbook)
         if answer.has_answer and not valid:
             # 出典なしの回答は返さない（ガードレール1）
             answer.has_answer = False
@@ -209,6 +237,11 @@ class AnswerGenerator:
                 "担当者に直接ご確認いただくか、質問を具体的にしてもう一度お試しください。"
             )
         return answer
+
+
+def _accumulate_usage(total: dict[str, int], usage: dict[str, int]) -> None:
+    for key, value in usage.items():
+        total[key] = total.get(key, 0) + value
 
 
 def _usage_dict(response: Any) -> dict[str, int]:
@@ -228,8 +261,24 @@ def _usage_dict(response: Any) -> dict[str, int]:
     return result
 
 
+_URL_RE = re.compile(r"https?://[^\s<>\"」』】）\)。、！？]+")
+
+
 def _url_in_handbook(url: str, handbook: Handbook) -> bool:
-    return any(url in f.content for f in handbook.files)
+    candidates = {url, url.rstrip("/")}
+    if not url.endswith("/"):
+        candidates.add(url + "/")
+    return any(any(c in f.content for c in candidates) for f in handbook.files)
+
+
+def _scrub_body_urls(text: str, handbook: Handbook) -> str:
+    """本文中のURLのうち、ハンドブックに記載のないものを除去する（捏造リンク対策）。"""
+
+    def repl(match: re.Match) -> str:
+        url = match.group(0)
+        return url if _url_in_handbook(url, handbook) else "（URL省略）"
+
+    return _URL_RE.sub(repl, text)
 
 
 def display_name(file_name: str) -> str:
