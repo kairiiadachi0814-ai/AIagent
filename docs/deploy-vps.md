@@ -65,8 +65,17 @@ ssh -i /c/Users/admin/.ssh/raizuinu_vps ubuntu@tk2-262-40529.vs.sakura.ne.jp \
   "sudo -u raizuinu /opt/raizuinu/venv/bin/pip install -r /opt/raizuinu/app/requirements.txt"
 ```
 
-## コストの実測（2026-08-13）
+## コストの実測・目安
+
+claude-opus-5での実測（2026-08-13、変更前）:
 
 - 初回質問（プロンプトキャッシュ構築を含む）: **約202円**（ハンドブック全文≈12.8万トークンの1時間キャッシュ書き込み）
 - キャッシュ有効中（直前の質問から1時間以内）の質問: **約15〜20円**
-- 質問が1時間以上空くたびにキャッシュ再構築費（約200円）が発生する。月次上限1万円 → 最低でも月約50問、連続利用なら数百問に相当
+
+2026-08-13に **claude-sonnet-5へ変更**（`config.json`のmodel＋単価表を更新）。単価はOpus 5の6割減（$3/$15 per MTok）のため目安は:
+
+- キャッシュ構築を含む質問: **約120円**
+- キャッシュ有効中の質問: **約8〜12円**
+- 月次上限1万円 → 飛び飛びでも月約80問、連続利用なら数百問に相当
+
+モデル変更時は `config.json` の `model` と `pricing_usd_per_mtok` をセットで更新すること（コスト集計の正確性のため）。`fallback_enabled` はOpus 5／Fable 5系でのみtrueにする（安全クラシファイア拒否時の代替モデル再実行機能）。
