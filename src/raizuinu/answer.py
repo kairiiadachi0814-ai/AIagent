@@ -119,7 +119,7 @@ Chatworkで社員からの質問に、社内ハンドブック（経理・財務
 7. 関連する原本文書・スプレッドシート・フォルダのURLがハンドブック（特に「マニュアルリンク集」）に記載されている場合は、回答本文またはsourcesのurlに含めて案内すること。URLは一字一句正確に転記し、加工・短縮・推測してはならない。ハンドブックに記載のないURLを作らないこと。
 8. メッセージ種別の判定: 利用者が質問ではなく「マニュアル（原本）を更新した・変更した」と明確に報告している場合のみ、intentをmanual_update_reportとし、reported_manualsに対象マニュアル名を入れること。その場合answerには報告内容の短い受領確認文（1〜2文。対象マニュアル名を復唱）を書き、has_answerはfalse、sourcesは空とする。更新の仕方に関する質問や迷うケースはquestionとして扱うこと。
 9. 一般的な会計・簿記・税務知識の質問（社内の手順・ルールではないもの）への対応: intentをgeneral_knowledgeとし、「会計基礎知識リンク集」に該当する解説記事があればreference_urlにそのURLを一字一句正確に転記すること。answerには「社内ハンドブックには記載がありません。参考記事: <URL>」の趣旨の案内文（税理士確認の注意書き付き）を書く。詳細な要約はシステム側が記事を取得して別途行うため、自身の知識だけで数値や限度額を断定して書いてはならない。該当記事がリンク集にない場合はreference_urlを空にし「記載なし」の回答とする。
-10. 法令・法律の知識に関する質問（社内手順ではないもの）: intentをlegal_knowledgeとし、必ずsearch_lawツールで法令を特定し、get_law_articleツールで条文の原文を取得したうえで、その原文に基づいて回答すること。ツールを使わず記憶だけで条文の内容や条番号を断定してはならない。回答には法令名・条番号を明記し、ツール結果に含まれるURL（laws.e-gov.go.jp）をそのまま含める。回答の最後に必ず「※e-Gov法令検索の条文に基づく一般的な情報です。法的判断や契約書の内容確認は、顧問弁護士への相談またはLegalForceでのリーガルチェックを経てください。」を付ける。この場合sourcesは空でよい（出典は本文中の法令名・条番号・URLで示す）。has_answerは条文を取得できた場合にtrue。
+10. 法令・法律の知識に関する質問（社内手順ではないもの）: intentをlegal_knowledgeとし、必ずsearch_lawツールで法令を特定し、get_law_articleツールで条文の原文を取得したうえで、その原文に基づいて回答すること。ツールを使わず記憶だけで条文の内容や条番号を断定してはならない。回答には法令名・条番号を明記し、ツール結果に含まれるURL（laws.e-gov.go.jp）をそのまま含める。回答の最後に必ず「※e-Gov法令検索の条文に基づく一般的な情報です。法的判断や契約書の内容確認は、顧問弁護士への相談またはLegalForceでのリーガルチェックを経てください。」を付ける。この場合sourcesは空でよい（出典は本文中の法令名・条番号・URLで示す）。has_answerは条文を取得できた場合にtrue。**ツール呼び出しは効率よく行うこと**: 独立した検索・条文取得は1ターンに複数まとめて並列に呼んでよい。網羅を目指さず、質問に最も関係する法令1〜2件・条文2〜4件に絞り、取得できた範囲で回答をまとめること（ツール往復は合計5回以内を目安）。
 11. 契約書の作成・ひな形に関する相談: 「ひな形リンク集」から該当するひな形のURLを案内し、あわせて「作成した契約書は締結前に必ずLegalForceでリーガルチェックを行う」こと（手順はハンドブック「LegalForce_リーガルチェック」参照）を必ず案内する。契約条項の妥当性を自ら断定してはならない。"""
 
 
@@ -275,6 +275,7 @@ class AnswerGenerator:
         """カスタムツール（e-Gov法令検索）を実行し、結果をJSON文字列で返す。"""
         from .egov import EgovError
 
+        print(f"[tool] {name} {json.dumps(tool_input, ensure_ascii=False)[:200]}", flush=True)
         try:
             if name == "search_law" and self._egov is not None:
                 keyword = str(tool_input.get("keyword", "")).strip()
@@ -417,7 +418,7 @@ def _accumulate_usage(total: dict[str, int], usage: dict[str, int]) -> None:
         total[key] = total.get(key, 0) + value
 
 
-_MAX_LOOP_STEPS = 8
+_MAX_LOOP_STEPS = 10
 
 
 def _call_with_continuation(

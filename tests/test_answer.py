@@ -441,11 +441,13 @@ class TestAnswerGenerator:
                                       cache_creation_input_tokens=0, cache_read_input_tokens=0),
             )
 
-        client = FakeClient([tool_use_response() for _ in range(8)])
+        from raizuinu.answer import _MAX_LOOP_STEPS
+
+        client = FakeClient([tool_use_response() for _ in range(_MAX_LOOP_STEPS)])
         gen = AnswerGenerator(config, client=client, egov=CountingEgov())
         answer = gen.generate("質問", handbook)
-        assert client.calls == 8
-        assert calls["count"] == 7  # 最終回は結果を送れないためツールを実行しない
+        assert client.calls == _MAX_LOOP_STEPS
+        assert calls["count"] == _MAX_LOOP_STEPS - 1  # 最終回はツールを実行しない
         assert not answer.has_answer
         assert "上限" in answer.text
 
