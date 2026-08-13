@@ -45,7 +45,11 @@ python -m pytest tests/          # テスト
 python run_local.py "銀行明細の取得手順は？"
 ```
 
-### デプロイ（推奨: Google Cloud Run）
+### デプロイ
+
+**本番環境はさくらのVPSに構築済み（2026-08-13）。** サーバー情報・運用コマンド・更新手順は [docs/deploy-vps.md](docs/deploy-vps.md) を参照。以下はCloud Runを選ぶ場合の参考手順。
+
+### 参考: Google Cloud Runの場合
 
 1. コンテナ化して `gunicorn "raizuinu.app:create_app()"` を起動（PYTHONPATH=src、**workersは既定の1のまま**にする）
 2. **「CPU always allocated」（--no-cpu-throttling）を有効にする**（Webhook応答後にバックグラウンドで回答処理を行うため）
