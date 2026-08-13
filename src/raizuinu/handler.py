@@ -23,9 +23,18 @@ from .cost import CostTracker
 from .handbook import HandbookLoader
 from .webhook import MentionEvent, SignatureError, parse_mention, verify_signature
 
-FAILURE_MESSAGE = "処理に失敗しました。時間をおいてもう一度お試しください。"
-STOPPED_MESSAGE = "今月の利用上限に達したため、応答を停止しています。管理者にお問い合わせください。"
-BUSY_MESSAGE = "ただいま質問が混み合っています。少し時間をおいてもう一度お試しください。"
+FAILURE_MESSAGE = (
+    "申し訳ありません、処理に失敗してしまいました。"
+    "少し時間をおいて、もう一度お声がけいただけますか。"
+)
+STOPPED_MESSAGE = (
+    "申し訳ありません。今月のAI利用枠が上限に達したため、いったんお休みしています。"
+    "お急ぎの場合は管理者までご連絡ください。"
+)
+BUSY_MESSAGE = (
+    "すみません、いまご質問が混み合っています。"
+    "少し時間をおいて、もう一度お声がけいただけますか。"
+)
 
 _DEDUPE_MAX = 1000
 
@@ -288,11 +297,11 @@ class RaizuinuHandler:
 
         from .answer import sanitize_for_chatwork
 
-        ack = sanitize_for_chatwork(answer.text) or "マニュアル更新のご報告を受け付けました。"
+        ack = sanitize_for_chatwork(answer.text) or "マニュアル更新のご報告、受け付けました。"
         reply = (
             f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n"
             + ack
-            + "\n\n※反映作業の受付リストに追加しました。反映が完了するまでは更新前の内容で回答する場合があります。"
+            + "\n\n反映作業のリストに追加しました。反映が済むまでは、少し前の内容でお答えすることがある点だけご了承ください。"
         )
         self._chatwork.send_message(event.room_id, reply)
 
