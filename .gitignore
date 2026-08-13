@@ -1,1 +1,8 @@
 .claude/
+__pycache__/
+*.pyc
+.pytest_cache/
+logs/
+state/
+venv/
+.venv/

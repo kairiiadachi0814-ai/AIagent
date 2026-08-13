@@ -25,3 +25,11 @@ Chatworkの許可ルームでメンションを受けたら、`handbook/` と `s
 - APIトークン・キーのコードへの直書き
 - 出典なしの回答を返す実装
 - 許可リスト外のルームへの応答
+
+## 実装構成（Phase 1・2026-08-13時点）
+
+- `src/raizuinu/` にコア実装（config／webhook／handbook／answer／chatwork／audit／cost／handler／app／lambda_function）。役割はパッケージdocstring参照
+- ハンドブック転記ファイル（63件）は現状リポジトリ直下のフラット構成。参照ルートは `config/config.json` の `handbook.roots` で管理し、将来 `handbook/`・`sops/` 階層へ移す場合も設定変更のみで追従する
+- 11章未決事項の推奨案（暫定採用）は `docs/phase1-requirements.md` 11章と `config/config.json` に記録
+- 秘密情報は環境変数のみ: `ANTHROPIC_API_KEY`／`CHATWORK_API_TOKEN`／`CHATWORK_WEBHOOK_TOKEN`
+- テストは `python -m pytest tests/`。ローカル動作確認は `python run_local.py "<質問>"`

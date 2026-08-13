@@ -1,0 +1,240 @@
+"""Claude APIによる回答生成と出典検証。
+
+ガードレール（要件定義書7章）の担保方法:
+1. 出典をごまかさない       → 構造化出力で出典を必須化し、実在ファイルと突合。
+                              実在しない出典は破棄し、有効な出典が残らない回答は
+                              「記載なし」扱いに落とす（FR-03）。
+2. 書かれていないことは不明と答える → has_answer=false の構造化フィールドで明示（FR-04）。
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import Any
+
+from .config import Config
+from .handbook import Handbook
+
+# 出典付き回答を強制するJSONスキーマ（structured outputs）
+ANSWER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "has_answer": {
+            "type": "boolean",
+            "description": "ハンドブックに根拠がある回答ができたか",
+        },
+        "answer": {"type": "string", "description": "回答本文（Chatworkにそのまま掲載）"},
+        "sources": {
+            "type": "array",
+            "description": "参照したハンドブックのファイル名と見出し。has_answer=trueなら必須",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "ファイル名（例: 銀行明細取得.md）"},
+                    "heading": {"type": "string", "description": "参照した見出し。無ければ空文字"},
+                },
+                "required": ["file", "heading"],
+                "additionalProperties": False,
+            },
+        },
+        "suggested_file": {
+            "type": "string",
+            "description": "記載が無い場合に追記先として提案するファイル名。無ければ空文字",
+        },
+    },
+    "required": ["has_answer", "answer", "sources", "suggested_file"],
+    "additionalProperties": False,
+}
+
+SYSTEM_INSTRUCTIONS = """あなたは株式会社ライズクリエイションの社内AIエージェント「{agent_name}」です。
+Chatworkで社員からの質問に、社内ハンドブック（経理・財務の業務手順書群）だけを根拠に日本語で回答します。
+
+守るべき原則:
+1. 回答は必ずハンドブックの記載に基づくこと。参照したファイル名と見出しをsourcesに正確に挙げること。実在しないファイル名を出典にしてはならない。
+2. ハンドブックに書かれていないことは推測で埋めず、has_answer=falseとし、answerには「ハンドブックに記載がありません」という趣旨を書くこと。あわせて、どのファイルに追記すべきかをsuggested_fileで提案してよい。
+3. 回答本文は簡潔に。手順を問われたら該当手順を要約し、詳細はファイル名を案内する。
+4. パスワード等の認証情報がハンドブックに残っている場合でも、回答本文に転記しないこと。
+5. 会話履歴は文脈理解の参考とし、回答の根拠にはしないこと。"""
+
+
+@dataclass
+class Answer:
+    has_answer: bool
+    text: str
+    sources: list[dict[str, str]] = field(default_factory=list)
+    suggested_file: str = ""
+    usage: dict[str, int] = field(default_factory=dict)
+    refused: bool = False
+
+
+class AnswerGenerator:
+    """Claude API呼び出しと出典検証。"""
+
+    def __init__(self, config: Config, client: Any | None = None) -> None:
+        self._config = config
+        if client is None:
+            import anthropic
+
+            client = anthropic.Anthropic()
+        self._client = client
+
+    def generate(self, question: str, handbook: Handbook, context: str = "") -> Answer:
+        response = self._create_message(question, handbook, context)
+
+        usage = _usage_dict(response)
+
+        if getattr(response, "stop_reason", None) == "refusal":
+            return Answer(
+                has_answer=False,
+                text="この質問には回答できませんでした（安全上の理由）。表現を変えてもう一度お試しください。",
+                usage=usage,
+                refused=True,
+            )
+
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            # 思考+本文が上限に達し出力が不完全（JSONパース失敗と切り分けるため先に検出）
+            return Answer(
+                has_answer=False,
+                text="回答の生成が長さ上限に達しました。質問を分けてもう一度お試しください。",
+                usage=usage,
+            )
+
+        text = next(
+            (b.text for b in response.content if getattr(b, "type", "") == "text"), ""
+        )
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return Answer(
+                has_answer=False,
+                text="回答の生成に失敗しました。もう一度お試しください。",
+                usage=usage,
+            )
+
+        answer = Answer(
+            has_answer=bool(data.get("has_answer")),
+            text=str(data.get("answer", "")).strip(),
+            sources=list(data.get("sources") or []),
+            suggested_file=str(data.get("suggested_file", "")),
+            usage=usage,
+        )
+        return self._validate_citations(answer, handbook)
+
+    # --- 内部 ---
+
+    def _create_message(self, question: str, handbook: Handbook, context: str) -> Any:
+        cfg = self._config
+        system = [
+            {
+                "type": "text",
+                "text": SYSTEM_INSTRUCTIONS.format(agent_name=cfg.agent_name),
+            },
+            {
+                "type": "text",
+                "text": "# ハンドブック\n\n" + handbook.render(),
+                # ハンドブックは安定プレフィックスとしてキャッシュする（コスト最適化）
+                "cache_control": {"type": "ephemeral", "ttl": cfg.prompt_cache_ttl},
+            },
+        ]
+        user_content = question
+        if context:
+            user_content = (
+                "## 直近の会話（文脈参考用）\n" + context + "\n\n## 質問\n" + question
+            )
+
+        kwargs: dict[str, Any] = {
+            "model": cfg.model,
+            "max_tokens": cfg.max_tokens,
+            "system": system,
+            "messages": [{"role": "user", "content": user_content}],
+            "output_config": {
+                "effort": cfg.effort,
+                "format": {"type": "json_schema", "schema": ANSWER_SCHEMA},
+            },
+        }
+        if cfg.fallback_enabled:
+            # 安全クラシファイアによる拒否時に別モデルで再実行される（推奨設定）
+            kwargs["betas"] = ["server-side-fallback-2026-07-01"]
+            kwargs["fallbacks"] = "default"
+            return self._client.beta.messages.create(**kwargs)
+        return self._client.messages.create(**kwargs)
+
+    @staticmethod
+    def _validate_citations(answer: Answer, handbook: Handbook) -> Answer:
+        """出典を実在ファイル・実在見出しと突合する（出典の捏造防止・FR-03）。"""
+        headings_by_file = {f.name: set(f.headings) for f in handbook.files}
+        valid: list[dict[str, str]] = []
+        for src in answer.sources:
+            normalized = handbook.normalize_citation(str(src.get("file", "")))
+            if not normalized:
+                continue
+            heading = str(src.get("heading", "")).strip()
+            if heading and heading not in headings_by_file.get(normalized, set()):
+                heading = ""  # 実在しない見出しは出典に載せない
+            valid.append({"file": normalized, "heading": heading})
+        answer.sources = valid
+        if answer.has_answer and not valid:
+            # 出典なしの回答は返さない（ガードレール1）
+            answer.has_answer = False
+            answer.text = (
+                "ハンドブック内に確かな根拠を特定できませんでした。"
+                "担当者に直接ご確認いただくか、質問を具体的にしてもう一度お試しください。"
+            )
+        return answer
+
+
+def _usage_dict(response: Any) -> dict[str, int]:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {}
+    result = {}
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ):
+        value = getattr(usage, key, None)
+        if value is not None:
+            result[key] = int(value)
+    return result
+
+
+def sanitize_for_chatwork(text: str) -> str:
+    """モデル由来文字列のChatworkタグを無害化する（[toall]等の注入防止）。
+
+    角括弧を全角に置換してタグとして解釈されないようにする。
+    """
+    return text.replace("[", "［").replace("]", "］")
+
+
+def format_reply(answer: Answer, event_account_id: int, room_id: int, message_id: str) -> str:
+    """Chatworkへの返信本文を組み立てる（返信タグ＋本文＋出典）。
+
+    返信タグは自前生成の値のみで構成し、モデル由来の文字列はすべて
+    sanitize_for_chatwork を通す。
+    """
+    lines = [
+        f"[rp aid={int(event_account_id)} to={int(room_id)}-{message_id}]",
+        sanitize_for_chatwork(answer.text),
+    ]
+    if answer.has_answer and answer.sources:
+        lines.append("")
+        lines.append("【出典】")
+        seen = set()
+        for src in answer.sources:
+            label = src["file"]
+            if src.get("heading"):
+                label += f"（{src['heading']}）"
+            label = sanitize_for_chatwork(label)
+            if label not in seen:
+                seen.add(label)
+                lines.append(f"・{label}")
+    elif not answer.has_answer and answer.suggested_file:
+        lines.append("")
+        lines.append(
+            "※追記する場合の候補ファイル: "
+            + sanitize_for_chatwork(answer.suggested_file)
+        )
+    return "\n".join(lines)
