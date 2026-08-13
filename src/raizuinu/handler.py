@@ -308,10 +308,16 @@ class RaizuinuHandler:
 
 
 def _sources_suffix(answer) -> str:
+    from .answer import display_name
+
     if answer.has_answer and answer.sources:
         labels = []
         for s in answer.sources:
-            label = s["file"] + (f"（{s['heading']}）" if s.get("heading") else "")
+            label = display_name(s["file"]) + (
+                f"（{s['heading']}）" if s.get("heading") else ""
+            )
+            if s.get("url"):
+                label += f" {s['url']}"
             if label not in labels:
                 labels.append(label)
         return "\n\n【出典】\n" + "\n".join(f"・{label}" for label in labels)

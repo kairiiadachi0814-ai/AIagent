@@ -6,8 +6,14 @@ from raizuinu.config import Config
 from raizuinu.handbook import HandbookLoader
 
 
+REAL_URL = "https://docs.google.com/document/d/abc123/edit"
+
+
 def make_handbook(tmp_path):
     (tmp_path / "銀行明細取得.md").write_text("# 銀行明細取得\n手順\n", encoding="utf-8")
+    (tmp_path / "マニュアルリンク集.md").write_text(
+        f"# リンク集\n| 銀行明細取得 |  | {REAL_URL} |\n", encoding="utf-8"
+    )
     return HandbookLoader([tmp_path], ["*.md"], [], 300).load()
 
 
@@ -51,14 +57,39 @@ class TestAnswerGenerator:
             {
                 "has_answer": True,
                 "answer": "手順はこうです",
-                "sources": [{"file": "銀行明細取得.md", "heading": "銀行明細取得"}],
+                "sources": [
+                    {"file": "銀行明細取得.md", "heading": "銀行明細取得", "url": REAL_URL}
+                ],
                 "suggested_file": "",
             },
         )
         answer = gen.generate("取得手順は？", handbook)
         assert answer.has_answer
-        assert answer.sources == [{"file": "銀行明細取得.md", "heading": "銀行明細取得"}]
+        assert answer.sources == [
+            {"file": "銀行明細取得.md", "heading": "銀行明細取得", "url": REAL_URL}
+        ]
         assert answer.usage["input_tokens"] == 1000
+
+    def test_fabricated_url_is_dropped(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        gen, _ = make_generator(
+            tmp_path,
+            {
+                "has_answer": True,
+                "answer": "回答",
+                "sources": [
+                    {
+                        "file": "銀行明細取得.md",
+                        "heading": "",
+                        "url": "https://docs.google.com/document/d/FAKE-NOT-IN-HANDBOOK/edit",
+                    }
+                ],
+                "suggested_file": "",
+            },
+        )
+        answer = gen.generate("質問", handbook)
+        assert answer.has_answer
+        assert answer.sources[0]["url"] == ""  # ハンドブックにないURLは破棄
 
     def test_fabricated_citation_is_dropped_and_answer_downgraded(self, tmp_path):
         handbook = make_handbook(tmp_path)
@@ -118,7 +149,7 @@ class TestAnswerGenerator:
         )
         answer = gen.generate("質問", handbook)
         assert answer.has_answer
-        assert answer.sources == [{"file": "銀行明細取得.md", "heading": ""}]
+        assert answer.sources == [{"file": "銀行明細取得.md", "heading": "", "url": ""}]
 
     def test_broken_json_returns_failure(self, tmp_path):
         handbook = make_handbook(tmp_path)
@@ -147,25 +178,28 @@ class TestAnswerGenerator:
 
 
 class TestFormatReply:
-    def test_reply_includes_rp_tag_and_sources(self):
+    def test_reply_includes_rp_tag_and_sources_without_md_extension(self):
         answer = Answer(
             has_answer=True,
             text="回答本文",
             sources=[
-                {"file": "銀行明細取得.md", "heading": "りそな銀行"},
-                {"file": "銀行明細取得.md", "heading": "りそな銀行"},  # 重複は1つに
+                {"file": "銀行明細取得.md", "heading": "りそな銀行", "url": REAL_URL},
+                {"file": "銀行明細取得.md", "heading": "りそな銀行", "url": REAL_URL},
             ],
         )
         reply = format_reply(answer, 111, 12345, "100001")
         assert reply.startswith("[rp aid=111 to=12345-100001]")
         assert "【出典】" in reply
-        assert reply.count("銀行明細取得.md（りそな銀行）") == 1
+        assert ".md" not in reply  # 内部ファイル名は利用者に見せない
+        assert reply.count("銀行明細取得（りそな銀行）") == 1  # 重複は1つに
+        assert REAL_URL in reply
 
     def test_no_answer_reply_suggests_file(self):
         answer = Answer(has_answer=False, text="記載がありません", suggested_file="海外送金.md")
         reply = format_reply(answer, 111, 12345, "100001")
         assert "【出典】" not in reply
-        assert "海外送金.md" in reply
+        assert "海外送金" in reply
+        assert ".md" not in reply
 
     def test_chatwork_tag_injection_neutralized(self):
         answer = Answer(

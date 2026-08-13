@@ -33,8 +33,12 @@ ANSWER_SCHEMA: dict[str, Any] = {
                 "properties": {
                     "file": {"type": "string", "description": "ファイル名（例: 銀行明細取得.md）"},
                     "heading": {"type": "string", "description": "参照した見出し。無ければ空文字"},
+                    "url": {
+                        "type": "string",
+                        "description": "そのマニュアルの原本URL。マニュアルリンク集に記載がある場合のみ一字一句正確に転記。無ければ空文字",
+                    },
                 },
-                "required": ["file", "heading"],
+                "required": ["file", "heading", "url"],
                 "additionalProperties": False,
             },
         },
@@ -53,10 +57,11 @@ Chatworkで社員からの質問に、社内ハンドブック（経理・財務
 守るべき原則:
 1. 回答は必ずハンドブックの記載に基づくこと。参照したファイル名と見出しをsourcesに正確に挙げること。実在しないファイル名を出典にしてはならない。
 2. ハンドブックに書かれていないことは推測で埋めず、has_answer=falseとし、answerには「ハンドブックに記載がありません」という趣旨を書くこと。あわせて、どのファイルに追記すべきかをsuggested_fileで提案してよい。
-3. 回答本文は簡潔に。手順を問われたら該当手順を要約し、詳細はファイル名を案内する。
-4. パスワード等の認証情報がハンドブックに残っている場合でも、回答本文に転記しないこと。
-5. 会話履歴は文脈理解の参考とし、回答の根拠にはしないこと。
-6. 関連する原本文書・スプレッドシート・フォルダのURLがハンドブック（特に「マニュアルリンク集」）に記載されている場合は、回答本文に該当URLをそのまま含めて案内すること。URLは一字一句正確に転記し、加工・短縮・推測してはならない。ハンドブックに記載のないURLを作らないこと。"""
+3. 回答本文は簡潔に。手順を問われたら該当手順の要点を回答本文に直接書くこと。
+4. 回答本文に「〜.md」等の内部ファイル名を書いてはならない。利用者はmdファイルを閲覧できない（管理者専用）。詳細への誘導は、マニュアルリンク集に記載の原本URL（GoogleドキュメントやシートのURL）で行い、URLが無い場合は本文の要約で完結させること。
+5. パスワード等の認証情報がハンドブックに残っている場合でも、回答本文に転記しないこと。
+6. 会話履歴は文脈理解の参考とし、回答の根拠にはしないこと。
+7. 関連する原本文書・スプレッドシート・フォルダのURLがハンドブック（特に「マニュアルリンク集」）に記載されている場合は、回答本文またはsourcesのurlに含めて案内すること。URLは一字一句正確に転記し、加工・短縮・推測してはならない。ハンドブックに記載のないURLを作らないこと。"""
 
 
 @dataclass
@@ -163,7 +168,7 @@ class AnswerGenerator:
 
     @staticmethod
     def _validate_citations(answer: Answer, handbook: Handbook) -> Answer:
-        """出典を実在ファイル・実在見出しと突合する（出典の捏造防止・FR-03）。"""
+        """出典を実在ファイル・実在見出し・実在URLと突合する（出典の捏造防止・FR-03）。"""
         headings_by_file = {f.name: set(f.headings) for f in handbook.files}
         valid: list[dict[str, str]] = []
         for src in answer.sources:
@@ -173,7 +178,10 @@ class AnswerGenerator:
             heading = str(src.get("heading", "")).strip()
             if heading and heading not in headings_by_file.get(normalized, set()):
                 heading = ""  # 実在しない見出しは出典に載せない
-            valid.append({"file": normalized, "heading": heading})
+            url = str(src.get("url", "")).strip()
+            if url and not _url_in_handbook(url, handbook):
+                url = ""  # ハンドブックに記載のないURLは出典に載せない（捏造防止）
+            valid.append({"file": normalized, "heading": heading, "url": url})
         answer.sources = valid
         if answer.has_answer and not valid:
             # 出典なしの回答は返さない（ガードレール1）
@@ -202,6 +210,15 @@ def _usage_dict(response: Any) -> dict[str, int]:
     return result
 
 
+def _url_in_handbook(url: str, handbook: Handbook) -> bool:
+    return any(url in f.content for f in handbook.files)
+
+
+def display_name(file_name: str) -> str:
+    """出典表示用のマニュアル名（内部ファイルの拡張子は見せない）。"""
+    return file_name[:-3] if file_name.endswith(".md") else file_name
+
+
 def sanitize_for_chatwork(text: str) -> str:
     """モデル由来文字列のChatworkタグを無害化する（[toall]等の注入防止）。
 
@@ -225,17 +242,19 @@ def format_reply(answer: Answer, event_account_id: int, room_id: int, message_id
         lines.append("【出典】")
         seen = set()
         for src in answer.sources:
-            label = src["file"]
+            label = display_name(src["file"])
             if src.get("heading"):
                 label += f"（{src['heading']}）"
             label = sanitize_for_chatwork(label)
+            if src.get("url"):
+                label += f" {src['url']}"  # URLは検証済みのため加工しない
             if label not in seen:
                 seen.add(label)
                 lines.append(f"・{label}")
     elif not answer.has_answer and answer.suggested_file:
         lines.append("")
         lines.append(
-            "※追記する場合の候補ファイル: "
-            + sanitize_for_chatwork(answer.suggested_file)
+            "※追記候補マニュアル: "
+            + sanitize_for_chatwork(display_name(answer.suggested_file))
         )
     return "\n".join(lines)
