@@ -196,6 +196,11 @@ class RaizuinuHandler:
         except Exception:
             print("[warn] コスト計上に失敗: " + traceback.format_exc(), flush=True)
 
+        # マニュアル更新の報告 → 受付リストへ記録し、管理者へ通知（FR外の運用機能）
+        if answer.intent == "manual_update_report":
+            self._handle_update_report(event, answer, status)
+            return
+
         reply = format_reply(answer, event.account_id, event.room_id, event.message_id)
         self._chatwork.send_message(event.room_id, reply)
 
@@ -225,6 +230,69 @@ class RaizuinuHandler:
                 + traceback.format_exc(),
                 flush=True,
             )
+
+    def _handle_update_report(self, event: MentionEvent, answer, status) -> None:
+        """マニュアル更新報告を受付リストに記録し、報告者へ受領返信・管理者へ通知する。
+
+        実際の反映（原本の再転記→デプロイ）は品質確認のため管理者側の作業とする。
+        """
+        from datetime import datetime, timezone, timedelta
+
+        manuals = answer.reported_manuals or ["（対象マニュアル名は本文参照）"]
+        entry = {
+            "ts": datetime.now(timezone(timedelta(hours=9))).isoformat(),
+            "room_id": event.room_id,
+            "account_id": event.account_id,
+            "message_id": event.message_id,
+            "manuals": answer.reported_manuals,
+            "body": event.question,
+            "status": "pending",
+        }
+        queue_path = self._config.resolve_path(self._config.state_dir) / "pending_updates.jsonl"
+        try:
+            queue_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(queue_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError:
+            print("[warn] 更新受付リストの書き込みに失敗: " + traceback.format_exc(), flush=True)
+
+        from .answer import sanitize_for_chatwork
+
+        ack = sanitize_for_chatwork(answer.text) or "マニュアル更新のご報告を受け付けました。"
+        reply = (
+            f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n"
+            + ack
+            + "\n\n※反映作業の受付リストに追加しました。反映が完了するまでは更新前の内容で回答する場合があります。"
+        )
+        self._chatwork.send_message(event.room_id, reply)
+
+        # 管理者への通知（報告があったルームと別の場合のみ。同一なら受領返信で足りる）
+        admin_room = self._config.admin_room_id
+        if admin_room and admin_room != event.room_id:
+            try:
+                self._chatwork.send_message(
+                    admin_room,
+                    f"[info][title]{self._config.agent_name} マニュアル更新報告[/title]"
+                    f"対象: {sanitize_for_chatwork('、'.join(manuals))}\n"
+                    f"報告ルーム: {event.room_id} / 報告者アカウント: {event.account_id}\n"
+                    "反映するには、Claude Codeで「マニュアル更新を反映して」と依頼してください。[/info]",
+                )
+            except Exception:
+                print("[warn] 更新報告の管理者通知に失敗", flush=True)
+
+        self._audit_safely(
+            {
+                "type": "update_report",
+                "room_id": event.room_id,
+                "account_id": event.account_id,
+                "message_id": event.message_id,
+                "question": event.question,
+                "manuals": answer.reported_manuals,
+                "answer": ack,
+                "usage": answer.usage,
+                "monthly_total_jpy": round(status.total_jpy, 2) if status else None,
+            }
+        )
 
     def _audit_safely(self, record: dict) -> None:
         try:

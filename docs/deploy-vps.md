@@ -65,6 +65,21 @@ ssh -i /c/Users/admin/.ssh/raizuinu_vps ubuntu@tk2-262-40529.vs.sakura.ne.jp \
   "sudo -u raizuinu /opt/raizuinu/venv/bin/pip install -r /opt/raizuinu/app/requirements.txt"
 ```
 
+## マニュアル更新報告の受付フロー（2026-08-13追加）
+
+メンバーがChatworkでらいずいぬに「◯◯のマニュアルを更新した」とメンションすると：
+
+1. らいずいぬが更新報告と判定し、受付リスト `/var/lib/raizuinu/pending_updates.jsonl` に追記
+2. 報告者へ受領を返信し、管理者ルーム（報告ルームと別の場合）へ通知
+3. 実際の反映は管理者作業: Claude Codeで「マニュアル更新を反映して」と依頼
+   → 受付リストを読み取り→Drive差分検知→再転記→コミット→デプロイ→処理済みエントリをリストから除去
+
+受付リストの確認コマンド:
+
+```
+ssh -i C:\Users\admin\.ssh\raizuinu_vps ubuntu@tk2-262-40529.vs.sakura.ne.jp "sudo cat /var/lib/raizuinu/pending_updates.jsonl 2>/dev/null || echo '(受付なし)'"
+```
+
 ## コストの実測・目安
 
 claude-opus-5での実測（2026-08-13、変更前）:

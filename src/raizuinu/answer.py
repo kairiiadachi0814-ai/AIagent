@@ -20,6 +20,16 @@ from .handbook import Handbook
 ANSWER_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
+        "intent": {
+            "type": "string",
+            "enum": ["question", "manual_update_report"],
+            "description": "メッセージ種別。マニュアル（原本）を更新した旨の報告ならmanual_update_report、それ以外はquestion",
+        },
+        "reported_manuals": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "更新報告の場合、報告対象のマニュアル名（分かる範囲で）。質問の場合は空配列",
+        },
         "has_answer": {
             "type": "boolean",
             "description": "ハンドブックに根拠がある回答ができたか",
@@ -47,7 +57,7 @@ ANSWER_SCHEMA: dict[str, Any] = {
             "description": "記載が無い場合に追記先として提案するファイル名。無ければ空文字",
         },
     },
-    "required": ["has_answer", "answer", "sources", "suggested_file"],
+    "required": ["intent", "reported_manuals", "has_answer", "answer", "sources", "suggested_file"],
     "additionalProperties": False,
 }
 
@@ -61,7 +71,8 @@ Chatworkで社員からの質問に、社内ハンドブック（経理・財務
 4. 回答本文に「〜.md」等の内部ファイル名を書いてはならない。利用者はmdファイルを閲覧できない（管理者専用）。詳細への誘導は、マニュアルリンク集に記載の原本URL（GoogleドキュメントやシートのURL）で行い、URLが無い場合は本文の要約で完結させること。
 5. パスワード等の認証情報がハンドブックに残っている場合でも、回答本文に転記しないこと。
 6. 会話履歴は文脈理解の参考とし、回答の根拠にはしないこと。
-7. 関連する原本文書・スプレッドシート・フォルダのURLがハンドブック（特に「マニュアルリンク集」）に記載されている場合は、回答本文またはsourcesのurlに含めて案内すること。URLは一字一句正確に転記し、加工・短縮・推測してはならない。ハンドブックに記載のないURLを作らないこと。"""
+7. 関連する原本文書・スプレッドシート・フォルダのURLがハンドブック（特に「マニュアルリンク集」）に記載されている場合は、回答本文またはsourcesのurlに含めて案内すること。URLは一字一句正確に転記し、加工・短縮・推測してはならない。ハンドブックに記載のないURLを作らないこと。
+8. メッセージ種別の判定: 利用者が質問ではなく「マニュアル（原本）を更新した・変更した」と明確に報告している場合のみ、intentをmanual_update_reportとし、reported_manualsに対象マニュアル名を入れること。その場合answerには報告内容の短い受領確認文（1〜2文。対象マニュアル名を復唱）を書き、has_answerはfalse、sourcesは空とする。更新の仕方に関する質問や迷うケースはquestionとして扱うこと。"""
 
 
 @dataclass
@@ -72,6 +83,8 @@ class Answer:
     suggested_file: str = ""
     usage: dict[str, int] = field(default_factory=dict)
     refused: bool = False
+    intent: str = "question"
+    reported_manuals: list[str] = field(default_factory=list)
 
 
 class AnswerGenerator:
@@ -118,12 +131,17 @@ class AnswerGenerator:
                 usage=usage,
             )
 
+        intent = str(data.get("intent", "question"))
+        if intent not in ("question", "manual_update_report"):
+            intent = "question"
         answer = Answer(
             has_answer=bool(data.get("has_answer")),
             text=str(data.get("answer", "")).strip(),
             sources=list(data.get("sources") or []),
             suggested_file=str(data.get("suggested_file", "")),
             usage=usage,
+            intent=intent,
+            reported_manuals=[str(m) for m in (data.get("reported_manuals") or []) if str(m).strip()],
         )
         return self._validate_citations(answer, handbook)
 

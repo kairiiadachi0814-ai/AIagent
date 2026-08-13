@@ -196,6 +196,54 @@ class TestHandleWebhook:
         assert generator.calls == []  # 空のまま回答しない
         assert any("失敗" in sent[1] for sent in chatwork.sent)
 
+    def test_update_report_is_queued_and_acknowledged(self, tmp_path, monkeypatch):
+        import json as _json
+
+        report_answer = Answer(
+            has_answer=False,
+            text="「為替レート取得・SCM入力」の更新報告を受け付けました。",
+            usage={"input_tokens": 10, "output_tokens": 10},
+            intent="manual_update_report",
+            reported_manuals=["為替レート取得・SCM入力"],
+        )
+        handler, chatwork, _, audit = make_handler(
+            tmp_path, monkeypatch, answer=report_answer
+        )
+        handler._config.data["admin_room_id"] = 55555  # 報告ルームと別の管理者ルーム
+        body = payload()
+        handler.handle_webhook(body, sign(body))
+
+        # 報告者への受領返信＋管理者通知の2通
+        assert len(chatwork.sent) == 2
+        assert "受け付けました" in chatwork.sent[0][1]
+        assert "反映" in chatwork.sent[0][1]
+        assert chatwork.sent[1][0] == 55555
+        assert "為替レート取得・SCM入力" in chatwork.sent[1][1]
+
+        # 受付リストに記録される
+        queue = tmp_path / "state" / "pending_updates.jsonl"
+        assert queue.exists()
+        entry = _json.loads(queue.read_text(encoding="utf-8").strip())
+        assert entry["manuals"] == ["為替レート取得・SCM入力"]
+        assert entry["status"] == "pending"
+
+        # 監査ログにも記録
+        assert audit.records[0]["type"] == "update_report"
+
+    def test_update_report_same_room_admin_no_duplicate_notify(self, tmp_path, monkeypatch):
+        report_answer = Answer(
+            has_answer=False,
+            text="受け付けました。",
+            usage={},
+            intent="manual_update_report",
+            reported_manuals=["銀行明細取得"],
+        )
+        handler, chatwork, _, _ = make_handler(tmp_path, monkeypatch, answer=report_answer)
+        handler._config.data["admin_room_id"] = 12345  # 報告ルーム＝管理者ルーム
+        body = payload()
+        handler.handle_webhook(body, sign(body))
+        assert len(chatwork.sent) == 1  # 受領返信のみ（同室への二重通知はしない）
+
     def test_stopped_notification_flag_only_on_success(self, tmp_path, monkeypatch):
         handler, chatwork, _, _ = make_handler(tmp_path, monkeypatch)
         handler._cost.add_usage({"output_tokens": 10_000_000_000})
