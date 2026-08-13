@@ -36,6 +36,14 @@ class ChatworkClient:
         self._raise_for_status(resp)
         return str(resp.json().get("message_id", ""))
 
+    def get_me(self) -> int:
+        """自分（エージェントアカウント）のaccount_idを返す。"""
+        resp = requests.get(
+            f"{API_BASE}/me", headers=self._headers, timeout=self._timeout
+        )
+        self._raise_for_status(resp)
+        return int(resp.json().get("account_id"))
+
     def get_recent_messages(self, room_id: int, limit: int = 20) -> list[dict[str, Any]]:
         """直近のメッセージを古い順で最大limit件返す。
 

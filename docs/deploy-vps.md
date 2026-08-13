@@ -30,7 +30,7 @@ Chatwork Webhook（mention_to_me）
 | 秘密情報 | `/etc/raizuinu/env`（root 600。ANTHROPIC_API_KEY／CHATWORK_API_TOKEN／CHATWORK_WEBHOOK_TOKEN） |
 | 状態（コスト累計・dedupe） | `/var/lib/raizuinu`（`RAIZUINU_STATE_DIR`で指定） |
 | 監査ログ | `/var/log/raizuinu/audit-YYYYMM.jsonl`（`RAIZUINU_AUDIT_LOG_DIR`で指定） |
-| systemdユニット | `/etc/systemd/system/raizuinu.service` |
+| systemdユニット | `/etc/systemd/system/raizuinu.service`（Webhook本体）、`raizuinu-selfreview.{service,timer}`（週次自己分析）、`raizuinu-watcher.{service,timer}`（議論ウォッチャー） |
 | Caddy設定 | `/etc/caddy/Caddyfile` |
 
 さくらのVPSコントロールパネルの**パケットフィルター**で TCP 22/80/443 を許可済み（80/443を消すと証明書更新とWebhook受信が止まるので注意）。
@@ -95,6 +95,34 @@ ssh -i C:\Users\admin\.ssh\raizuinu_vps ubuntu@tk2-262-40529.vs.sakura.ne.jp "su
 ssh -i C:\Users\admin\.ssh\raizuinu_vps ubuntu@tk2-262-40529.vs.sakura.ne.jp "sudo systemctl start raizuinu-selfreview.service && sudo journalctl -u raizuinu-selfreview -n 5 --no-pager"
 ```
 
+## 議論ウォッチャー（2026-08-13追加）
+
+systemdタイマー（`raizuinu-watcher.timer`、5分ごと）が `python -m raizuinu.watcher` を実行し、
+`config.json` の `discussion_watch.room_ids` のルームを巡回する。
+
+1. **差分取得**: 前回巡回以降の新規発言のみ評価（既読位置は `/var/lib/raizuinu/watch-{room_id}.json`）。
+   初回はその時点までを既読化するだけで評価しない。ボット宛メンション・自分の発言・10文字未満は除外
+2. **2段階判定**: 1段目は軽量スクリーニング（ハンドブックなし・effort low）で「誤りの疑い」だけを検出。
+   疑いがある場合のみ2段目で通常のQ&Aパイプライン（出典検証・URLスクラブ・e-Govツール込み）により裏取り
+3. **沈黙がデフォルト**: 裏取りできた「明らかな誤り」のみ助言。意見の相違・雑談には介入しない。
+   介入は1ルームあたり1日3回まで。同じ出典による再介入は同日中は抑止
+4. **見習いモード**（`discussion_watch.mode: "shadow"`・現在の設定）: ルームには投稿せず、
+   管理者ルームへ助言候補を内報。精度確認後 `"live"` に変更（＋デプロイ）するとルームへ直接投稿
+5. 介入時のみ監査ログ（`type: watch_intervention`）へ記録。月次コスト上限到達時は巡回停止
+
+運用コマンド:
+
+```
+# タイマー状態・直近の実行結果
+ssh -i C:\Users\admin\.ssh\raizuinu_vps ubuntu@tk2-262-40529.vs.sakura.ne.jp "systemctl list-timers raizuinu-watcher.timer --no-pager && sudo journalctl -u raizuinu-watcher -n 20 --no-pager"
+
+# 手動で1回実行
+ssh -i C:\Users\admin\.ssh\raizuinu_vps ubuntu@tk2-262-40529.vs.sakura.ne.jp "sudo systemctl start raizuinu-watcher.service"
+```
+
+コスト目安: スクリーニングはハンドブックを読まないため1回≈0.1〜0.5円。発言が無い巡回はAPI呼び出しゼロ（Chatwork取得のみ）。
+2段目の裏取りが走った場合のみ通常質問と同等（キャッシュ有効中≈8〜12円）。
+
 ## コストの実測・目安
 
 claude-opus-5での実測（2026-08-13、変更前）:
@@ -106,6 +134,6 @@ claude-opus-5での実測（2026-08-13、変更前）:
 
 - キャッシュ構築を含む質問: **約120円**
 - キャッシュ有効中の質問: **約8〜12円**
-- 月次上限1万円 → 飛び飛びでも月約80問、連続利用なら数百問に相当
+- 月次上限1.5万円（2026-08-13に1万円から引き上げ。議論ウォッチャー追加に伴う） → 飛び飛びでも月約120問、連続利用なら数百問に相当
 
 モデル変更時は `config.json` の `model` と `pricing_usd_per_mtok` をセットで更新すること（コスト集計の正確性のため）。`fallback_enabled` はOpus 5／Fable 5系でのみtrueにする（安全クラシファイア拒否時の代替モデル再実行機能）。

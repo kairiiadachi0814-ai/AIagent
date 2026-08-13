@@ -40,6 +40,11 @@ def verify_signature(raw_body: bytes, signature: str | None, webhook_token: str 
         raise SignatureError("署名が一致しません")
 
 
+def strip_chatwork_tags(text: str) -> str:
+    """Chatworkタグ（[To:...] [rp ...] 等）を除去した本文を返す。"""
+    return _TAG_PATTERN.sub("", str(text)).strip()
+
+
 @dataclass
 class MentionEvent:
     """自分宛メンション（mention_to_me）イベント。"""

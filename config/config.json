@@ -28,7 +28,7 @@
   "web_fetch_max_content_tokens": 30000,
   "legal_enabled": true,
   "body_url_allowlist": ["https://laws.e-gov.go.jp/"],
-  "monthly_cost_limit_jpy": 10000,
+  "monthly_cost_limit_jpy": 15000,
   "cost_alert_threshold": 0.7,
   "usd_jpy_rate": 155.0,
   "pricing_usd_per_mtok": {
@@ -43,5 +43,13 @@
   "state_dir": "state",
   "webhook_async": true,
   "webhook_max_concurrency": 2,
-  "webhook_max_queue": 10
+  "webhook_max_queue": 10,
+  "discussion_watch": {
+    "enabled": true,
+    "room_ids": [444781726],
+    "mode": "shadow",
+    "max_interventions_per_day": 3,
+    "min_message_chars": 10,
+    "max_batch_messages": 30
+  }
 }

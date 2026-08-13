@@ -57,6 +57,15 @@ _DEFAULTS: dict[str, Any] = {
     "webhook_async": True,
     "webhook_max_concurrency": 2,
     "webhook_max_queue": 10,
+    # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
+    "discussion_watch": {
+        "enabled": False,
+        "room_ids": [],
+        "mode": "shadow",
+        "max_interventions_per_day": 3,
+        "min_message_chars": 10,
+        "max_batch_messages": 30,
+    },
 }
 
 
