@@ -80,6 +80,21 @@ ssh -i /c/Users/admin/.ssh/raizuinu_vps ubuntu@tk2-262-40529.vs.sakura.ne.jp \
 ssh -i C:\Users\admin\.ssh\raizuinu_vps ubuntu@tk2-262-40529.vs.sakura.ne.jp "sudo cat /var/lib/raizuinu/pending_updates.jsonl 2>/dev/null || echo '(受付なし)'"
 ```
 
+## 自己改善サイクル（承認制・2026-08-13追加）
+
+1. **フィードバック受付**: 利用者が回答の誤りを指摘すると `/var/lib/raizuinu/feedback.jsonl` に記録され、管理者ルームへ通知
+2. **週次自己分析**: systemdタイマー（`raizuinu-selfreview.timer`、毎週月曜9:00 JST）が
+   `python -m raizuinu.selfreview` を実行。直近7日の監査ログ・フィードバック・未反映の
+   更新報告を集計し、改善提案レポートを管理者ルームへ投稿（`/var/lib/raizuinu/reports/` にも保存）
+3. **反映は承認制**: レポートは提案のみで何も変更しない。管理者がClaude Codeで
+   「自己分析レポートの提案◯番を反映して」と指示 → 実装・テスト・レビューのうえ反映
+
+手動実行:
+
+```
+ssh -i C:\Users\admin\.ssh\raizuinu_vps ubuntu@tk2-262-40529.vs.sakura.ne.jp "sudo systemctl start raizuinu-selfreview.service && sudo journalctl -u raizuinu-selfreview -n 5 --no-pager"
+```
+
 ## コストの実測・目安
 
 claude-opus-5での実測（2026-08-13、変更前）:

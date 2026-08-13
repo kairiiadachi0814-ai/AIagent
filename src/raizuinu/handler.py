@@ -240,6 +240,11 @@ class RaizuinuHandler:
             self._handle_update_report(event, answer, status)
             return
 
+        # 回答への指摘・改善要望 → 改善リストへ記録し、管理者へ通知（自己改善サイクル）
+        if answer.intent == "answer_feedback":
+            self._handle_feedback(event, answer, status)
+            return
+
         reply = format_reply(answer, event.account_id, event.room_id, event.message_id)
         self._chatwork.send_message(event.room_id, reply)
 
@@ -327,6 +332,66 @@ class RaizuinuHandler:
                 "message_id": event.message_id,
                 "question": event.question,
                 "manuals": answer.reported_manuals,
+                "answer": ack,
+                "usage": answer.usage,
+                "monthly_total_jpy": round(status.total_jpy, 2) if status else None,
+            }
+        )
+
+    def _handle_feedback(self, event: MentionEvent, answer, status) -> None:
+        """回答への指摘・改善要望を改善リストに記録し、受領返信・管理者通知する。
+
+        記録は提案材料としてのみ使い、反映は管理者承認のもとClaude Code経由で行う。
+        """
+        from datetime import datetime, timezone, timedelta
+
+        entry = {
+            "ts": datetime.now(timezone(timedelta(hours=9))).isoformat(),
+            "room_id": event.room_id,
+            "account_id": event.account_id,
+            "message_id": event.message_id,
+            "body": event.question,
+            "status": "pending",
+        }
+        queue_path = self._config.resolve_path(self._config.state_dir) / "feedback.jsonl"
+        try:
+            queue_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(queue_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError:
+            print("[warn] 改善リストの書き込みに失敗: " + traceback.format_exc(), flush=True)
+
+        from .answer import sanitize_for_chatwork
+
+        ack = (
+            sanitize_for_chatwork(answer.text)
+            or "ご指摘ありがとうございます。改善リストに追加し、管理者が確認します。"
+        )
+        self._chatwork.send_message(
+            event.room_id,
+            f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n" + ack,
+        )
+
+        admin_room = self._config.admin_room_id
+        if admin_room and admin_room != event.room_id:
+            try:
+                self._chatwork.send_message(
+                    admin_room,
+                    f"[info][title]{self._config.agent_name} フィードバック受付[/title]"
+                    f"内容: {sanitize_for_chatwork(event.question[:300])}\n"
+                    f"報告ルーム: {event.room_id} / 報告者アカウント: {event.account_id}\n"
+                    "週次の自己分析レポートに反映されます。[/info]",
+                )
+            except Exception:
+                print("[warn] フィードバックの管理者通知に失敗", flush=True)
+
+        self._audit_safely(
+            {
+                "type": "feedback",
+                "room_id": event.room_id,
+                "account_id": event.account_id,
+                "message_id": event.message_id,
+                "question": event.question,
                 "answer": ack,
                 "usage": answer.usage,
                 "monthly_total_jpy": round(status.total_jpy, 2) if status else None,

@@ -230,6 +230,31 @@ class TestHandleWebhook:
         # 監査ログにも記録
         assert audit.records[0]["type"] == "update_report"
 
+    def test_feedback_is_queued_and_acknowledged(self, tmp_path, monkeypatch):
+        import json as _json
+
+        feedback_answer = Answer(
+            has_answer=False,
+            text="ご指摘ありがとうございます。改善リストに追加し、管理者が確認します。",
+            usage={"input_tokens": 10, "output_tokens": 10},
+            intent="answer_feedback",
+        )
+        handler, chatwork, _, audit = make_handler(
+            tmp_path, monkeypatch, answer=feedback_answer
+        )
+        handler._config.data["admin_room_id"] = 55555
+        body = payload(message_id="500001")
+        handler.handle_webhook(body, sign(body))
+
+        assert len(chatwork.sent) == 2  # 受領返信＋管理者通知
+        assert "ご指摘ありがとうございます" in chatwork.sent[0][1]
+        assert chatwork.sent[1][0] == 55555
+        queue = tmp_path / "state" / "feedback.jsonl"
+        assert queue.exists()
+        entry = _json.loads(queue.read_text(encoding="utf-8").strip())
+        assert entry["status"] == "pending"
+        assert audit.records[0]["type"] == "feedback"
+
     def test_update_report_same_room_admin_no_duplicate_notify(self, tmp_path, monkeypatch):
         report_answer = Answer(
             has_answer=False,
