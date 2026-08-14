@@ -225,6 +225,15 @@ class TestDocTaskRunner:
         assert "議事録にまとめて" in content
         assert "===文書" in content  # 文書本文は区切りで囲む（指示と混同させない）
 
+    def test_prompt_requires_conversational_opening(self, tmp_path):
+        # 成果物をいきなり出さず、依頼メッセージに一言応じてから返すこと
+        runner, client = make_runner(tmp_path)
+        runner.run("さっきは添付を忘れました。議事録にまとめて", file_doc(), 12345)
+        system = client.kwargs["system"]
+        assert "依頼者のメッセージに一言応じることから始める" in system
+        # 依頼文そのものもモデルへ渡っている（相手の言葉に応答できる）
+        assert "さっきは添付を忘れました" in client.kwargs["messages"][0]["content"]
+
     def test_unsupported_kind_returns_guidance_without_api_call(self, tmp_path):
         runner, client = make_runner(tmp_path)
         reply, meta, usage = runner.run(
