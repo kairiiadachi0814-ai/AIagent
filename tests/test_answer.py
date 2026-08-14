@@ -105,6 +105,48 @@ class TestAnswerGenerator:
         assert answer.sources[0]["url"] == amazon_url  # 表記ゆれ（半角空白）を吸収
         assert amazon_url in format_reply(answer, 1, 2, "3")
 
+    def test_source_url_prefers_own_header_and_rejects_other_manuals_url(self, tmp_path):
+        # 各マニュアル冒頭の「- 出典：」URLを最優先で使い、
+        # 別マニュアルのURLをモデルが挙げても採用しない（原本の取り違え防止）
+        url_a = "https://docs.google.com/document/d/AAAAAAAAAAAA/edit"
+        url_b = "https://docs.google.com/document/d/BBBBBBBBBBBB/edit"
+        (tmp_path / "給与振込処理_ライズ.md").write_text(
+            f"# 給与振込処理（ライズ）\n\n- 出典：Googleドキュメント「給与振込処理（ライズ）」\n  {url_a}\n- 転記日：2026-07-17\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "給与振込処理_楽天軒.md").write_text(
+            f"# 給与振込処理（楽天軒）\n\n- 出典：Googleドキュメント「給与振込処理（楽天軒）」\n  {url_b}\n",
+            encoding="utf-8",
+        )
+        handbook = HandbookLoader([tmp_path], ["*.md"], [], 300).load()
+        gen, _ = make_generator(
+            tmp_path,
+            {
+                "has_answer": True,
+                "answer": "手順はこうです",
+                # 楽天軒のURLを誤って添えたケース（リンク集の行ずれ相当）
+                "sources": [{"file": "給与振込処理_ライズ.md", "heading": "", "url": url_b}],
+                "suggested_file": "",
+            },
+        )
+        answer = gen.generate("ライズの給与振込は？", handbook)
+        assert answer.sources[0]["url"] == url_a  # 自分自身の原本URLに直る
+
+    def test_source_url_not_taken_from_template_or_article_collections(self, tmp_path):
+        # ひな形・freee等のリンク集は社内マニュアルの原本ではないため補完に使わない
+        from raizuinu.answer import _lookup_manual_url
+
+        (tmp_path / "経費精算書作成.md").write_text("# 経費精算書作成\n手順\n", encoding="utf-8")
+        (tmp_path / "ひな形リンク集_Box.md").write_text(
+            "# ひな形\n- 経費精算書: https://app.box.com/file/123\n", encoding="utf-8"
+        )
+        (tmp_path / "会計基礎知識リンク集_freee.md").write_text(
+            "# 会計\n| 経費精算書作成の基礎 | https://www.freee.co.jp/kb/kb-accounting/x/ |\n",
+            encoding="utf-8",
+        )
+        handbook = HandbookLoader([tmp_path], ["*.md"], [], 300).load()
+        assert _lookup_manual_url("経費精算書作成.md", handbook) == ""
+
     def test_source_url_lookup_does_not_guess_when_ambiguous(self, tmp_path):
         # 候補が絞れない場合はURLを付けない（誤った原本へ誘導しない）
         from raizuinu.answer import _lookup_manual_url

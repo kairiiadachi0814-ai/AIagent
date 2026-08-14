@@ -513,10 +513,15 @@ class AnswerGenerator:
             if heading and heading not in headings_by_file.get(normalized, set()):
                 heading = ""  # 実在しない見出しは出典に載せない
             url = str(src.get("url", "")).strip()
-            if url and not _url_in_handbook(url, handbook):
-                url = ""  # ハンドブックに記載のないURLは出典に載せない（捏造防止）
+            if url and not (
+                _url_in_handbook(url, handbook)
+                and _url_belongs_to_file(url, normalized, handbook)
+            ):
+                # 捏造URL、および「そのマニュアルのものではないURL」（隣の行を
+                # 写した等）は載せない。正しいURLは直後の補完で付け直す
+                url = ""
             if not url:
-                # モデルがurlを埋め忘れても、リンク集から機械的に補完する
+                # モデルがurlを埋め忘れても、原本URLを機械的に補完する
                 url = _lookup_manual_url(normalized, handbook)
             valid.append({"file": normalized, "heading": heading, "url": url})
         answer.sources = valid
@@ -714,27 +719,50 @@ def _normalize_title(text: str) -> str:
     return _TITLE_NOISE_RE.sub("", text).lower()
 
 
-def _manual_url_map(handbook: Handbook) -> dict[str, str]:
-    """マニュアル名（正規化）→ 原本URL の対応表をリンク集から作る。
+# 各マニュアル冒頭の「- 出典：Googleドキュメント「◯◯」\n  <URL>」ブロック。
+# そのファイル自身の原本URLなので、他マニュアルと取り違える余地がない
+_SOURCE_HEADER_RE = re.compile(
+    r"^[ \t]*[-*][ \t]*出典[：:][^\n]*\n(?:[^\n]*\n){0,2}?[ \t]*(https?://[^\s<>\"]+)",
+    re.MULTILINE,
+)
+# GoogleドキュメントやDriveの識別子（?tab= 等のクエリ差を吸収して同一性を見る）
+_DOC_ID_RE = re.compile(r"/(?:d|folders)/([A-Za-z0-9_-]{10,})")
 
-    出典にURLが付かない事故（モデルがurlを埋め忘れる）を防ぐため、
-    コード側で機械的に補完できるようにする。Handbookインスタンスにキャッシュする。
+
+def _own_source_url(file_name: str, handbook: Handbook) -> str:
+    """そのマニュアル自身が冒頭に記載している原本URLを返す。"""
+    cached = getattr(handbook, "_own_url_map", None)
+    if cached is None:
+        cached = {}
+        for f in handbook.files:
+            match = _SOURCE_HEADER_RE.search(f.content[:2000])
+            if match:
+                cached[f.name] = match.group(1)
+        handbook._own_url_map = cached  # type: ignore[attr-defined]
+    return cached.get(file_name, "")
+
+
+def _manual_url_map(handbook: Handbook) -> dict[str, str]:
+    """マニュアル名（正規化）→ 原本URL の対応表を「マニュアルリンク集」から作る。
+
+    冒頭に出典URLを持たないファイルの補完に使う予備の経路。ひな形・freee・
+    補助金のリンク集は社内マニュアルの原本ではないため対象外にする（誤補完防止）。
     """
     cached = getattr(handbook, "_manual_map", None)
     if cached is not None:
         return cached
     mapping: dict[str, str] = {}
     for f in handbook.files:
-        if "リンク集" not in f.name:
+        if "マニュアルリンク集" not in f.name:
             continue
         for line in f.content.splitlines():
+            if not line.lstrip().startswith("|"):
+                continue  # 表の行だけを見る（見出し・注記の混入を防ぐ）
             match = _URL_RE.search(line)
             if not match:
                 continue
-            before = line[: match.start()]
-            cells = [c.strip() for c in before.split("|") if c.strip()]
-            title = cells[0] if cells else before.strip(" -:*")
-            title = re.sub(r"^[-*・]\s*", "", title).strip()
+            cells = [c.strip() for c in line[: match.start()].split("|") if c.strip()]
+            title = cells[0] if cells else ""
             if title and len(title) < 60:
                 mapping.setdefault(_normalize_title(title), match.group(0))
     handbook._manual_map = mapping  # type: ignore[attr-defined]
@@ -742,15 +770,37 @@ def _manual_url_map(handbook: Handbook) -> dict[str, str]:
 
 
 def _lookup_manual_url(file_name: str, handbook: Handbook) -> str:
-    """マニュアル名から原本URLを引く（完全一致→一意な部分一致の順）。"""
+    """マニュアルの原本URLを引く（自身の出典ヘッダ→リンク集の順）。"""
+    own = _own_source_url(file_name, handbook)
+    if own:
+        return own
     mapping = _manual_url_map(handbook)
     key = _normalize_title(display_name(file_name))
+    if not key:
+        return ""
     if key in mapping:
         return mapping[key]
-    # 「ライズ給与振込システム作業フロー(2025.11～)」のように注記付きで
-    # 載っている場合に備え、候補が1件に定まるときだけ部分一致を許す
-    hits = [url for title, url in mapping.items() if key and (key in title or title in key)]
+    # 「ライズ給与振込システム作業フロー(2025.11～)」のように注記付きで載っている
+    # 場合に備え、マニュアル名がリンク集の見出しに含まれ、候補が1件のときだけ許す
+    hits = [url for title, url in mapping.items() if key in title]
     return hits[0] if len(hits) == 1 else ""
+
+
+def _url_belongs_to_file(url: str, file_name: str, handbook: Handbook) -> bool:
+    """そのURLが、出典として挙げられたマニュアル自身に載っているURLか。
+
+    「ハンドブックのどこかに実在する」だけでは、モデルが隣の行のURLを写した場合に
+    別マニュアルの原本へ誘導してしまうため、出典ファイル本文との対応まで確認する。
+    """
+    target = next((f for f in handbook.files if f.name == file_name), None)
+    if target is None:
+        return False
+    doc_id = _DOC_ID_RE.search(url)
+    if doc_id:
+        return doc_id.group(1) in target.content
+    return url.rstrip("/") in {
+        m.group(0).rstrip("/") for m in _URL_RE.finditer(target.content)
+    }
 
 
 def _url_in_handbook(url: str, handbook: Handbook) -> bool:
