@@ -54,6 +54,7 @@ class MentionEvent:
     account_id: int
     body: str
     send_time: int
+    to_account_id: int = 0  # メンション先（=ボット自身）のアカウントID
 
     @property
     def question(self) -> str:
@@ -73,4 +74,5 @@ def parse_mention(raw_body: bytes) -> MentionEvent | None:
         account_id=int(event["from_account_id"]),
         body=str(event.get("body", "")),
         send_time=int(event.get("send_time", 0)),
+        to_account_id=int(event.get("to_account_id") or 0),
     )

@@ -57,6 +57,12 @@ _DEFAULTS: dict[str, Any] = {
     "webhook_async": True,
     "webhook_max_concurrency": 2,
     "webhook_max_queue": 10,
+    # 文書つき雑務依頼（会議ファイルの議事録作成・要約など）
+    "doc_task": {
+        "enabled": False,
+        "max_file_mb": 20,
+        "max_text_chars": 120000,
+    },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {
         "enabled": False,

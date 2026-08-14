@@ -72,6 +72,11 @@ class RaizuinuHandler:
             log_dir=cfg.resolve_path(cfg.audit_log_dir),
             retention_days=cfg.audit_log_retention_days,
         )
+        self._doc_task = overrides.get("doc_task")
+        if self._doc_task is None and cfg.doc_task.get("enabled"):
+            from .doctask import DocTaskRunner
+
+            self._doc_task = DocTaskRunner(cfg, self._chatwork)
         self._dedupe_lock = threading.Lock()
         self._processed_ids: dict[str, None] = {}  # 挿入順を保つLRU代替
         self._dedupe_path = cfg.resolve_path(cfg.state_dir) / "processed_messages.json"
@@ -201,6 +206,7 @@ class RaizuinuHandler:
 
         # 同一ルームの直近会話を文脈として付与（FR-01）
         context = ""
+        messages: list = []
         try:
             messages = self._chatwork.get_recent_messages(
                 event.room_id, limit=cfg.context_message_count
@@ -216,6 +222,23 @@ class RaizuinuHandler:
             raise RuntimeError(
                 "ハンドブックが1件も読み込めません。handbook.roots の設定を確認してください"
             )
+
+        # 文書つき雑務依頼（会議ファイルの議事録作成・要約など）→ 専用フロー。
+        # マニュアル原本のURL（ハンドブック記載）は対象外にしてQ&Aで扱う
+        if self._doc_task is not None:
+            from .answer import _url_in_handbook
+            from .doctask import find_document
+
+            document = find_document(
+                event.body,
+                messages,
+                question,
+                bot_account_id=event.to_account_id,
+                handbook_url_check=lambda url: _url_in_handbook(url, handbook),
+            )
+            if document is not None:
+                self._process_doc_task(event, question, document)
+                return
         # 生成直前に上限を再確認（コンテキスト取得の間に他リクエストが計上した分を反映）
         status = self._cost.status()
         if status.over_limit:
@@ -268,6 +291,61 @@ class RaizuinuHandler:
                     "answer": answer.text,
                     "usage": answer.usage,
                     "cost_jpy": round(self._cost.estimate_cost_jpy(answer.usage), 3),
+                    "monthly_total_jpy": round(status.total_jpy, 2) if status else None,
+                }
+            )
+        except Exception:
+            print(
+                "[warn] 返信後の通知・監査処理に失敗（返信自体は成功）: "
+                + traceback.format_exc(),
+                flush=True,
+            )
+
+    def _process_doc_task(self, event: MentionEvent, question: str, document: dict) -> None:
+        """文書つき依頼を処理して返信する（ハンドブック・出典検証は使わない）。"""
+        from .answer import sanitize_for_chatwork
+
+        # 生成直前の上限再確認（Q&Aフローと同じ扱い）
+        status = self._cost.status()
+        if status.over_limit:
+            self._notify_stopped_once(status)
+            self._chatwork.send_message(
+                event.room_id,
+                f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n"
+                + STOPPED_MESSAGE,
+            )
+            return
+
+        reply_text, meta, usage = self._doc_task.run(question, document, event.room_id)
+
+        status = None
+        try:
+            if usage:
+                status = self._cost.add_usage(usage)
+        except Exception:
+            print("[warn] コスト計上に失敗: " + traceback.format_exc(), flush=True)
+
+        self._chatwork.send_message(
+            event.room_id,
+            f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n"
+            + sanitize_for_chatwork(reply_text),
+        )
+
+        # 返信成功後の後処理での例外は失敗メッセージを送らない（二重送信防止）
+        try:
+            if status is not None:
+                self._maybe_alert(status)
+            self._audit_safely(
+                {
+                    "type": "doc_task",
+                    "room_id": event.room_id,
+                    "account_id": event.account_id,
+                    "message_id": event.message_id,
+                    "question": question,
+                    "document": meta,
+                    "answer": reply_text[:2000],
+                    "usage": usage,
+                    "cost_jpy": round(self._cost.estimate_cost_jpy(usage), 3) if usage else 0.0,
                     "monthly_total_jpy": round(status.total_jpy, 2) if status else None,
                 }
             )

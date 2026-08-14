@@ -44,6 +44,17 @@ class ChatworkClient:
         self._raise_for_status(resp)
         return int(resp.json().get("account_id"))
 
+    def get_file_info(self, room_id: int, file_id: int) -> dict[str, Any]:
+        """添付ファイルの情報（filename・filesize・30秒有効のdownload_url）を返す。"""
+        resp = requests.get(
+            f"{API_BASE}/rooms/{room_id}/files/{file_id}",
+            headers=self._headers,
+            params={"create_download_url": 1},
+            timeout=self._timeout,
+        )
+        self._raise_for_status(resp)
+        return resp.json()
+
     def get_recent_messages(self, room_id: int, limit: int = 20) -> list[dict[str, Any]]:
         """直近のメッセージを古い順で最大limit件返す。
 

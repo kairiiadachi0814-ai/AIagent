@@ -41,6 +41,11 @@
   "audit_log_dir": "logs",
   "audit_log_retention_days": 90,
   "state_dir": "state",
+  "doc_task": {
+    "enabled": true,
+    "max_file_mb": 20,
+    "max_text_chars": 120000
+  },
   "webhook_async": true,
   "webhook_max_concurrency": 2,
   "webhook_max_queue": 10,
