@@ -62,6 +62,8 @@ _DEFAULTS: dict[str, Any] = {
         "enabled": False,
         "max_file_mb": 20,
         "max_text_chars": 120000,
+        # 「さっきのファイル」を探すときだけ、文脈用より広くメッセージを遡る
+        "search_message_count": 60,
     },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {

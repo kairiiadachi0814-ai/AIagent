@@ -293,6 +293,17 @@ class TestDocTaskRunner:
         assert content.index("途中まで") < content.index("===文書")  # 注意書きは文書より前
 
 
+class TestDocumentRequestDetection:
+    def test_looks_like_document_request(self):
+        from raizuinu.doctask import looks_like_document_request
+
+        assert looks_like_document_request("さっきのファイルを議事録にして")
+        assert looks_like_document_request("添付の内容を要約して")
+        assert not looks_like_document_request("議事録の書き方を教えて")  # 手順Q&A
+        assert not looks_like_document_request("経費精算の締め日は？")
+        assert not looks_like_document_request("添付書類の提出先はどこ？")  # 要約等の依頼でない
+
+
 class TestHandlerIntegration:
     def test_doc_task_routes_before_qa(self, tmp_path, monkeypatch):
         from tests.test_handler import FakeAudit, FakeChatwork, FakeGenerator, make_handler
@@ -347,3 +358,86 @@ class TestHandlerIntegration:
         assert "■要点" in sent_body
         assert "[rp aid=111" in sent_body
         assert audit.records[0]["type"] == "doc_task"
+
+    def test_history_upload_by_member_is_found_and_processed(self, tmp_path, monkeypatch):
+        # 「さっきのファイルを議事録にして」→ 直近のメンバー投稿の添付を拾って処理する
+        handler, chatwork, generator, audit, token = self._make(tmp_path, monkeypatch)
+        chatwork.messages = [
+            {"message_id": "1", "account": {"account_id": 111, "name": "坂田"},
+             "body": "[info][title][dtext:file_uploaded][/title]"
+                     "[download:42]会議文字起こし.txt (1 KB)[/download][/info]"},
+        ]
+        self._send(handler, token, "[To:999]さっきのファイルを議事録にして。")
+        assert generator.calls == []  # Q&Aへ流れない
+        assert "■要点" in chatwork.sent[0][1]
+        assert audit.records[0]["type"] == "doc_task"
+
+    def test_document_request_without_file_returns_guidance(self, tmp_path, monkeypatch):
+        # 見つからないときは「機能がない」ではなく、依頼の仕方を案内する（API消費なし）
+        handler, chatwork, generator, audit, token = self._make(tmp_path, monkeypatch)
+        chatwork.messages = [
+            {"message_id": "1", "account": {"account_id": 999, "name": "らいずいぬ"},
+             "body": "[download:42]ボットが上げたファイル.txt (1 KB)[/download]"},
+        ]
+        self._send(handler, token, "[To:999]さっきのファイルを議事録にして。")
+        assert generator.calls == []
+        sent = chatwork.sent[0][1]
+        assert "添付ファイルが見つかりませんでした" in sent
+        assert ".docx" in sent  # 依頼の仕方を案内
+        assert audit.records[0]["type"] == "doc_task_not_found"
+
+    # --- ヘルパー ---
+
+    def _make(self, tmp_path, monkeypatch):
+        from tests.test_handler import FakeAudit, FakeChatwork, FakeGenerator
+        import base64
+
+        from raizuinu.handbook import HandbookLoader
+        from raizuinu.handler import RaizuinuHandler
+
+        token = base64.b64encode(b"doc-test-key2").decode()
+        monkeypatch.setenv("CHATWORK_WEBHOOK_TOKEN", token)
+        (tmp_path / "銀行明細取得.md").write_text("# 銀行明細取得\n手順\n", encoding="utf-8")
+        config = Config.load(tmp_path / "no-config.json")
+        config.data.update({
+            "allowed_room_ids": [12345], "webhook_async": False,
+            "state_dir": str(tmp_path / "state"), "audit_log_dir": str(tmp_path / "logs"),
+            "doc_task": {"enabled": True, "max_file_mb": 20, "max_text_chars": 120000,
+                         "search_message_count": 60},
+        })
+        config.base_dir = tmp_path
+
+        chatwork = FakeChatwork()
+        chatwork.messages = []
+        chatwork.get_recent_messages = lambda room_id, limit=20: chatwork.messages
+        chatwork.get_file_info = lambda room_id, file_id: {
+            "filename": "会議文字起こし.txt", "filesize": 100,
+            "download_url": "https://files.example/dl",
+        }
+        audit = FakeAudit()
+        generator = FakeGenerator(None)
+        runner = DocTaskRunner(
+            config, chatwork, client=fake_client("■要点\n・テスト"),
+            http_get=lambda url, timeout=60: (200, url, "会議の本文".encode("utf-8")),
+        )
+        handler = RaizuinuHandler(
+            config, chatwork=chatwork, generator=generator, audit=audit,
+            handbook_loader=HandbookLoader([tmp_path], ["*.md"], [], 300),
+            doc_task=runner,
+        )
+        return handler, chatwork, generator, audit, token
+
+    @staticmethod
+    def _send(handler, token, body_text):
+        import base64, hashlib, hmac
+
+        body = json.dumps({
+            "webhook_event_type": "mention_to_me",
+            "webhook_event": {
+                "from_account_id": 111, "to_account_id": 999,
+                "room_id": 12345, "message_id": "300002",
+                "body": body_text, "send_time": 1700000000,
+            },
+        }).encode()
+        digest = hmac.new(base64.b64decode(token), body, hashlib.sha256).digest()
+        return handler.handle_webhook(body, base64.b64encode(digest).decode())

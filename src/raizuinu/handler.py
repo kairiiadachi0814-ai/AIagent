@@ -227,15 +227,37 @@ class RaizuinuHandler:
         # マニュアル原本のURL（ハンドブック記載）は対象外にしてQ&Aで扱う
         if self._doc_task is not None:
             from .answer import _url_in_handbook
-            from .doctask import find_document
-
-            document = find_document(
-                event.body,
-                messages,
-                question,
-                bot_account_id=event.to_account_id,
-                handbook_url_check=lambda url: _url_in_handbook(url, handbook),
+            from .doctask import (
+                NO_DOCUMENT_GUIDANCE,
+                find_document,
+                looks_like_document_request,
             )
+
+            url_check = lambda url: _url_in_handbook(url, handbook)  # noqa: E731
+            document = find_document(
+                event.body, messages, question,
+                bot_account_id=event.to_account_id, handbook_url_check=url_check,
+            )
+            if document is None and looks_like_document_request(question):
+                # 「さっきのファイル」を探すときだけ、文脈用より広く遡って再検索する
+                try:
+                    wider = self._chatwork.get_recent_messages(
+                        event.room_id,
+                        limit=int(cfg.doc_task.get("search_message_count", 60)),
+                    )
+                    document = find_document(
+                        event.body, wider, question,
+                        bot_account_id=event.to_account_id, handbook_url_check=url_check,
+                    )
+                except Exception:
+                    print("[warn] 添付ファイル探索に失敗: " + traceback.format_exc(), flush=True)
+                if document is None:
+                    # 文書依頼と分かっているものをQ&Aへ流すと「機能がない」等の
+                    # 誤った回答になるため、ここで案内文を返して終える
+                    self._reply_and_audit(
+                        event, question, NO_DOCUMENT_GUIDANCE, "doc_task_not_found"
+                    )
+                    return
             if document is not None:
                 self._process_doc_task(event, question, document)
                 return
@@ -300,6 +322,28 @@ class RaizuinuHandler:
                 + traceback.format_exc(),
                 flush=True,
             )
+
+    def _reply_and_audit(
+        self, event: MentionEvent, question: str, text: str, record_type: str
+    ) -> None:
+        """API消費のない定型返信を送り、監査ログに残す。"""
+        from .answer import sanitize_for_chatwork
+
+        self._chatwork.send_message(
+            event.room_id,
+            f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n"
+            + sanitize_for_chatwork(text),
+        )
+        self._audit_safely(
+            {
+                "type": record_type,
+                "room_id": event.room_id,
+                "account_id": event.account_id,
+                "message_id": event.message_id,
+                "question": question,
+                "answer": text,
+            }
+        )
 
     def _process_doc_task(self, event: MentionEvent, question: str, document: dict) -> None:
         """文書つき依頼を処理して返信する（ハンドブック・出典検証は使わない）。"""

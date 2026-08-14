@@ -106,6 +106,28 @@ def _document_in_text(text: str) -> dict[str, Any] | None:
     return None
 
 
+NO_DOCUMENT_GUIDANCE = (
+    "すみません、直近のやり取りの中に読み取れる添付ファイルが見つかりませんでした。\n"
+    "お手数ですが、次のいずれかでもう一度お声がけいただけますか。\n"
+    "・ファイル（.docx／.txt など）を添付したメッセージの中で、私宛にメンションして依頼する\n"
+    "・GoogleドキュメントやスプレッドシートのURLを、依頼のメッセージに貼り付ける\n"
+    "（旧形式の .doc やPDFは読み取れないため、Wordで .docx として保存し直してください）"
+)
+
+
+def looks_like_document_request(question: str) -> bool:
+    """「さっきのファイルを議事録にして」のように、文書を指した依頼かどうか。
+
+    該当するのに文書が見つからない場合は、通常のQ&Aに流さず案内文を返すために使う
+    （ハンドブックの質問として処理されると「機能がない」等の誤った回答になるため）。
+    """
+    if any(m in question for m in _HOWTO_MARKERS):
+        return False
+    return any(kw in question for kw in _TASK_KEYWORDS) and any(
+        m in question for m in _DOC_REF_MARKERS
+    )
+
+
 def find_document(
     body: str,
     recent_messages: list[dict],

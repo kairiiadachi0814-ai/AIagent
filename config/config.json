@@ -44,7 +44,8 @@
   "doc_task": {
     "enabled": true,
     "max_file_mb": 20,
-    "max_text_chars": 120000
+    "max_text_chars": 120000,
+    "search_message_count": 60
   },
   "webhook_async": true,
   "webhook_max_concurrency": 2,
