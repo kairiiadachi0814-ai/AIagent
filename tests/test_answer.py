@@ -8,6 +8,7 @@ from raizuinu.handbook import HandbookLoader
 
 REAL_URL = "https://docs.google.com/document/d/abc123/edit"
 FREEE_URL = "https://www.freee.co.jp/kb/kb-accounting/entertainment-expenses/"
+MIRASAPO_URL = "https://mirasapo-plus.go.jp/subsidy/ithojo/"
 
 
 def make_handbook(tmp_path):
@@ -17,6 +18,9 @@ def make_handbook(tmp_path):
     )
     (tmp_path / "会計基礎知識リンク集_freee.md").write_text(
         f"# 会計リンク集\n| 交際費 | {FREEE_URL} |\n", encoding="utf-8"
+    )
+    (tmp_path / "補助金リンク集_ミラサポplus.md").write_text(
+        f"# 補助金リンク集\n- デジタル化・AI導入補助金: {MIRASAPO_URL}\n", encoding="utf-8"
     )
     return HandbookLoader([tmp_path], ["*.md"], [], 300).load()
 
@@ -233,6 +237,94 @@ class TestAnswerGenerator:
         assert client.kwargs["tools"][0]["type"] == "web_fetch_20260209"
         assert FREEE_URL in client.kwargs["messages"][0]["content"]
         assert answer.usage["input_tokens"] == 6000  # 両段の累積
+
+    def test_subsidy_two_stage_summary_via_mirasapo(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["web_fetch_enabled"] = True
+        config.data["web_fetch_allowed_domains"] = ["www.freee.co.jp", "mirasapo-plus.go.jp"]
+        stage1 = {
+            "intent": "general_knowledge",
+            "reference_url": MIRASAPO_URL,
+            "has_answer": False,
+            "answer": f"社内ハンドブックには記載がありません。参考: {MIRASAPO_URL}",
+            "sources": [],
+            "suggested_file": "",
+            "reported_manuals": [],
+        }
+        summary = "ITツール導入を支援する補助金です。※ミラサポplus（経済産業省 中小企業庁）の掲載情報に基づきます。"
+        client = FakeClient([fake_response(stage1), self._stage2_response(summary)])
+        gen = AnswerGenerator(config, client=client)
+        answer = gen.generate("IT導入補助金って何？", handbook)
+        assert client.calls == 2  # ミラサポplusドメインも2段目の取得対象
+        assert answer.has_answer
+        assert "ITツール" in answer.text
+        assert answer.sources == [
+            {"file": "補助金リンク集_ミラサポplus.md", "heading": "", "url": MIRASAPO_URL}
+        ]
+        # 2段目のシステム指示には補助金向け免責文（公募要領の確認）が入る
+        assert "公募要領" in client.kwargs["system"]
+        assert "税理士" not in client.kwargs["system"]
+
+    def test_disclaimer_selection_by_domain(self):
+        from raizuinu.answer import _disclaimer_for_url
+
+        assert "公募要領" in _disclaimer_for_url(MIRASAPO_URL)
+        assert "税理士" in _disclaimer_for_url(FREEE_URL)
+        assert "税理士" in _disclaimer_for_url("")  # 不明時は従来の免責文
+        # 偽装ドメインはミラサポ扱いにしない
+        assert "税理士" in _disclaimer_for_url("https://mirasapo-plus.go.jp.evil.com/x/")
+
+    def test_subsidy_stage2_prompt_requires_acceptance_status(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["web_fetch_enabled"] = True
+        config.data["web_fetch_allowed_domains"] = ["mirasapo-plus.go.jp"]
+        stage1 = {
+            "intent": "general_knowledge",
+            "reference_url": MIRASAPO_URL,
+            "has_answer": False,
+            "answer": f"参考: {MIRASAPO_URL}",
+            "sources": [],
+            "suggested_file": "",
+            "reported_manuals": [],
+        }
+        client = FakeClient([fake_response(stage1), self._stage2_response("要約です。")])
+        gen = AnswerGenerator(config, client=client)
+        answer = gen.generate("IT導入補助金の上限額は？", handbook)
+        # 補助金ページでは受付状況の言及を必須にし、行数上限も2〜8行へ緩和
+        assert "受付状況" in client.kwargs["system"]
+        assert "2〜8行" in client.kwargs["system"]
+        assert answer.stage2 == "ok"
+
+    def test_stage2_status_recorded_on_fetch_failure(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["web_fetch_enabled"] = True
+        config.data["web_fetch_allowed_domains"] = ["www.freee.co.jp"]
+        client = FakeClient(
+            [fake_response(self._general_knowledge_stage1()), self._stage2_response("FETCH_FAILED")]
+        )
+        gen = AnswerGenerator(config, client=client)
+        answer = gen.generate("接待交際費の限度は？", handbook)
+        assert answer.stage2 == "fetch_failed"  # 監査ログでリンク切れを検知できる
+
+    def test_fabricated_mirasapo_url_in_body_is_scrubbed(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        fake_url = "https://mirasapo-plus.go.jp/subsidy/not-a-real-page/"
+        gen, _ = make_generator(
+            tmp_path,
+            {
+                "has_answer": True,
+                "answer": f"詳しくは {fake_url} をご覧ください",
+                "sources": [{"file": "銀行明細取得.md", "heading": "", "url": ""}],
+                "suggested_file": "",
+            },
+        )
+        answer = gen.generate("質問", handbook)
+        # リンク集に無いミラサポURLの創作は許可しない（完全一致検証のみ）
+        assert fake_url not in answer.text
+        assert "（URL省略）" in answer.text
 
     def test_general_knowledge_fetch_failure_falls_back_to_link(self, tmp_path):
         handbook = make_handbook(tmp_path)

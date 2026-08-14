@@ -30,11 +30,11 @@ ANSWER_SCHEMA: dict[str, Any] = {
                 "legal_knowledge",
                 "answer_feedback",
             ],
-            "description": "メッセージ種別。社内手順・ルールの質問=question／マニュアル更新の報告=manual_update_report／一般的な会計・簿記・税務知識の質問=general_knowledge／法令・法律の知識に関する質問=legal_knowledge／過去の回答への誤り指摘・改善要望=answer_feedback",
+            "description": "メッセージ種別。社内手順・ルールの質問=question／マニュアル更新の報告=manual_update_report／一般的な会計・簿記・税務知識または補助金・助成金・支援制度の質問=general_knowledge／法令・法律の知識に関する質問=legal_knowledge／過去の回答への誤り指摘・改善要望=answer_feedback",
         },
         "reference_url": {
             "type": "string",
-            "description": "general_knowledgeの場合のみ: 会計基礎知識リンク集に記載の該当記事URLを一字一句正確に転記。該当がなければ空文字。他のintentでは空文字",
+            "description": "general_knowledgeの場合のみ: 会計基礎知識リンク集（会計・税務）または補助金リンク集（補助金・助成金の制度内容）に記載の該当ページURLを一字一句正確に転記。どちらを使うかは質問の主眼（会計処理か制度内容か）で選ぶ。該当がなければ空文字。他のintentでは空文字",
         },
         "reported_manuals": {
             "type": "array",
@@ -79,8 +79,8 @@ LEGAL_TOOLS: list[dict[str, Any]] = [
         "description": (
             "日本の法令（法律・政令・省令）をe-Gov法令検索で条文キーワード検索する。"
             "法令・法律の知識に関する質問（intent=legal_knowledge）の回答専用。"
-            "法令の質問では法令・条文の特定に必ず使い、社内手順・一般会計知識など"
-            "法令以外の質問では決して呼び出さないこと。"
+            "法令の質問では法令・条文の特定に必ず使い、社内手順・一般会計知識・"
+            "補助金/助成金の制度内容など法令以外の質問では決して呼び出さないこと。"
             "結果にはlaw_id・法令名・該当箇所の抜粋・e-GovのURLが含まれる。"
         ),
         "input_schema": {
@@ -100,7 +100,8 @@ LEGAL_TOOLS: list[dict[str, Any]] = [
             "law_idと条番号を指定して条文の原文を取得する（e-Gov法令検索）。"
             "法令・法律の知識に関する質問（intent=legal_knowledge）の回答専用で、"
             "law_idにはsearch_lawの結果から得た実際の値のみを指定すること。"
-            "法令の回答は必ずこの原文に基づき、法令以外の質問では決して呼び出さないこと。"
+            "法令の回答は必ずこの原文に基づき、法令以外の質問"
+            "（社内手順・一般会計知識・補助金/助成金の制度内容など）では決して呼び出さないこと。"
         ),
         "input_schema": {
             "type": "object",
@@ -145,8 +146,8 @@ Chatworkで社員からの質問に、社内ハンドブック（経理・財務
 6. 会話履歴は文脈理解の参考とし、回答の根拠にはしないこと。
 7. 関連する原本文書・スプレッドシート・フォルダのURLがハンドブック（特に「マニュアルリンク集」）に記載されている場合は、回答本文またはsourcesのurlに含めて案内すること。URLは一字一句正確に転記し、加工・短縮・推測してはならない。ハンドブックに記載のないURLを作らないこと。本文中に一字一句正確に写す自信がないURLは本文に書かず、「末尾の【出典】のリンクからご覧ください」のように出典欄へ誘導すること（本文のURLはハンドブックとの完全一致チェックがあり、一致しないと「（URL省略）」に置換されて読みにくくなる）。
 8. メッセージ種別の判定: 利用者が質問ではなく「マニュアル（原本）を更新した・変更した」と明確に報告している場合のみ、intentをmanual_update_reportとし、reported_manualsに対象マニュアル名を入れること。その場合answerには報告内容の短い受領確認文（1〜2文。対象マニュアル名を復唱）を書き、has_answerはfalse、sourcesは空とする。更新の仕方に関する質問や迷うケースはquestionとして扱うこと。
-9. 一般的な会計・簿記・税務知識の質問（社内の手順・ルールではないもの）への対応: intentをgeneral_knowledgeとし、「会計基礎知識リンク集」に該当する解説記事があればreference_urlにそのURLを一字一句正確に転記すること。answerには「社内ハンドブックには記載がありません。参考記事: <URL>」の趣旨の案内文（税理士確認の注意書き付き）を書く。詳細な要約はシステム側が記事を取得して別途行うため、自身の知識だけで数値や限度額を断定して書いてはならない。該当記事がリンク集にない場合はreference_urlを空にし「記載なし」の回答とする。
-10. 法令・法律の知識に関する質問（社内手順ではないもの）: intentをlegal_knowledgeとし、必ずsearch_lawツールで法令を特定し、get_law_articleツールで条文の原文を取得したうえで、その原文に基づいて回答すること。ツールを使わず記憶だけで条文の内容や条番号を断定してはならない。回答には法令名・条番号を明記し、ツール結果に含まれるURL（laws.e-gov.go.jp）をそのまま含める。回答の最後に必ず「※e-Gov法令検索の条文に基づく一般的な情報です。法的判断や契約書の内容確認は、顧問弁護士への相談またはLegalForceでのリーガルチェックを経てください。」を付ける。この場合sourcesは空でよい（出典は本文中の法令名・条番号・URLで示す）。has_answerは条文を取得できた場合にtrue。**ツール呼び出しは効率よく行うこと**: 独立した検索・条文取得は1ターンに複数まとめて並列に呼んでよい。網羅を目指さず、質問に最も関係する法令1〜2件・条文2〜4件に絞り、取得できた範囲で回答をまとめること（ツール往復は合計5回以内を目安）。search_law／get_law_articleは法令・法律の質問の回答専用ツールであり、intentがlegal_knowledge以外になる質問（社内手順・一般会計知識・更新報告・フィードバック等）では一切呼び出さないこと。「placeholder」のような仮の引数での試し呼び出しもしてはならない。
+9. 一般的な会計・簿記・税務知識の質問、または補助金・助成金・支援制度に関する質問（いずれも社内の手順・ルールではないもの）への対応: intentをgeneral_knowledgeとし、会計・税務なら「会計基礎知識リンク集」、補助金・助成金・支援制度なら「補助金リンク集」に該当する解説ページがあればreference_urlにそのURLを一字一句正確に転記すること。リンク集の使い分けは質問の主眼で決める: (a)補助金に触れる質問でも、主眼が受給後の会計処理・仕訳・税務（圧縮記帳、収益計上時期、消費税・法人税の扱いなど）であれば「会計基礎知識リンク集」から選ぶ。(b)制度の内容・対象・金額・申請方法・探し方が主眼なら「補助金リンク集」から選び、会計基礎知識リンク集に類似記事があっても補助金リンク集を優先する。(c)個別の制度への質問はその制度の個別ページがある場合のみ使い、一覧・チラシ集などの総覧ページは「どんな補助金があるか」のような探し方の質問にのみ使う。(d)主眼側のリンク集に該当ページが無ければreference_urlを空にし「記載なし」の回答とする（もう一方のリンク集で代用しない）。answerには「社内ハンドブックには記載がありません。参考: <URL>」の趣旨の案内文（会計・税務は税理士確認、補助金は公式サイト・公募要領確認の注意書き付き）を書く。詳細な要約はシステム側がページを取得して別途行うため、自身の知識だけで数値・限度額・公募期間・申請可否を断定して書いてはならない。
+10. 法令・法律の知識に関する質問（社内手順ではないもの）: intentをlegal_knowledgeとし、必ずsearch_lawツールで法令を特定し、get_law_articleツールで条文の原文を取得したうえで、その原文に基づいて回答すること。ツールを使わず記憶だけで条文の内容や条番号を断定してはならない。回答には法令名・条番号を明記し、ツール結果に含まれるURL（laws.e-gov.go.jp）をそのまま含める。回答の最後に必ず「※e-Gov法令検索の条文に基づく一般的な情報です。法的判断や契約書の内容確認は、顧問弁護士への相談またはLegalForceでのリーガルチェックを経てください。」を付ける。この場合sourcesは空でよい（出典は本文中の法令名・条番号・URLで示す）。has_answerは条文を取得できた場合にtrue。**ツール呼び出しは効率よく行うこと**: 独立した検索・条文取得は1ターンに複数まとめて並列に呼んでよい。網羅を目指さず、質問に最も関係する法令1〜2件・条文2〜4件に絞り、取得できた範囲で回答をまとめること（ツール往復は合計5回以内を目安）。search_law／get_law_articleは法令・法律の質問の回答専用ツールであり、intentがlegal_knowledge以外になる質問（社内手順・一般会計知識・更新報告・フィードバック等）では一切呼び出さないこと。「placeholder」のような仮の引数での試し呼び出しもしてはならない。補助金・助成金・支援制度の内容・要件・金額・申請方法の質問は法令の質問ではない（原則9のgeneral_knowledgeとして扱い、これらのツールを使わない）。補助金の根拠となる法律の条文そのものを明確に問われた場合のみ法令の質問として扱う。
 11. 契約書の作成・ひな形に関する相談: 「ひな形リンク集」から該当するひな形のURLを案内し、あわせて「作成した契約書は締結前に必ずLegalForceでリーガルチェックを行う」こと（手順はハンドブック「LegalForce_リーガルチェック」参照）を必ず案内する。契約条項の妥当性を自ら断定してはならない。
 12. 過去の回答への誤り指摘・不満・改善要望（フィードバック）: intentをanswer_feedbackとし、answerには丁寧なお詫びと受領の一言を書くこと（指摘内容を短く復唱し、改善リストに追加して管理者が確認する旨を伝える）。反論や弁明はせず、has_answerはfalse、sourcesは空とする。"""
 
@@ -162,6 +163,7 @@ class Answer:
     intent: str = "question"
     reported_manuals: list[str] = field(default_factory=list)
     reference_url: str = ""
+    stage2: str = ""  # 2段目取得の結果: ""=対象外 / "ok" / "fetch_failed" / "error"
 
 
 class AnswerGenerator:
@@ -377,10 +379,13 @@ class AnswerGenerator:
         try:
             text, usage2 = self._summarize_article(question, url)
         except Exception:
+            answer.stage2 = "error"
             return answer  # 要約失敗時は案内文のまま（呼び出し元で失敗扱いにしない）
         _accumulate_usage(answer.usage, usage2)
         if not text:
+            answer.stage2 = "fetch_failed"  # リンク切れ・ソフト404の検知用（監査ログへ）
             return answer
+        answer.stage2 = "ok"
         source_file = _find_url_file(url, handbook)
         answer.text = _scrub_body_urls(text, handbook)
         answer.has_answer = True
@@ -390,23 +395,34 @@ class AnswerGenerator:
         return answer
 
     def _summarize_article(self, question: str, url: str) -> "tuple[str, dict[str, int]]":
-        """記事をweb_fetchで取得し、質問への要点回答を生成する（2段目・軽量呼び出し）。"""
+        """参考ページをweb_fetchで取得し、質問への要点回答を生成する（2段目・軽量呼び出し）。"""
         cfg = self._config
+        is_subsidy = _is_mirasapo_url(url)
+        line_range = "2〜8行" if is_subsidy else "2〜6行"
+        subsidy_note = (
+            "補助金・助成金のページでは、公募期間・受付状況（公募中／受付終了／次回公募の予定）が"
+            "ページに記載されている場合、質問と直接関係なくても必ず1行含めること。"
+            if is_subsidy
+            else ""
+        )
         system = (
-            "あなたは社内アシスタント。ユーザーの質問と参考記事URLが与えられる。"
-            "web_fetchツールで記事を取得し、記事の内容に基づいて質問への答え"
-            "（該当する数値・条件・区分など）を日本語で2〜6行に簡潔にまとめること。"
+            "あなたは社内アシスタント。ユーザーの質問と参考ページのURLが与えられる。"
+            "web_fetchツールでページを取得し、ページの内容に基づいて質問への答え"
+            f"（該当する数値・条件・区分・期限など）を日本語で{line_range}に簡潔にまとめること。"
             "文体は、気さくで頼れる経理の先輩が教えてくれるようなです・ます調の"
             "話し言葉にする（かしこまりすぎない）。経理財務の経験が浅い人にも"
             "分かるように、専門用語には初出時にひと言の意味を添えてよい。"
-            "ただし記事に書かれた事実の範囲で言い方だけを易しくし、"
-            "数値や正式な用語は記事のとおり正確に書くこと。"
-            "記事の長い引用・転載はしない。記事に書かれていないことは書かない。"
+            "ただしページに書かれた事実の範囲で言い方だけを易しくし、"
+            "数値や正式な用語はページのとおり正確に書くこと。"
+            "ページの長い引用・転載はしない。ページに書かれていないことは書かない。"
+            + subsidy_note +
             "「内容を取得しました」「回答をまとめます」のような作業経過の前置きは"
             "一切書かず、回答本文から直接始めること。"
-            "回答の最後に必ず「※社外の一般解説（freee会計）に基づく情報です。"
-            "当社での具体的な取り扱い・税務判断は税理士にご確認ください。」を付けること。"
-            "記事を取得できなかった場合は FETCH_FAILED とだけ出力すること。"
+            f"回答の最後に必ず「{_disclaimer_for_url(url)}」を付けること。"
+            "ページを取得できなかった場合、または取得したページが"
+            "「ページが見つかりません」等のエラーページや、参考ページURLの主題と"
+            "明らかに無関係な内容（トップページへの転送等）だった場合は、"
+            "FETCH_FAILED とだけ出力すること。"
         )
         kwargs: dict[str, Any] = {
             "model": cfg.model,
@@ -424,7 +440,7 @@ class AnswerGenerator:
                 }
             ],
         }
-        messages = [{"role": "user", "content": f"質問: {question}\n参考記事URL: {url}"}]
+        messages = [{"role": "user", "content": f"質問: {question}\n参考ページURL: {url}"}]
         response, usage, _ = _call_with_continuation(
             self._client.messages.create, kwargs, messages
         )
@@ -560,6 +576,29 @@ def _call_with_continuation(
             continue
         break
     return response, usage_total, tool_used
+
+
+# 2段目要約の末尾に付ける免責文（参照元ドメイン別）
+_FREEE_DISCLAIMER = (
+    "※社外の一般解説（freee会計）に基づく情報です。"
+    "当社での具体的な取り扱い・税務判断は税理士にご確認ください。"
+)
+_MIRASAPO_DISCLAIMER = (
+    "※ミラサポplus（経済産業省 中小企業庁）の掲載情報に基づきます。"
+    "補助金・助成金の公募期間や要件は変わることがあるため、"
+    "申請前に必ず各制度の公式サイト・公募要領をご確認ください。"
+)
+
+
+def _is_mirasapo_url(url: str) -> bool:
+    from urllib.parse import urlparse
+
+    host = (urlparse(url).hostname or "").lower()
+    return host == "mirasapo-plus.go.jp" or host.endswith(".mirasapo-plus.go.jp")
+
+
+def _disclaimer_for_url(url: str) -> str:
+    return _MIRASAPO_DISCLAIMER if _is_mirasapo_url(url) else _FREEE_DISCLAIMER
 
 
 def _find_url_file(url: str, handbook: Handbook) -> str | None:

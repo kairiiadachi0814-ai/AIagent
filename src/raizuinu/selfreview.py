@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -74,6 +75,14 @@ def summarize(records: list[dict]) -> dict[str, Any]:
         for s in r.get("sources") or []:
             source_counter[str(s)] += 1
     cost = sum(float(r.get("cost_jpy") or 0.0) for r in records)
+    # 参考ページ（freee・ミラサポplus）の取得失敗はリンク切れ・サイト改編の兆候
+    fetch_failed_urls = sorted(
+        {
+            str(r.get("reference_url", ""))
+            for r in answers
+            if r.get("stage2") in ("fetch_failed", "error") and r.get("reference_url")
+        }
+    )
     return {
         "total": len(records),
         "by_type": dict(by_type),
@@ -85,7 +94,42 @@ def summarize(records: list[dict]) -> dict[str, Any]:
         "errors": by_type.get("error", 0),
         "top_sources": source_counter.most_common(5),
         "cost_jpy": round(cost, 1),
+        "fetch_failed_urls": fetch_failed_urls[:MAX_LISTED_QUESTIONS],
     }
+
+
+SUBSIDY_LINK_FILE = "補助金リンク集_ミラサポplus.md"
+_URL_PATTERN = re.compile(r"https?://[^\s)\"<>」』]+")
+
+
+def check_link_health(handbook, fetcher=None) -> list[str]:
+    """補助金リンク集のURLを実際に取得し、異常なURL（リンク切れ・トップへの転送）を返す。
+
+    ミラサポplusはサイト改編が多く、旧URLがトップページへの転送やソフト404になるため、
+    週次でステータスと最終URLを確認する。freeeリンク集（270件超）は対象外（コスト対効果）。
+    """
+    if fetcher is None:
+        import requests
+
+        def fetcher(url):  # noqa: ANN001 - (status_code, final_url) を返す
+            resp = requests.get(url, timeout=15, allow_redirects=True)
+            return resp.status_code, str(resp.url)
+
+    target = next((f for f in handbook.files if f.name == SUBSIDY_LINK_FILE), None)
+    if target is None:
+        return []
+    broken: list[str] = []
+    for url in sorted(set(_URL_PATTERN.findall(target.content))):
+        try:
+            status, final_url = fetcher(url)
+        except Exception:
+            broken.append(f"{url}（接続失敗）")
+            continue
+        if status >= 400:
+            broken.append(f"{url}（HTTP {status}）")
+        elif final_url.rstrip("/") == "https://mirasapo-plus.go.jp" and url.rstrip("/") != "https://mirasapo-plus.go.jp":
+            broken.append(f"{url}（トップページへ転送）")
+    return broken
 
 
 def build_proposals(
@@ -154,7 +198,9 @@ def build_proposals(
     ).strip()
 
 
-def render_report(stats: dict, proposals: str, limit_note: str = "") -> str:
+def render_report(
+    stats: dict, proposals: str, limit_note: str = "", broken_links: list[str] | None = None
+) -> str:
     lines = [
         "[info][title]らいずいぬ 週次自己分析レポート[/title]",
         f"対象期間: 直近{ANALYSIS_DAYS}日間",
@@ -170,6 +216,12 @@ def render_report(stats: dict, proposals: str, limit_note: str = "") -> str:
         lines.append("■答えられなかった質問")
         for q in stats["unanswered_questions"]:
             lines.append(f"・{q}")
+    link_issues = list(stats.get("fetch_failed_urls") or []) + list(broken_links or [])
+    if link_issues:
+        lines.append("")
+        lines.append("■参考ページの取得失敗・リンク切れの疑い（リンク集の更新をご検討ください）")
+        for u in link_issues:
+            lines.append(f"・{u}")
     if proposals:
         lines.append("")
         lines.append("■改善提案（要承認）")
@@ -219,7 +271,12 @@ def main() -> None:
     if not proposals and cost.status().over_limit:
         limit_note = "（今月のAPI利用上限に達しているため、提案生成は省略し統計のみ掲載しています）"
 
-    report = render_report(stats, proposals, limit_note)
+    try:
+        broken_links = check_link_health(handbook)
+    except Exception:
+        broken_links = []  # ヘルスチェック失敗でレポート全体を落とさない
+
+    report = render_report(stats, proposals, limit_note, broken_links)
 
     # レポートを記録として保存（反映作業時にClaude Codeが参照する）
     reports_dir = state_dir / "reports"

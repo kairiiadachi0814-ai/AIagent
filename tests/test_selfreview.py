@@ -101,3 +101,56 @@ class TestRenderReport:
         # 承認ゲートの明示（勝手に変更しないことの宣言）
         assert "まだ何も変更していません" in report
         assert "反映して" in report
+
+
+class TestLinkHealth:
+    def _handbook_with_links(self, tmp_path):
+        from raizuinu.handbook import HandbookLoader
+
+        (tmp_path / "補助金リンク集_ミラサポplus.md").write_text(
+            "# 補助金リンク集\n"
+            "- ものづくり補助金: https://mirasapo-plus.go.jp/subsidy/manufacturing/\n"
+            "- 旧ページ: https://mirasapo-plus.go.jp/subsidy/old-gone/\n",
+            encoding="utf-8",
+        )
+        return HandbookLoader([tmp_path], ["*.md"], [], 300).load()
+
+    def test_detects_404_and_redirect_to_top(self, tmp_path):
+        from raizuinu.selfreview import check_link_health
+
+        def fetcher(url):
+            if "old-gone" in url:
+                return 404, url
+            return 200, url
+
+        broken = check_link_health(self._handbook_with_links(tmp_path), fetcher=fetcher)
+        assert broken == ["https://mirasapo-plus.go.jp/subsidy/old-gone/（HTTP 404）"]
+
+    def test_detects_soft_redirect_to_top(self, tmp_path):
+        from raizuinu.selfreview import check_link_health
+
+        def fetcher(url):
+            if "old-gone" in url:
+                return 200, "https://mirasapo-plus.go.jp/"  # トップへ転送＝ソフト404
+            return 200, url
+
+        broken = check_link_health(self._handbook_with_links(tmp_path), fetcher=fetcher)
+        assert broken == ["https://mirasapo-plus.go.jp/subsidy/old-gone/（トップページへ転送）"]
+
+    def test_fetch_failed_urls_reported(self):
+        from raizuinu.selfreview import render_report, summarize
+
+        records = [
+            {
+                "type": "answer",
+                "has_answer": False,
+                "stage2": "fetch_failed",
+                "reference_url": "https://mirasapo-plus.go.jp/subsidy/ithojo/",
+                "question": "IT導入補助金は？",
+            }
+        ]
+        stats = summarize(records)
+        assert stats["fetch_failed_urls"] == ["https://mirasapo-plus.go.jp/subsidy/ithojo/"]
+        report = render_report(stats, "", "")
+        assert "リンク切れ" in report
+        assert "https://mirasapo-plus.go.jp/subsidy/ithojo/" in report
