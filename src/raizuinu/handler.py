@@ -615,7 +615,7 @@ def _sources_suffix(answer) -> str:
     if answer.has_answer and answer.sources:
         labels = []
         for s in answer.sources:
-            label = display_name(s["file"]) + (
+            label = (s.get("title") or display_name(s["file"])) + (
                 f"（{s['heading']}）" if s.get("heading") else ""
             )
             if s.get("url"):
