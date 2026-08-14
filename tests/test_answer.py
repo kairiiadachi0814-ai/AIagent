@@ -351,6 +351,87 @@ class TestAnswerGenerator:
         assert answer.has_answer
         assert "laws.e-gov.go.jp" in answer.text
 
+    def test_placeholder_tool_args_rejected_without_egov_call(self, tmp_path):
+        # 一般会計知識の質問でモデルがplaceholder引数の退行的ツール呼び出しをした
+        # 実測ケース。e-Govへは送らず、エラー文をツール結果として返して継続する
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["legal_enabled"] = True
+
+        class ExplodingEgov:
+            def search(self, keyword):
+                raise AssertionError("placeholder引数でe-Govを呼んではならない")
+
+            def search_by_title(self, title):
+                raise AssertionError("placeholder引数でe-Govを呼んではならない")
+
+            def get_article(self, law_id, article=None):
+                raise AssertionError("placeholder引数でe-Govを呼んではならない")
+
+        tool_use_response = SimpleNamespace(
+            stop_reason="tool_use",
+            content=[
+                SimpleNamespace(type="tool_use", id="tu_1", name="search_law",
+                                input={"keyword": "placeholder"}),
+                SimpleNamespace(type="tool_use", id="tu_2", name="get_law_article",
+                                input={"law_id": "placeholder"}),
+            ],
+            usage=None,
+        )
+        final_payload = {
+            "intent": "general_knowledge",
+            "reference_url": "",
+            "has_answer": False,
+            "answer": "社内ハンドブックには記載がありません。",
+            "sources": [],
+            "suggested_file": "",
+            "reported_manuals": [],
+        }
+        client = FakeClient([tool_use_response, fake_response(final_payload)])
+        gen = AnswerGenerator(config, client=client, egov=ExplodingEgov())
+        answer = gen.generate("貸倒引当金って何ですか？", handbook)
+
+        assert client.calls == 2
+        tool_results = client.kwargs["messages"][-1]["content"]
+        assert len(tool_results) == 2
+        assert all(r["content"].startswith("エラー:") for r in tool_results)
+        assert answer.text == "社内ハンドブックには記載がありません。"
+
+    def test_placeholder_only_tool_calls_do_not_ground_legal_answer(self, tmp_path):
+        # placeholder引数で棄却された呼び出しは「ツール実行済み」に数えない。
+        # 条文を取得していない法令回答はquestionへ降格され出典検証を通る
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["legal_enabled"] = True
+
+        class ExplodingEgov:
+            def search(self, keyword):
+                raise AssertionError("placeholder引数でe-Govを呼んではならない")
+
+        tool_use_response = SimpleNamespace(
+            stop_reason="tool_use",
+            content=[
+                SimpleNamespace(type="tool_use", id="tu_1", name="search_law",
+                                input={"keyword": "placeholder"}),
+            ],
+            usage=None,
+        )
+        final_payload = {
+            "intent": "legal_knowledge",
+            "reference_url": "",
+            "has_answer": True,
+            "answer": "民法第522条により契約は承諾で成立します（条文未取得の断定）",
+            "sources": [],
+            "suggested_file": "",
+            "reported_manuals": [],
+        }
+        client = FakeClient([tool_use_response, fake_response(final_payload)])
+        gen = AnswerGenerator(config, client=client, egov=ExplodingEgov())
+        answer = gen.generate("契約はいつ成立する？", handbook)
+        assert answer.intent == "question"
+        assert not answer.has_answer
+        assert "断定" not in answer.text
+
     def test_general_knowledge_stage2_truncation_falls_back(self, tmp_path):
         handbook = make_handbook(tmp_path)
         config = Config.load(tmp_path / "no-config.json")
@@ -530,3 +611,18 @@ class TestFormatReply:
         assert "[info]" not in reply
         assert "[title]" not in reply
         assert reply.startswith("[rp aid=111 to=12345-100001]")  # 自前タグは維持
+
+
+class TestPlaceholderDetection:
+    def test_placeholder_like_values_detected(self):
+        from raizuinu.answer import _is_placeholder_value
+
+        for value in ["placeholder", "Placeholder", "PLACEHOLDER", "", "   ",
+                      "<keyword>", "<law_id>", "string", "n/a", "---", "…"]:
+            assert _is_placeholder_value(value), value
+
+    def test_real_values_pass(self):
+        from raizuinu.answer import _is_placeholder_value
+
+        for value in ["下請代金 支払期日", "貸倒引当金", "民法", "129AC0000000089"]:
+            assert not _is_placeholder_value(value), value

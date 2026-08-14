@@ -78,8 +78,10 @@ LEGAL_TOOLS: list[dict[str, Any]] = [
         "name": "search_law",
         "description": (
             "日本の法令（法律・政令・省令）をe-Gov法令検索で条文キーワード検索する。"
-            "法令・条文の特定に必ず使うこと。結果にはlaw_id・法令名・該当箇所の抜粋・"
-            "e-GovのURLが含まれる。"
+            "法令・法律の知識に関する質問（intent=legal_knowledge）の回答専用。"
+            "法令の質問では法令・条文の特定に必ず使い、社内手順・一般会計知識など"
+            "法令以外の質問では決して呼び出さないこと。"
+            "結果にはlaw_id・法令名・該当箇所の抜粋・e-GovのURLが含まれる。"
         ),
         "input_schema": {
             "type": "object",
@@ -96,7 +98,9 @@ LEGAL_TOOLS: list[dict[str, Any]] = [
         "name": "get_law_article",
         "description": (
             "law_idと条番号を指定して条文の原文を取得する（e-Gov法令検索）。"
-            "回答は必ずこの原文に基づくこと。"
+            "法令・法律の知識に関する質問（intent=legal_knowledge）の回答専用で、"
+            "law_idにはsearch_lawの結果から得た実際の値のみを指定すること。"
+            "法令の回答は必ずこの原文に基づき、法令以外の質問では決して呼び出さないこと。"
         ),
         "input_schema": {
             "type": "object",
@@ -142,7 +146,7 @@ Chatworkで社員からの質問に、社内ハンドブック（経理・財務
 7. 関連する原本文書・スプレッドシート・フォルダのURLがハンドブック（特に「マニュアルリンク集」）に記載されている場合は、回答本文またはsourcesのurlに含めて案内すること。URLは一字一句正確に転記し、加工・短縮・推測してはならない。ハンドブックに記載のないURLを作らないこと。本文中に一字一句正確に写す自信がないURLは本文に書かず、「末尾の【出典】のリンクからご覧ください」のように出典欄へ誘導すること（本文のURLはハンドブックとの完全一致チェックがあり、一致しないと「（URL省略）」に置換されて読みにくくなる）。
 8. メッセージ種別の判定: 利用者が質問ではなく「マニュアル（原本）を更新した・変更した」と明確に報告している場合のみ、intentをmanual_update_reportとし、reported_manualsに対象マニュアル名を入れること。その場合answerには報告内容の短い受領確認文（1〜2文。対象マニュアル名を復唱）を書き、has_answerはfalse、sourcesは空とする。更新の仕方に関する質問や迷うケースはquestionとして扱うこと。
 9. 一般的な会計・簿記・税務知識の質問（社内の手順・ルールではないもの）への対応: intentをgeneral_knowledgeとし、「会計基礎知識リンク集」に該当する解説記事があればreference_urlにそのURLを一字一句正確に転記すること。answerには「社内ハンドブックには記載がありません。参考記事: <URL>」の趣旨の案内文（税理士確認の注意書き付き）を書く。詳細な要約はシステム側が記事を取得して別途行うため、自身の知識だけで数値や限度額を断定して書いてはならない。該当記事がリンク集にない場合はreference_urlを空にし「記載なし」の回答とする。
-10. 法令・法律の知識に関する質問（社内手順ではないもの）: intentをlegal_knowledgeとし、必ずsearch_lawツールで法令を特定し、get_law_articleツールで条文の原文を取得したうえで、その原文に基づいて回答すること。ツールを使わず記憶だけで条文の内容や条番号を断定してはならない。回答には法令名・条番号を明記し、ツール結果に含まれるURL（laws.e-gov.go.jp）をそのまま含める。回答の最後に必ず「※e-Gov法令検索の条文に基づく一般的な情報です。法的判断や契約書の内容確認は、顧問弁護士への相談またはLegalForceでのリーガルチェックを経てください。」を付ける。この場合sourcesは空でよい（出典は本文中の法令名・条番号・URLで示す）。has_answerは条文を取得できた場合にtrue。**ツール呼び出しは効率よく行うこと**: 独立した検索・条文取得は1ターンに複数まとめて並列に呼んでよい。網羅を目指さず、質問に最も関係する法令1〜2件・条文2〜4件に絞り、取得できた範囲で回答をまとめること（ツール往復は合計5回以内を目安）。
+10. 法令・法律の知識に関する質問（社内手順ではないもの）: intentをlegal_knowledgeとし、必ずsearch_lawツールで法令を特定し、get_law_articleツールで条文の原文を取得したうえで、その原文に基づいて回答すること。ツールを使わず記憶だけで条文の内容や条番号を断定してはならない。回答には法令名・条番号を明記し、ツール結果に含まれるURL（laws.e-gov.go.jp）をそのまま含める。回答の最後に必ず「※e-Gov法令検索の条文に基づく一般的な情報です。法的判断や契約書の内容確認は、顧問弁護士への相談またはLegalForceでのリーガルチェックを経てください。」を付ける。この場合sourcesは空でよい（出典は本文中の法令名・条番号・URLで示す）。has_answerは条文を取得できた場合にtrue。**ツール呼び出しは効率よく行うこと**: 独立した検索・条文取得は1ターンに複数まとめて並列に呼んでよい。網羅を目指さず、質問に最も関係する法令1〜2件・条文2〜4件に絞り、取得できた範囲で回答をまとめること（ツール往復は合計5回以内を目安）。search_law／get_law_articleは法令・法律の質問の回答専用ツールであり、intentがlegal_knowledge以外になる質問（社内手順・一般会計知識・更新報告・フィードバック等）では一切呼び出さないこと。「placeholder」のような仮の引数での試し呼び出しもしてはならない。
 11. 契約書の作成・ひな形に関する相談: 「ひな形リンク集」から該当するひな形のURLを案内し、あわせて「作成した契約書は締結前に必ずLegalForceでリーガルチェックを行う」こと（手順はハンドブック「LegalForce_リーガルチェック」参照）を必ず案内する。契約条項の妥当性を自ら断定してはならない。
 12. 過去の回答への誤り指摘・不満・改善要望（フィードバック）: intentをanswer_feedbackとし、answerには丁寧なお詫びと受領の一言を書くこと（指摘内容を短く復唱し、改善リストに追加して管理者が確認する旨を伝える）。反論や弁明はせず、has_answerはfalse、sourcesは空とする。"""
 
@@ -308,31 +312,45 @@ class AnswerGenerator:
             create, kwargs, messages, tool_executor=self._execute_tool
         )
 
-    def _execute_tool(self, name: str, tool_input: dict) -> str:
-        """カスタムツール（e-Gov法令検索）を実行し、結果をJSON文字列で返す。"""
+    def _execute_tool(self, name: str, tool_input: dict) -> "tuple[str, bool]":
+        """カスタムツール（e-Gov法令検索）を実行する。
+
+        戻り値は (モデルへ返す結果文字列, 実行としてカウントするか)。
+        placeholder的な無意味引数はe-Govへ送らずエラー文だけ返し、実行にカウント
+        しない（法令と無関係な質問での退行的ツール呼び出しを根拠扱いしないため）。
+        """
         from .egov import EgovError
 
         print(f"[tool] {name} {json.dumps(tool_input, ensure_ascii=False)[:200]}", flush=True)
         try:
             if name == "search_law" and self._egov is not None:
                 keyword = str(tool_input.get("keyword", "")).strip()
+                if _is_placeholder_value(keyword):
+                    return _tool_misuse_error(
+                        "検索キーワード（keyword）", "質問の内容に即した具体的なキーワード"
+                    ), False
                 results = self._egov.search(keyword)
                 if not results:
                     results = self._egov.search_by_title(keyword)
                 if not results:
-                    return "該当する法令が見つかりませんでした。キーワードを変えて再検索してください。"
-                return json.dumps(results, ensure_ascii=False)
+                    return "該当する法令が見つかりませんでした。キーワードを変えて再検索してください。", True
+                return json.dumps(results, ensure_ascii=False), True
             if name == "get_law_article" and self._egov is not None:
+                law_id = str(tool_input.get("law_id", "")).strip()
+                if _is_placeholder_value(law_id):
+                    return _tool_misuse_error(
+                        "law_id", "search_lawの結果に含まれる実際のlaw_id"
+                    ), False
                 result = self._egov.get_article(
-                    str(tool_input.get("law_id", "")),
+                    law_id,
                     str(tool_input.get("article") or "") or None,
                 )
-                return json.dumps(result, ensure_ascii=False)
-            return f"エラー: 未知のツール {name}"
+                return json.dumps(result, ensure_ascii=False), True
+            return f"エラー: 未知のツール {name}", False
         except EgovError as exc:
-            return f"エラー: {exc}"
+            return f"エラー: {exc}", True
         except Exception as exc:  # ツール失敗で回答全体を落とさない
-            return f"エラー: 条文の取得に失敗しました（{exc}）"
+            return f"エラー: 条文の取得に失敗しました（{exc}）", True
 
     def _enrich_general_knowledge(
         self, answer: Answer, question: str, handbook: Handbook
@@ -463,6 +481,35 @@ def _accumulate_usage(total: dict[str, int], usage: dict[str, int]) -> None:
         total[key] = total.get(key, 0) + value
 
 
+# 構造化出力＋ツール併用時に、法令と無関係な質問でモデルがスキーマ例のような
+# 無意味引数（例: "placeholder"）のツール呼び出しを行う退行が観測されている。
+# 実行前に弾いてe-Govへの無駄なリクエストを防ぐ
+_PLACEHOLDER_VALUES = frozenset(
+    {
+        "placeholder", "string", "example", "sample", "dummy", "test",
+        "keyword", "law_id", "article", "todo", "tbd", "unknown",
+        "none", "null", "n/a", "na", "foo", "bar", "xxx",
+    }
+)
+
+
+def _is_placeholder_value(value: str) -> bool:
+    """引数が未指定・placeholder的トークン・記号のみのいずれかならTrue。"""
+    normalized = value.strip().strip("<>「」『』\"'").strip().lower()
+    if not normalized or normalized in _PLACEHOLDER_VALUES:
+        return True
+    return not any(c.isalnum() for c in normalized)
+
+
+def _tool_misuse_error(field: str, hint: str) -> str:
+    return (
+        f"エラー: {field}が指定されていないか、無意味な値です。"
+        "このツールは法令・法律に関する質問の回答にのみ使用できます。"
+        f"法令の質問の場合は{hint}を指定して再実行し、"
+        "法令と無関係な質問の場合はツールを使わずそのまま回答してください。"
+    )
+
+
 _MAX_LOOP_STEPS = 10
 
 
@@ -475,7 +522,9 @@ def _call_with_continuation(
     """API呼び出しループ。戻り値は (最終レスポンス, 累積usage, ツール実行有無)。
 
     - pause_turn（サーバーツールの反復上限）: そのまま再送して継続
-    - tool_use（カスタムツール）: tool_executorで実行し結果を返して継続
+    - tool_use（カスタムツール）: tool_executorで実行し結果を返して継続。
+      tool_executorは (結果文字列, 実行としてカウントするか) を返す。
+      placeholder引数等で棄却された呼び出しはツール実行有無に数えない
     - 最終回では実行・継続せずに返す（結果を送れないツール実行をしない）
     """
     usage_total: dict[str, int] = {}
@@ -493,7 +542,8 @@ def _call_with_continuation(
             tool_results = []
             for block in response.content:
                 if getattr(block, "type", "") == "tool_use":
-                    result = tool_executor(block.name, dict(block.input or {}))
+                    result, executed = tool_executor(block.name, dict(block.input or {}))
+                    tool_used = tool_used or executed
                     tool_results.append(
                         {
                             "type": "tool_result",
@@ -503,7 +553,6 @@ def _call_with_continuation(
                     )
             if not tool_results:
                 break
-            tool_used = True
             messages = messages + [
                 {"role": "assistant", "content": response.content},
                 {"role": "user", "content": tool_results},
