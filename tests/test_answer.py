@@ -681,6 +681,8 @@ class TestAnswerGenerator:
                                 input={"keyword": "placeholder"}),
                 SimpleNamespace(type="tool_use", id="tu_2", name="get_law_article",
                                 input={"law_id": "placeholder"}),
+                SimpleNamespace(type="tool_use", id="tu_3", name="search_law",
+                                input={"keyword": "a"}),  # 1文字キーワードも実測された退行
             ],
             usage=None,
         )
@@ -699,7 +701,7 @@ class TestAnswerGenerator:
 
         assert client.calls == 2
         tool_results = client.kwargs["messages"][-1]["content"]
-        assert len(tool_results) == 2
+        assert len(tool_results) == 3
         assert all(r["content"].startswith("エラー:") for r in tool_results)
         assert answer.text == "社内ハンドブックには記載がありません。"
 
@@ -823,7 +825,7 @@ class TestAnswerGenerator:
             return SimpleNamespace(
                 stop_reason="tool_use",
                 content=[SimpleNamespace(type="tool_use", id="tu", name="search_law",
-                                         input={"keyword": "x"})],
+                                         input={"keyword": "民法"})],
                 usage=SimpleNamespace(input_tokens=10, output_tokens=1,
                                       cache_creation_input_tokens=0, cache_read_input_tokens=0),
             )

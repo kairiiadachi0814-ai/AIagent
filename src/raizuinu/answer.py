@@ -357,7 +357,8 @@ class AnswerGenerator:
         try:
             if name == "search_law" and self._egov is not None:
                 keyword = str(tool_input.get("keyword", "")).strip()
-                if _is_placeholder_value(keyword):
+                # 「a」等の1文字キーワードもplaceholder同様の退行呼び出し（実地で観測）
+                if _is_placeholder_value(keyword) or len(keyword) < 2:
                     return _tool_misuse_error(
                         "検索キーワード（keyword）", "質問の内容に即した具体的なキーワード"
                     ), False
