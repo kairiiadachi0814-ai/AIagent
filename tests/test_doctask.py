@@ -111,6 +111,17 @@ class TestFindDocument:
             "[To:999] 議事録の書き方を教えて", recent, "議事録の書き方を教えて"
         ) is None
 
+    def test_history_scan_requires_doc_reference_word(self):
+        recent = [{"body": "[download:555]会議.docx (10 KB)[/download]"}]
+        # 「要約して」だけでは遡らない（貼り付け素材や一般質問の横取り防止）
+        assert find_document("[To:999] 経費の流れを要約して", recent, "経費の流れを要約して") is None
+
+    def test_pasted_material_does_not_scan_history(self):
+        recent = [{"body": "[download:555]会議.docx (10 KB)[/download]"}]
+        pasted = "さっきの会議まとめて\n発言1\n発言2\n発言3\n発言4"
+        # 本文に素材が貼られていれば遡らずtaskフロー（Q&A側）で処理する
+        assert find_document(f"[To:999] {pasted}", recent, pasted) is None
+
     def test_no_document(self):
         assert find_document("[To:999] 議事録の書き方を教えて", [], "議事録の書き方を教えて") is None
 

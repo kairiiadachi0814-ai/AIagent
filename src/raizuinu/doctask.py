@@ -52,6 +52,8 @@ _TASK_KEYWORDS = (
 )
 # 手順を尋ねる形の質問はQ&A（過去の添付に遡らない）
 _HOWTO_MARKERS = ("書き方", "方法", "やり方", "とは", "って何")
+# 過去メッセージへ遡るのは、過去の文書を指す言葉がある依頼のみ
+_DOC_REF_MARKERS = ("さっき", "先ほど", "添付", "ファイル", "アップ", "資料", "上の", "前の")
 
 SYSTEM_PROMPT = """あなたは株式会社ライズクリエイションの社内AIエージェント「{agent_name}」です。
 メンバーから会議の文字起こし・議事録・メモなどの文書と依頼を受け取り、文書に基づく事務作業（議事録作成・概要まとめ・決定事項や宿題の抽出・整理など）を行います。
@@ -133,6 +135,10 @@ def find_document(
         return found if has_keywords else None  # unsupported_file
     if not has_keywords or any(m in question for m in _HOWTO_MARKERS):
         return None
+    if not any(m in question for m in _DOC_REF_MARKERS):
+        return None  # 過去の文書を指す言葉が無い依頼は遡らない（通常のQ&A・雑務へ）
+    if question.count("\n") >= 3 or len(question) > 300:
+        return None  # 本文に素材が貼られた依頼（議事録テキスト等）はtaskフローで処理する
     for message in reversed(recent_messages or []):
         account = message.get("account") or {}
         if bot_account_id and int(account.get("account_id") or 0) == int(bot_account_id):

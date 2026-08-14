@@ -165,6 +165,15 @@ class TestIntervention:
         assert body.startswith("横から失礼します")
         assert "銀行明細取得" in body  # 出典付き
 
+    def test_chat_style_answer_without_sources_stays_silent(self, tmp_path):
+        # intent拡張（chat/task）後も、出典なし回答での介入は起きない
+        chatty = Answer(has_answer=True, text="面白い話題ですね！", sources=[], intent="chat")
+        watcher, chatwork, _, _ = make_watcher(
+            tmp_path, DISCUSSION, answer=chatty, preset_last_seen=99
+        )
+        watcher.run_once()
+        assert chatwork.sent == []
+
     def test_silent_when_no_confirmed_error(self, tmp_path):
         no_error = Answer(has_answer=False, text="明らかな誤りはありません")
         watcher, chatwork, _, _ = make_watcher(

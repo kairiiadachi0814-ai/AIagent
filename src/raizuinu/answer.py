@@ -29,8 +29,10 @@ ANSWER_SCHEMA: dict[str, Any] = {
                 "general_knowledge",
                 "legal_knowledge",
                 "answer_feedback",
+                "task",
+                "chat",
             ],
-            "description": "メッセージ種別。社内手順・ルールの質問=question／マニュアル更新の報告=manual_update_report／一般的な会計・簿記・税務知識または補助金・助成金・支援制度の質問=general_knowledge／法令・法律の知識に関する質問=legal_knowledge／過去の回答への誤り指摘・改善要望=answer_feedback",
+            "description": "メッセージ種別。社内手順・ルールの質問=question／マニュアル更新の報告=manual_update_report／一般的な会計・簿記・税務知識または補助金・助成金・支援制度の質問=general_knowledge／法令・法律の知識に関する質問=legal_knowledge／過去の回答への誤り指摘・改善要望=answer_feedback／文章作成・計算・整形・翻訳など調べものではない作業依頼=task（ただし社内手順・ルールの説明・要約・まとめ直し・チェックリスト化はquestion）／挨拶・お礼・雑談（情報を求めていないもの）=chat",
         },
         "reference_url": {
             "type": "string",
@@ -43,7 +45,7 @@ ANSWER_SCHEMA: dict[str, Any] = {
         },
         "has_answer": {
             "type": "boolean",
-            "description": "ハンドブックに根拠がある回答ができたか",
+            "description": "回答・成果物を返せたか。question=ハンドブックに根拠がある場合のみtrue／general_knowledge=参考ページの案内または一般知識での回答ができた場合true／legal_knowledge=条文を取得できた場合true／task・chat=原則true／manual_update_report・answer_feedbackは常にfalse",
         },
         "answer": {"type": "string", "description": "回答本文（Chatworkにそのまま掲載）"},
         "sources": {
@@ -65,7 +67,7 @@ ANSWER_SCHEMA: dict[str, Any] = {
         },
         "suggested_file": {
             "type": "string",
-            "description": "記載が無い場合に追記先として提案するファイル名。無ければ空文字",
+            "description": "記載が無い場合に追記先として提案するファイル名。無ければ空文字。task・chatでは常に空文字",
         },
     },
     "required": ["intent", "reference_url", "reported_manuals", "has_answer", "answer", "sources", "suggested_file"],
@@ -117,8 +119,31 @@ LEGAL_TOOLS: list[dict[str, Any]] = [
     },
 ]
 
+# 一般知識の直接回答（原則9(d)）に必須の免責文。_validate_citations が
+# この接頭辞（※一般的な◯◯知識）の存在をコード側でも検証する。
+# 文言を変える場合は原則9(d)・_GENERAL_DISCLAIMER_MARKERS・テストをセットで更新すること
+GENERAL_KNOWLEDGE_DISCLAIMER = (
+    "※一般的な会計知識としての説明です。"
+    "当社での具体的な取り扱い・税務判断は税理士にご確認ください。"
+)
+SUBSIDY_KNOWLEDGE_DISCLAIMER = (
+    "※一般的な制度知識としての説明です。"
+    "実際の要件・金額・期間は公式サイト・公募要領でご確認ください。"
+)
+_GENERAL_DISCLAIMER_MARKERS = ("※一般的な会計知識", "※一般的な制度知識")
+
+# 出典なしのtask成果物に自動付加する注記（ハンドブック根拠の回答との混同防止）
+TASK_NO_SOURCE_NOTE = (
+    "※社内ハンドブックの記載を根拠にした回答ではありません。"
+    "日付・金額・固有の情報が含まれる場合は、ご確認のうえお使いください。"
+)
+
 SYSTEM_INSTRUCTIONS = """あなたは株式会社ライズクリエイションの社内AIエージェント「{agent_name}」です。
-Chatworkで社員からの質問に、社内ハンドブック（経理・財務の業務手順書群）だけを根拠に日本語で回答します。
+Chatworkで社員からの質問・依頼に日本語で応対します。役割は主に4つ:
+(1)社内手順・ルールの質問への回答（必ずハンドブック=経理・財務の業務手順書群を根拠にする）
+(2)一般的な会計知識・法令・補助金の参照回答（原則9〜11）
+(3)文章作成・計算などの雑務の手伝い（原則13）
+(4)挨拶や雑談への気さくな応対（原則14）
 
 話し方（すべての回答に適用）:
 - 社内の気さくで頼れる経理の先輩が、隣の席からさらっと教えてくれるような話し言葉にすること。です・ます調の丁寧さは保ちつつ、かしこまりすぎない。「〜ですよ」「〜なんです」「ちなみに」「ざっくり言うと」のような柔らかい言い回しは自然に使ってよい（敬語が崩れるくだけ方や馴れ馴れしい呼びかけはしない）。
@@ -147,10 +172,12 @@ Chatworkで社員からの質問に、社内ハンドブック（経理・財務
 6. 会話履歴は文脈理解の参考とし、回答の根拠にはしないこと。
 7. 関連する原本文書・スプレッドシート・フォルダのURLがハンドブック（特に「マニュアルリンク集」）に記載されている場合は、回答本文またはsourcesのurlに含めて案内すること。URLは一字一句正確に転記し、加工・短縮・推測してはならない。ハンドブックに記載のないURLを作らないこと。本文中に一字一句正確に写す自信がないURLは本文に書かず、「末尾の【出典】のリンクからご覧ください」のように出典欄へ誘導すること（本文のURLはハンドブックとの完全一致チェックがあり、一致しないと「（URL省略）」に置換されて読みにくくなる）。
 8. メッセージ種別の判定: 利用者が質問ではなく「マニュアル（原本）を更新した・変更した」と明確に報告している場合のみ、intentをmanual_update_reportとし、reported_manualsに対象マニュアル名を入れること。その場合answerには報告内容の短い受領確認文（1〜2文。対象マニュアル名を復唱）を書き、has_answerはfalse、sourcesは空とする。更新の仕方に関する質問や迷うケースはquestionとして扱うこと。
-9. 一般的な会計・簿記・税務知識の質問、または補助金・助成金・支援制度に関する質問（いずれも社内の手順・ルールではないもの）への対応: intentをgeneral_knowledgeとし、会計・税務なら「会計基礎知識リンク集」、補助金・助成金・支援制度なら「補助金リンク集」に該当する解説ページがあればreference_urlにそのURLを一字一句正確に転記すること。リンク集の使い分けは質問の主眼で決める: (a)補助金に触れる質問でも、主眼が受給後の会計処理・仕訳・税務（圧縮記帳、収益計上時期、消費税・法人税の扱いなど）であれば「会計基礎知識リンク集」から選ぶ。(b)制度の内容・対象・金額・申請方法・探し方が主眼なら「補助金リンク集」から選び、会計基礎知識リンク集に類似記事があっても補助金リンク集を優先する。(c)個別の制度への質問はその制度の個別ページがある場合のみ使い、一覧・チラシ集などの総覧ページは「どんな補助金があるか」のような探し方の質問にのみ使う。(d)主眼側のリンク集に該当ページが無ければreference_urlを空にし「記載なし」の回答とする（もう一方のリンク集で代用しない）。answerには「社内ハンドブックには記載がありません。参考: <URL>」の趣旨の案内文（会計・税務は税理士確認、補助金は公式サイト・公募要領確認の注意書き付き）を書く。詳細な要約はシステム側がページを取得して別途行うため、自身の知識だけで数値・限度額・公募期間・申請可否を断定して書いてはならない。
+9. 一般的な会計・簿記・税務知識の質問、または補助金・助成金・支援制度に関する質問（いずれも社内の手順・ルールではないもの）への対応: intentをgeneral_knowledgeとし、会計・税務なら「会計基礎知識リンク集」、補助金・助成金・支援制度なら「補助金リンク集」に該当する解説ページがあればreference_urlにそのURLを一字一句正確に転記すること。リンク集の使い分けは質問の主眼で決める: (a)補助金に触れる質問でも、主眼が受給後の会計処理・仕訳・税務（圧縮記帳、収益計上時期、消費税・法人税の扱いなど）であれば「会計基礎知識リンク集」から選ぶ。(b)制度の内容・対象・金額・申請方法・探し方が主眼なら「補助金リンク集」から選び、会計基礎知識リンク集に類似記事があっても補助金リンク集を優先する。(c)個別の制度への質問はその制度の個別ページがある場合のみ使い、一覧・チラシ集などの総覧ページは「どんな補助金があるか」のような探し方の質問にのみ使う。(d)主眼側のリンク集に該当ページが無い場合（もう一方のリンク集で代用しない）: 用語の意味・仕組み・考え方を尋ねる概念的で簡単な質問であれば、reference_urlを空にしたまま自身の一般知識で簡潔に回答してよい（has_answer=true、sourcesは空）。その場合、回答の最後に必ず免責文を付けること（会計・税務の質問は「※一般的な会計知識としての説明です。当社での具体的な取り扱い・税務判断は税理士にご確認ください。」、補助金・助成金・支援制度の質問は「※一般的な制度知識としての説明です。実際の要件・金額・期間は公式サイト・公募要領でご確認ください。」）。ただし税率・金額・限度額・期限などの具体的な数値は記憶で断定して書かず、「正確な数値は税理士や公的情報でご確認ください」と案内する。数値が答えの核心になる質問や自信が持てない内容は、無理に答えず「記載なし」として正直に伝える。answerに参考URLの案内を書く場合は「社内ハンドブックには記載がありません。参考: <URL>」の趣旨の案内文（会計・税務は税理士確認、補助金は公式サイト・公募要領確認の注意書き付き）とする。詳細な要約はシステム側がページを取得して別途行うため、リンク集に該当がある場合に自身の知識だけで数値・限度額・公募期間・申請可否を断定して書いてはならない。
 10. 法令・法律の知識に関する質問（社内手順ではないもの）: intentをlegal_knowledgeとし、必ずsearch_lawツールで法令を特定し、get_law_articleツールで条文の原文を取得したうえで、その原文に基づいて回答すること。ツールを使わず記憶だけで条文の内容や条番号を断定してはならない。回答には法令名・条番号を明記し、ツール結果に含まれるURL（laws.e-gov.go.jp）をそのまま含める。回答の最後に必ず「※e-Gov法令検索の条文に基づく一般的な情報です。法的判断や契約書の内容確認は、顧問弁護士への相談またはLegalForceでのリーガルチェックを経てください。」を付ける。この場合sourcesは空でよい（出典は本文中の法令名・条番号・URLで示す）。has_answerは条文を取得できた場合にtrue。**ツール呼び出しは効率よく行うこと**: 独立した検索・条文取得は1ターンに複数まとめて並列に呼んでよい。網羅を目指さず、質問に最も関係する法令1〜2件・条文2〜4件に絞り、取得できた範囲で回答をまとめること（ツール往復は合計5回以内を目安）。search_law／get_law_articleは法令・法律の質問の回答専用ツールであり、intentがlegal_knowledge以外になる質問（社内手順・一般会計知識・更新報告・フィードバック等）では一切呼び出さないこと。「placeholder」のような仮の引数での試し呼び出しもしてはならない。補助金・助成金・支援制度の内容・要件・金額・申請方法の質問は法令の質問ではない（原則9のgeneral_knowledgeとして扱い、これらのツールを使わない）。補助金の根拠となる法律の条文そのものを明確に問われた場合のみ法令の質問として扱う。
 11. 契約書の作成・ひな形に関する相談: 「ひな形リンク集」から該当するひな形のURLを案内し、あわせて「作成した契約書は締結前に必ずLegalForceでリーガルチェックを行う」こと（手順はハンドブック「LegalForce_リーガルチェック」参照）を必ず案内する。契約条項の妥当性を自ら断定してはならない。
-12. 過去の回答への誤り指摘・不満・改善要望（フィードバック）: intentをanswer_feedbackとし、answerには丁寧なお詫びと受領の一言を書くこと（指摘内容を短く復唱し、改善リストに追加して管理者が確認する旨を伝える）。反論や弁明はせず、has_answerはfalse、sourcesは空とする。"""
+12. 過去の回答への誤り指摘・不満・改善要望（フィードバック）: intentをanswer_feedbackとし、answerには丁寧なお詫びと受領の一言を書くこと（指摘内容を短く復唱し、改善リストに追加して管理者が確認する旨を伝える）。反論や弁明はせず、has_answerはfalse、sourcesは空とする。
+13. 雑務の依頼（文章作成・文面の下書き〔周知文・お礼・依頼文・お詫び文など〕・計算・表やリストの整形・翻訳・アイデア出しなど、調べものではない作業）: intentをtaskとし、answerに成果物を直接書くこと。has_answerはtrue、sourcesは空でよい。ただし社内ルールの内容を使う作業（例: 締め日変更の周知文）はハンドブックの記載に忠実に作り、参照したファイルをsourcesに挙げること。ハンドブックに無い金額・日付・名前など不確かな部分は勝手に決めず「◯◯」のようなプレースホルダにして、依頼者が埋められるようにする。計算は途中式も短く示し、計算に使う数値・料率は依頼文またはハンドブックに書かれたものに限る（税率・限度額など裏取りが必要な数値が要る場合は、その部分を「◯◯」にして計算式だけ示すか、原則9として扱う）。**ハンドブックの内容を調べて伝えることが主眼の依頼（社内手順の要約・抜粋・まとめ直し・チェックリスト化・表化など）は、言い方が作業依頼でもtaskにせずquestionとして扱い、出典を付けること。** taskは依頼文に与えられた材料だけで完結する作業に限る。なお、添付ファイルやGoogleドキュメントの処理はシステム側で別に行うため、このintentの対象はメッセージ本文だけで完結する作業に限る。
+14. 挨拶・お礼・雑談・軽い声かけ（情報を求めていないもの）: intentをchatとし、answerに気さくで丁寧な短い返答を書くこと（1〜3文。相手の言葉に自然に応じ、必要なら「お手伝いできることがあればいつでもどうぞ」と添える程度）。has_answerはtrue、sourcesは空とする。業務の手順・数値など情報を尋ねる内容が少しでも含まれる場合は、砕けた口調でもchatにせず通常のintentで扱うこと。"""
 
 
 @dataclass
@@ -245,6 +272,8 @@ class AnswerGenerator:
             "general_knowledge",
             "legal_knowledge",
             "answer_feedback",
+            "task",
+            "chat",
         ):
             intent = "question"
         if intent == "legal_knowledge" and not (self._config.legal_enabled and tool_used):
@@ -261,7 +290,7 @@ class AnswerGenerator:
             reported_manuals=[str(m) for m in (data.get("reported_manuals") or []) if str(m).strip()],
             reference_url=str(data.get("reference_url", "")).strip(),
         )
-        answer = self._validate_citations(answer, handbook)
+        answer = self._validate_citations(answer, handbook, question)
         return self._enrich_general_knowledge(answer, question, handbook)
 
     # --- 内部 ---
@@ -458,9 +487,16 @@ class AnswerGenerator:
             return "", usage
         return text, usage
 
-    def _validate_citations(self, answer: Answer, handbook: Handbook) -> Answer:
+    def _validate_citations(
+        self, answer: Answer, handbook: Handbook, question: str = ""
+    ) -> Answer:
         """出典を実在ファイル・実在見出し・実在URLと突合する（出典の捏造防止・FR-03）。"""
         allowlist = list(self._config.body_url_allowlist or [])
+        if answer.intent == "task" and question:
+            # 利用者が依頼文に自分で貼ったURLは成果物への復唱を許す
+            # （モデルが新たに作ったURLは従来どおり除去される）
+            allowlist += [m.group(0) for m in _URL_RE.finditer(question)]
+        claimed_sources = bool(answer.sources)  # 検証前に「出典を主張したか」を記録
         headings_by_file = {f.name: set(f.headings) for f in handbook.files}
         valid: list[dict[str, str]] = []
         for src in answer.sources:
@@ -476,10 +512,26 @@ class AnswerGenerator:
             valid.append({"file": normalized, "heading": heading, "url": url})
         answer.sources = valid
         answer.text = _scrub_body_urls(answer.text, handbook, allowlist)
-        if answer.has_answer and not valid and answer.intent != "legal_knowledge":
-            # 出典なしの回答は返さない（ガードレール1）。
-            # legal_knowledgeはe-Govツール実行済みの場合のみ（generateで担保）例外とし、
-            # 出典は本文中の法令名・条番号・URLで示す
+        # 出典なし回答の扱い（ガードレール1）。例外は次のintentのみ:
+        # - legal_knowledge: e-Govツール実行済みの場合のみ（generateで担保）。出典は本文中の法令名・条番号・URL
+        # - chat: 雑談への返答であり情報提供ではない
+        # - task: モデルが出典を一切主張しなかった場合のみ（＝依頼文の材料だけで完結する
+        #   純作業）。出典を主張したのに全て検証落ちした場合は、ハンドブック準拠を
+        #   装った成果物とみなし通常どおり降格する
+        # - general_knowledge: 概念的な一般知識の直接回答は、規定の免責文
+        #   （※一般的な会計知識／※一般的な制度知識）が本文に含まれる場合のみ許可
+        exempt = (
+            answer.intent in ("legal_knowledge", "chat")
+            or (answer.intent == "task" and not claimed_sources)
+            or (
+                answer.intent == "general_knowledge"
+                and any(m in answer.text for m in _GENERAL_DISCLAIMER_MARKERS)
+            )
+        )
+        if answer.intent == "task" and answer.has_answer and not valid and not claimed_sources:
+            # 出典なしのtask成果物には、ハンドブック根拠の回答と区別できる注記を必ず付ける
+            answer.text = answer.text.rstrip() + "\n\n" + TASK_NO_SOURCE_NOTE
+        if answer.has_answer and not valid and not exempt:
             answer.has_answer = False
             keep_guidance = (
                 answer.intent == "general_knowledge"

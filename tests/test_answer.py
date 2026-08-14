@@ -309,6 +309,161 @@ class TestAnswerGenerator:
         answer = gen.generate("接待交際費の限度は？", handbook)
         assert answer.stage2 == "fetch_failed"  # 監査ログでリンク切れを検知できる
 
+    def test_chat_intent_allows_answer_without_sources(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        gen, _ = make_generator(
+            tmp_path,
+            {
+                "intent": "chat",
+                "has_answer": True,
+                "answer": "おはようございます！今日もよろしくお願いします。",
+                "sources": [],
+                "suggested_file": "",
+                "reference_url": "",
+                "reported_manuals": [],
+            },
+        )
+        answer = gen.generate("おはよう！", handbook)
+        assert answer.has_answer  # 雑談は出典なしで成立する
+        assert answer.intent == "chat"
+        reply = format_reply(answer, 1, 2, "3")
+        assert "【出典】" not in reply
+
+    def test_task_intent_allows_deliverable_without_sources(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        gen, _ = make_generator(
+            tmp_path,
+            {
+                "intent": "task",
+                "has_answer": True,
+                "answer": "件名: 締め日変更のお知らせ\n本文: 皆さま…",
+                "sources": [],
+                "suggested_file": "",
+                "reference_url": "",
+                "reported_manuals": [],
+            },
+        )
+        answer = gen.generate("周知文を作って", handbook)
+        assert answer.has_answer
+        assert "締め日変更のお知らせ" in answer.text
+
+    def test_question_without_sources_still_downgraded(self, tmp_path):
+        # 社内手順の質問（question）は従来どおり出典必須のまま
+        handbook = make_handbook(tmp_path)
+        gen, _ = make_generator(
+            tmp_path,
+            {
+                "intent": "question",
+                "has_answer": True,
+                "answer": "出典なしの回答",
+                "sources": [],
+                "suggested_file": "",
+                "reference_url": "",
+                "reported_manuals": [],
+            },
+        )
+        answer = gen.generate("手順は？", handbook)
+        assert not answer.has_answer
+
+    def test_general_knowledge_direct_answer_requires_disclaimer(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        base = {
+            "intent": "general_knowledge",
+            "has_answer": True,
+            "sources": [],
+            "suggested_file": "",
+            "reference_url": "",
+            "reported_manuals": [],
+        }
+        # 規定の免責文つきの概念回答は許可
+        gen, _ = make_generator(
+            tmp_path,
+            {**base, "answer": "借方は左側の記録です。※一般的な会計知識としての説明です。税理士にご確認ください。"},
+        )
+        answer = gen.generate("借方って何？", handbook)
+        assert answer.has_answer
+        # 免責文なしは従来どおり降格（社内ルールとの混同防止）
+        gen2, _ = make_generator(tmp_path, {**base, "answer": "借方は左側の記録です。"})
+        answer2 = gen2.generate("借方って何？", handbook)
+        assert not answer2.has_answer
+        # ※があっても規定の免責文でなければ降格（1文字チェックの悪用防止）
+        gen3, _ = make_generator(
+            tmp_path,
+            {**base, "answer": "源泉徴収税率は10.21%です。※復興特別所得税を含みます。"},
+        )
+        answer3 = gen3.generate("源泉の税率は？", handbook)
+        assert not answer3.has_answer
+        # 補助金の概念質問には制度知識の免責文でも許可
+        gen4, _ = make_generator(
+            tmp_path,
+            {**base, "answer": "補助金は返済不要の支援金です。※一般的な制度知識としての説明です。公募要領でご確認ください。"},
+        )
+        answer4 = gen4.generate("補助金と融資の違いは？", handbook)
+        assert answer4.has_answer
+
+    def test_prompt_contains_disclaimer_markers(self):
+        # プロンプトの免責文と検証マーカーのドリフト防止
+        from raizuinu.answer import SYSTEM_INSTRUCTIONS, _GENERAL_DISCLAIMER_MARKERS
+
+        for marker in _GENERAL_DISCLAIMER_MARKERS:
+            assert marker in SYSTEM_INSTRUCTIONS
+
+    def test_task_with_fabricated_sources_is_downgraded(self, tmp_path):
+        # 出典を主張したのに全て検証落ち → ハンドブック準拠を装った成果物は出さない
+        handbook = make_handbook(tmp_path)
+        gen, _ = make_generator(
+            tmp_path,
+            {
+                "intent": "task",
+                "has_answer": True,
+                "answer": "周知文: 締め日は毎月25日です",
+                "sources": [{"file": "実在しないルール.md", "heading": "", "url": ""}],
+                "suggested_file": "",
+                "reference_url": "",
+                "reported_manuals": [],
+            },
+        )
+        answer = gen.generate("締め日の周知文を作って", handbook)
+        assert not answer.has_answer
+
+    def test_task_without_sources_gets_no_handbook_note(self, tmp_path):
+        # 出典なしの純作業成果物には「ハンドブック根拠ではない」注記が自動で付く
+        handbook = make_handbook(tmp_path)
+        gen, _ = make_generator(
+            tmp_path,
+            {
+                "intent": "task",
+                "has_answer": True,
+                "answer": "1,000円×12か月=12,000円です",
+                "sources": [],
+                "suggested_file": "",
+                "reference_url": "",
+                "reported_manuals": [],
+            },
+        )
+        answer = gen.generate("計算して", handbook)
+        assert answer.has_answer
+        assert "ハンドブックの記載を根拠にした回答ではありません" in answer.text
+
+    def test_task_can_echo_user_provided_url(self, tmp_path):
+        # 利用者が依頼文に貼ったURLは成果物への復唱を許す（新規URLの創作は従来どおり除去）
+        handbook = make_handbook(tmp_path)
+        user_url = "https://example.com/campaign/2026"
+        gen, _ = make_generator(
+            tmp_path,
+            {
+                "intent": "task",
+                "has_answer": True,
+                "answer": f"案内文: 詳細は {user_url} をご覧ください。",
+                "sources": [],
+                "suggested_file": "",
+                "reference_url": "",
+                "reported_manuals": [],
+            },
+        )
+        answer = gen.generate(f"この案内文を丁寧にして {user_url}", handbook)
+        assert user_url in answer.text
+
     def test_markdown_is_converted_for_chatwork(self):
         from raizuinu.answer import sanitize_for_chatwork
 
