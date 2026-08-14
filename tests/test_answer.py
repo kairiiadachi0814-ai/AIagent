@@ -80,6 +80,45 @@ class TestAnswerGenerator:
         ]
         assert answer.usage["input_tokens"] == 1000
 
+    def test_missing_source_url_is_filled_from_link_collection(self, tmp_path):
+        # モデルがurlを埋め忘れても、リンク集から機械的に補完する
+        (tmp_path / "Amazonモール売上明細取得.md").write_text(
+            "# Amazonモール売上明細取得\n手順\n", encoding="utf-8"
+        )
+        amazon_url = "https://docs.google.com/document/d/AMAZON-DOC/edit"
+        (tmp_path / "マニュアルリンク集.md").write_text(
+            f"# リンク集\n| 銀行明細取得 |  | {REAL_URL} |\n"
+            f"| Amazon モール売上明細取得 | リモートのため注意 | {amazon_url} |\n",
+            encoding="utf-8",
+        )
+        handbook = HandbookLoader([tmp_path], ["*.md"], [], 300).load()
+        gen, _ = make_generator(
+            tmp_path,
+            {
+                "has_answer": True,
+                "answer": "手順はこうです",
+                "sources": [{"file": "Amazonモール売上明細取得.md", "heading": "", "url": ""}],
+                "suggested_file": "",
+            },
+        )
+        answer = gen.generate("Amazonの売上データ取得は？", handbook)
+        assert answer.sources[0]["url"] == amazon_url  # 表記ゆれ（半角空白）を吸収
+        assert amazon_url in format_reply(answer, 1, 2, "3")
+
+    def test_source_url_lookup_does_not_guess_when_ambiguous(self, tmp_path):
+        # 候補が絞れない場合はURLを付けない（誤った原本へ誘導しない）
+        from raizuinu.answer import _lookup_manual_url
+
+        (tmp_path / "給与振込処理.md").write_text("# 給与振込処理\n手順\n", encoding="utf-8")
+        (tmp_path / "マニュアルリンク集.md").write_text(
+            "# リンク集\n"
+            "| 給与振込処理 ライズ | | https://docs.google.com/document/d/A/edit |\n"
+            "| 給与振込処理 楽天軒 | | https://docs.google.com/document/d/B/edit |\n",
+            encoding="utf-8",
+        )
+        handbook = HandbookLoader([tmp_path], ["*.md"], [], 300).load()
+        assert _lookup_manual_url("給与振込処理.md", handbook) == ""
+
     def test_fabricated_url_is_dropped(self, tmp_path):
         handbook = make_handbook(tmp_path)
         gen, _ = make_generator(
@@ -99,7 +138,9 @@ class TestAnswerGenerator:
         )
         answer = gen.generate("質問", handbook)
         assert answer.has_answer
-        assert answer.sources[0]["url"] == ""  # ハンドブックにないURLは破棄
+        # 捏造URLは破棄され、リンク集の正しい原本URLに置き換わる
+        assert "FAKE-NOT-IN-HANDBOOK" not in answer.sources[0]["url"]
+        assert answer.sources[0]["url"] == REAL_URL
 
     def test_fabricated_citation_is_dropped_and_answer_downgraded(self, tmp_path):
         handbook = make_handbook(tmp_path)
@@ -159,7 +200,10 @@ class TestAnswerGenerator:
         )
         answer = gen.generate("質問", handbook)
         assert answer.has_answer
-        assert answer.sources == [{"file": "銀行明細取得.md", "heading": "", "url": ""}]
+        # 実在しない見出しは落とし、原本URLはリンク集から補完される
+        assert answer.sources == [
+            {"file": "銀行明細取得.md", "heading": "", "url": REAL_URL}
+        ]
 
     def test_broken_json_returns_failure(self, tmp_path):
         handbook = make_handbook(tmp_path)
@@ -853,7 +897,8 @@ class TestAnswerGenerator:
             },
         )
         answer = gen.generate("質問", handbook)
-        assert answer.sources[0]["url"] == ""  # 部分一致では通さない（完全一致のみ）
+        # 切り詰めURLは通さず（完全一致のみ）、正しい原本URLに補完される
+        assert answer.sources[0]["url"] == REAL_URL
 
     def test_legal_tools_attached_when_enabled(self, tmp_path):
         handbook = make_handbook(tmp_path)

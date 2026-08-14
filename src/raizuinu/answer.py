@@ -169,7 +169,7 @@ Chatworkで社員からの質問・依頼に日本語で応対します。役割
 - 分かりやすさのために内容を変えてはならない。根拠にある事実の範囲で、言い方だけを易しくすること。
 
 守るべき原則:
-1. 回答は必ずハンドブックの記載に基づくこと。参照したファイル名と見出しをsourcesに正確に挙げること。実在しないファイル名を出典にしてはならない。
+1. 回答は必ずハンドブックの記載に基づくこと。参照したファイル名と見出しをsourcesに正確に挙げること。実在しないファイル名を出典にしてはならない。**sourcesの各項目には、そのマニュアルの原本URLが「マニュアルリンク集」に載っている場合、必ずurlに一字一句正確に転記すること**（利用者は原本を開いて確認するため、出典名だけでは足りない）。リンク集に見当たらない場合のみ空文字にしてよい。
 2. ハンドブックに書かれていないことは推測で埋めず、has_answer=falseとし、answerには「ハンドブックに記載がありません」という趣旨を書くこと。あわせて、どのファイルに追記すべきかをsuggested_fileで提案してよい。
 3. 回答本文は簡潔に。手順を問われたら該当手順の要点を回答本文に直接書くこと。
 4. 回答本文に「〜.md」等の内部ファイル名を書いてはならない。利用者はmdファイルを閲覧できない（管理者専用）。詳細への誘導は、マニュアルリンク集に記載の原本URL（GoogleドキュメントやシートのURL）で行い、URLが無い場合は本文の要約で完結させること。
@@ -515,6 +515,9 @@ class AnswerGenerator:
             url = str(src.get("url", "")).strip()
             if url and not _url_in_handbook(url, handbook):
                 url = ""  # ハンドブックに記載のないURLは出典に載せない（捏造防止）
+            if not url:
+                # モデルがurlを埋め忘れても、リンク集から機械的に補完する
+                url = _lookup_manual_url(normalized, handbook)
             valid.append({"file": normalized, "heading": heading, "url": url})
         answer.sources = valid
         answer.text = _scrub_body_urls(answer.text, handbook, allowlist)
@@ -702,6 +705,52 @@ def _handbook_url_map(handbook: Handbook) -> dict[str, str]:
             mapping.setdefault(match.group(0).rstrip("/"), f.name)
     handbook._url_map = mapping  # type: ignore[attr-defined]
     return mapping
+
+
+_TITLE_NOISE_RE = re.compile(r"[\s　_・,、。（）()\[\]]")
+
+
+def _normalize_title(text: str) -> str:
+    return _TITLE_NOISE_RE.sub("", text).lower()
+
+
+def _manual_url_map(handbook: Handbook) -> dict[str, str]:
+    """マニュアル名（正規化）→ 原本URL の対応表をリンク集から作る。
+
+    出典にURLが付かない事故（モデルがurlを埋め忘れる）を防ぐため、
+    コード側で機械的に補完できるようにする。Handbookインスタンスにキャッシュする。
+    """
+    cached = getattr(handbook, "_manual_map", None)
+    if cached is not None:
+        return cached
+    mapping: dict[str, str] = {}
+    for f in handbook.files:
+        if "リンク集" not in f.name:
+            continue
+        for line in f.content.splitlines():
+            match = _URL_RE.search(line)
+            if not match:
+                continue
+            before = line[: match.start()]
+            cells = [c.strip() for c in before.split("|") if c.strip()]
+            title = cells[0] if cells else before.strip(" -:*")
+            title = re.sub(r"^[-*・]\s*", "", title).strip()
+            if title and len(title) < 60:
+                mapping.setdefault(_normalize_title(title), match.group(0))
+    handbook._manual_map = mapping  # type: ignore[attr-defined]
+    return mapping
+
+
+def _lookup_manual_url(file_name: str, handbook: Handbook) -> str:
+    """マニュアル名から原本URLを引く（完全一致→一意な部分一致の順）。"""
+    mapping = _manual_url_map(handbook)
+    key = _normalize_title(display_name(file_name))
+    if key in mapping:
+        return mapping[key]
+    # 「ライズ給与振込システム作業フロー(2025.11～)」のように注記付きで
+    # 載っている場合に備え、候補が1件に定まるときだけ部分一致を許す
+    hits = [url for title, url in mapping.items() if key and (key in title or title in key)]
+    return hits[0] if len(hits) == 1 else ""
 
 
 def _url_in_handbook(url: str, handbook: Handbook) -> bool:
