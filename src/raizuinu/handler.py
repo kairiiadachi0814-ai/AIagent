@@ -231,6 +231,7 @@ class RaizuinuHandler:
                 NO_DOCUMENT_GUIDANCE,
                 find_document,
                 looks_like_document_request,
+                mentions_google_doc,
             )
 
             url_check = lambda url: _url_in_handbook(url, handbook)  # noqa: E731
@@ -238,7 +239,11 @@ class RaizuinuHandler:
                 event.body, messages, question,
                 bot_account_id=event.to_account_id, handbook_url_check=url_check,
             )
-            if document is None and looks_like_document_request(question):
+            if (
+                document is None
+                and looks_like_document_request(question)
+                and not mentions_google_doc(event.body)  # 原本URLはQ&Aで扱う
+            ):
                 # 「さっきのファイル」を探すときだけ、文脈用より広く遡って再検索する
                 try:
                     wider = self._chatwork.get_recent_messages(

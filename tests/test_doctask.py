@@ -299,9 +299,39 @@ class TestDocumentRequestDetection:
 
         assert looks_like_document_request("さっきのファイルを議事録にして")
         assert looks_like_document_request("添付の内容を要約して")
+        assert looks_like_document_request("先ほど送った議事録を整理して")
         assert not looks_like_document_request("議事録の書き方を教えて")  # 手順Q&A
         assert not looks_like_document_request("経費精算の締め日は？")
         assert not looks_like_document_request("添付書類の提出先はどこ？")  # 要約等の依頼でない
+
+    def test_ordinary_questions_are_not_hijacked(self):
+        # ハンドブックで答えるべき質問が案内文・文書探索に横取りされないこと
+        from raizuinu.doctask import _should_scan_history, looks_like_document_request
+
+        ordinary = [
+            "請求書ファイルの保管ルールを整理して",
+            "経費精算の資料をまとめて教えて",
+            "決算資料の作り方を整理して",
+            "5万円以上の資産計上ルールを整理して",  # 「以上の」が「上の」に部分一致しない
+            "10万円以上の備品の処理をまとめて教えて",
+            "以前の規定との違いをまとめて教えて",  # 「以前の」が「前の」に部分一致しない
+            "領収書ファイルの整理はどうすればいい",
+            "振込データのアップロード手順をまとめて",  # 「アップロード手順」が「アップ」に一致しない
+        ]
+        for q in ordinary:
+            assert not looks_like_document_request(q), q
+            assert not _should_scan_history(q), q
+
+    def test_pasted_material_is_not_treated_as_missing_file(self):
+        # 本文に文字起こしを貼った依頼を「添付が見つかりません」で握り潰さない
+        from raizuinu.doctask import looks_like_document_request
+
+        pasted = (
+            "先ほどの打ち合わせの文字起こしを議事録にまとめてください\n"
+            "田中: 前期の資料を確認しました\n坂田: 締め日は5営業日以内です\n"
+            "田中: 承知しました\n" + "以下は詳細な発言記録です。" * 20
+        )
+        assert not looks_like_document_request(pasted)
 
 
 class TestHandlerIntegration:
@@ -371,6 +401,23 @@ class TestHandlerIntegration:
         assert generator.calls == []  # Q&Aへ流れない
         assert "■要点" in chatwork.sent[0][1]
         assert audit.records[0]["type"] == "doc_task"
+
+    def test_handbook_url_request_goes_to_qa_not_guidance(self, tmp_path, monkeypatch):
+        # ハンドブック原本URL付きの依頼は「見つかりません」ではなくQ&Aへ回す
+        handler, chatwork, generator, audit, token = self._make(tmp_path, monkeypatch)
+        (tmp_path / "マニュアルリンク集.md").write_text(
+            f"# リンク集\n- 経費: {GOOGLE_DOC_URL}\n", encoding="utf-8"
+        )
+        from raizuinu.answer import Answer
+
+        generator._answer = Answer(
+            has_answer=True, text="手順はこうです",
+            sources=[{"file": "銀行明細取得.md", "heading": "", "url": ""}],
+            usage={"input_tokens": 1, "output_tokens": 1},
+        )
+        self._send(handler, token, f"[To:999]さっきの資料を要約して {GOOGLE_DOC_URL}")
+        assert len(generator.calls) == 1  # Q&Aフローが処理する
+        assert "見つかりませんでした" not in chatwork.sent[0][1]
 
     def test_document_request_without_file_returns_guidance(self, tmp_path, monkeypatch):
         # 見つからないときは「機能がない」ではなく、依頼の仕方を案内する（API消費なし）

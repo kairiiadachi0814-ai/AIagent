@@ -51,9 +51,23 @@ _TASK_KEYWORDS = (
     "アクション",
 )
 # 手順を尋ねる形の質問はQ&A（過去の添付に遡らない）
-_HOWTO_MARKERS = ("書き方", "方法", "やり方", "とは", "って何")
-# 過去メッセージへ遡るのは、過去の文書を指す言葉がある依頼のみ
-_DOC_REF_MARKERS = ("さっき", "先ほど", "添付", "ファイル", "アップ", "資料", "上の", "前の")
+_HOWTO_MARKERS = ("書き方", "方法", "やり方", "とは", "って何", "作り方")
+# 文書そのものを指す名詞。「経費精算の資料をまとめて教えて」のような
+# 通常のQ&Aを拾わないよう、下の参照語との同時出現を必須にする
+_DOC_NOUN_RE = re.compile(
+    r"ファイル|資料|文書|ドキュメント|テキスト|文字起こし|議事録|データ|添付|シート|スプレッドシート"
+)
+# 「直前に投稿された文書」を指す参照語。部分一致の誤爆（「以上の」→「上の」、
+# 「以前の」→「前の」、「アップロード手順」→「アップ」）を避けるため語形を限定する
+_STRONG_DOC_REF_RE = re.compile(
+    r"さっき|先ほど|先程|添付し|添付の|添付ファイル|添付いただ|送った|送りました|送信し|"
+    r"アップした|アップロードした|アップしていただ|上げた|共有した|貼った|先に送"
+)
+# 遡り検索のみで許す弱い参照語（案内文の即答には使わない）
+_WEAK_DOC_REF_RE = re.compile(r"上記|この|その|例の|先の")
+# 依頼文そのものに素材が貼られている場合は遡らない（taskフローで処理する）
+_PASTED_LINES = 3
+_PASTED_CHARS = 300
 
 SYSTEM_PROMPT = """あなたは株式会社ライズクリエイションの社内AIエージェント「{agent_name}」です。
 メンバーから会議の文字起こし・議事録・メモなどの文書と依頼を受け取り、文書に基づく事務作業（議事録作成・概要まとめ・決定事項や宿題の抽出・整理など）を行います。
@@ -115,16 +129,46 @@ NO_DOCUMENT_GUIDANCE = (
 )
 
 
+def mentions_google_doc(body: str) -> bool:
+    """本文にGoogleドキュメント／スプレッドシートのURLが含まれるか。
+
+    find_documentがNoneを返しても、URLがある場合は「見つからなかった」のではなく
+    「ハンドブック原本なのでQ&Aへ回した」ことを意味するため、案内文を出さない判定に使う。
+    """
+    return bool(_GOOGLE_URL_RE.search(_QUOTE_RE.sub("", body)))
+
+
+def _has_pasted_material(question: str) -> bool:
+    """依頼文そのものに素材（文字起こし等）が貼られているか。"""
+    return question.count("\n") >= _PASTED_LINES or len(question) > _PASTED_CHARS
+
+
+def _is_doc_task_phrasing(question: str) -> bool:
+    """文書に対する作業依頼の言い回しか（作業語＋文書を指す名詞、手順質問でない）。"""
+    if any(m in question for m in _HOWTO_MARKERS):
+        return False
+    if _has_pasted_material(question):
+        return False  # 貼り付け素材つきの依頼はtaskフローで処理する
+    return bool(
+        any(kw in question for kw in _TASK_KEYWORDS) and _DOC_NOUN_RE.search(question)
+    )
+
+
 def looks_like_document_request(question: str) -> bool:
-    """「さっきのファイルを議事録にして」のように、文書を指した依頼かどうか。
+    """「さっきのファイルを議事録にして」のように、投稿済み文書を明確に指した依頼か。
 
     該当するのに文書が見つからない場合は、通常のQ&Aに流さず案内文を返すために使う
     （ハンドブックの質問として処理されると「機能がない」等の誤った回答になるため）。
+    通常のQ&A（例:「請求書ファイルの保管ルールを整理して」）を横取りしないよう、
+    直前の投稿を指す明確な語がある場合に限る。
     """
-    if any(m in question for m in _HOWTO_MARKERS):
-        return False
-    return any(kw in question for kw in _TASK_KEYWORDS) and any(
-        m in question for m in _DOC_REF_MARKERS
+    return _is_doc_task_phrasing(question) and bool(_STRONG_DOC_REF_RE.search(question))
+
+
+def _should_scan_history(question: str) -> bool:
+    """過去メッセージまで遡って添付を探してよい依頼か（案内文より少し広く許す）。"""
+    return _is_doc_task_phrasing(question) and bool(
+        _STRONG_DOC_REF_RE.search(question) or _WEAK_DOC_REF_RE.search(question)
     )
 
 
@@ -142,7 +186,7 @@ def find_document(
     - ハンドブック記載の原本URL（マニュアル類）は文書タスクの対象にしない（Q&Aで扱う）
     - 対応形式外の添付は、議事録・要約系キーワードのある依頼のときだけ形式案内を返す
       （画像等を添えた通常質問はQ&Aフローへ）
-    - 直近メッセージからの検出は、キーワードがあり・手順質問（書き方/方法等）でなく・
+    - 直近メッセージからの検出は _should_scan_history が真の依頼に限り、
       ボット以外の発言の・対応形式の添付のみ
     """
     has_keywords = any(kw in question for kw in _TASK_KEYWORDS)
@@ -155,12 +199,8 @@ def find_document(
                 return None  # マニュアル原本のURLはQ&A（出典検証つき）で扱う
             return found
         return found if has_keywords else None  # unsupported_file
-    if not has_keywords or any(m in question for m in _HOWTO_MARKERS):
+    if not _should_scan_history(question):
         return None
-    if not any(m in question for m in _DOC_REF_MARKERS):
-        return None  # 過去の文書を指す言葉が無い依頼は遡らない（通常のQ&A・雑務へ）
-    if question.count("\n") >= 3 or len(question) > 300:
-        return None  # 本文に素材が貼られた依頼（議事録テキスト等）はtaskフローで処理する
     for message in reversed(recent_messages or []):
         account = message.get("account") or {}
         if bot_account_id and int(account.get("account_id") or 0) == int(bot_account_id):
