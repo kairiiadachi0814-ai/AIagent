@@ -174,6 +174,8 @@ def build_proposals(
         "提案は通し番号を付けて3〜6件に絞り、各提案は2行以内で具体的に。"
         "実行や変更の宣言はしない（すべて管理者の承認待ちの提案として書く）。"
         "データが少ない場合は無理に提案をひねり出さず、その旨を正直に書くこと。"
+        "レポートはChatworkに掲載されMarkdownは表示されないため、箇条書きは「・」で始め、"
+        "「- 」「**強調**」等のMarkdown記法は使わないこと。"
     )
     response = client.messages.create(
         model=config.model,
@@ -192,10 +194,14 @@ def build_proposals(
     cost.add_usage(usage)
     if getattr(response, "stop_reason", None) != "end_turn":
         return ""
-    return next(
+    text = next(
         (b.text for b in reversed(response.content) if getattr(b, "type", "") == "text"),
         "",
     ).strip()
+    # Chatworkに掲載するためMarkdown除去＋タグ無害化を通す
+    from .answer import sanitize_for_chatwork
+
+    return sanitize_for_chatwork(text)
 
 
 def render_report(

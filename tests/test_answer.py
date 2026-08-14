@@ -309,6 +309,65 @@ class TestAnswerGenerator:
         answer = gen.generate("接待交際費の限度は？", handbook)
         assert answer.stage2 == "fetch_failed"  # 監査ログでリンク切れを検知できる
 
+    def test_markdown_is_converted_for_chatwork(self):
+        from raizuinu.answer import sanitize_for_chatwork
+
+        text = (
+            "- **圧縮できる限度額**：補助金8.6億円が上限です。\n"
+            "  - `直接減額方式` の場合\n"
+            "* やり方：__費用計上__します\n"
+            "## 注意点\n"
+            "マイナス表記の -100円 はそのまま。\n"
+            "-123円が行頭でも空白が続かなければ触らない"
+        )
+        result = sanitize_for_chatwork(text)
+        assert "・圧縮できる限度額：補助金8.6億円が上限です。" in result
+        assert "  ・直接減額方式 の場合" in result
+        assert "・やり方：費用計上します" in result
+        assert "注意点" in result and "##" not in result
+        assert "**" not in result
+        assert "-100円" in result  # 行頭以外は触らない
+        assert "-123円が行頭でも" in result  # 記号の直後に空白が無ければ箇条書きとみなさない
+
+    def test_underscore_urls_not_broken_by_markdown_strip(self):
+        from raizuinu.answer import sanitize_for_chatwork
+
+        # ハンドブック実在のGoogle Docs URL（IDに__を含む）。同一行に2つ並んでも壊さない
+        u1 = "https://docs.google.com/document/d/1NhwGLpX1QkSyO5QTt__8QgfGoonD0aMvmpj9MCoOx7Y/edit?tab=t.0"
+        u2 = "https://docs.google.com/document/d/1yni68-r7QaGL8__KIgem-a6eciShRxsfpDjf-23Zgs0/edit"
+        text = f"・明細: {u1}\n・給与: {u2}\n同一行: {u1} と {u2} を参照。__強調__も除去。"
+        result = sanitize_for_chatwork(text)
+        assert result.count(u1) == 2
+        assert result.count(u2) == 2
+        assert "__" not in result.replace(u1, "").replace(u2, "")  # URL外の__記法は除去
+
+    def test_markdown_wrapped_url_survives_scrub(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        gen, _ = make_generator(
+            tmp_path,
+            {
+                "has_answer": True,
+                "answer": f"詳しくは **{REAL_URL}** をご覧ください",
+                "sources": [{"file": "銀行明細取得.md", "heading": "", "url": ""}],
+                "suggested_file": "",
+            },
+        )
+        answer = gen.generate("質問", handbook)
+        assert REAL_URL in answer.text  # **で囲まれても検証済みURLは（URL省略）にしない
+        reply = format_reply(answer, 1, 2, "3")
+        assert REAL_URL in reply
+        assert "**" not in reply  # 囲みの**は最終出力までに除去される
+
+    def test_format_reply_output_has_no_markdown(self, tmp_path):
+        answer = Answer(
+            has_answer=True,
+            text="- **要点**：こうです",
+            sources=[{"file": "銀行明細取得.md", "heading": "", "url": ""}],
+        )
+        reply = format_reply(answer, 111, 222, "333")
+        assert "・要点：こうです" in reply
+        assert "**" not in reply
+
     def test_fabricated_mirasapo_url_in_body_is_scrubbed(self, tmp_path):
         handbook = make_handbook(tmp_path)
         fake_url = "https://mirasapo-plus.go.jp/subsidy/not-a-real-page/"

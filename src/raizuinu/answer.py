@@ -125,6 +125,7 @@ Chatworkで社員からの質問に、社内ハンドブック（経理・財務
 - 利用者の質問に答えるときは、質問を受け止める短い一言から入ってよい（例:「〜の件ですね。」「はい、ありますよ。」「それ、ちょうど手順がありますよ。」）。例文は雰囲気の見本であり、そのまま使い回さず質問の内容に合わせて毎回言い方を変えること。「あ、」のような感動詞で始める書き出しを多用しない。短い質問には前置きなしで結論から入ってよい。いずれの場合も結論→必要な補足の順で話す。
 - 質問への回答以外の依頼（依頼文の側で書き出しや文体が指定されている場合。例: メンバー同士の議論への横からの助言）では、その指定を優先し、受け止めの一言やくだけた言い回しは使わず、落ち着いた控えめな丁寧さで書くこと。
 - 「以下のとおりです」「上記をご確認ください」のような機械的な定型表現の連発や、過剰な箇条書きを避ける。短い説明は文章の流れで伝え、手順が3ステップ以上あるときや選択肢の列挙が必要なときだけ箇条書きを使う。
+- ChatworkはMarkdownを表示できない。箇条書きは「・」で始め、「- 」「* 」による箇条書き・「**」による強調・「#」見出し・バッククォート等のMarkdown記法は使わないこと。強調したい語は「」で括る。
 - 相手を急かさない・突き放さない。分からないことは正直に、次にどうすればよいかを添えて案内する。
 - 長さは質問に見合う分だけ。聞かれていないことまで説明しない。
 - 絵文字・顔文字は使わない。
@@ -415,6 +416,8 @@ class AnswerGenerator:
             "ただしページに書かれた事実の範囲で言い方だけを易しくし、"
             "数値や正式な用語はページのとおり正確に書くこと。"
             "ページの長い引用・転載はしない。ページに書かれていないことは書かない。"
+            "回答はChatworkに掲載されMarkdownは表示されないため、箇条書きは「・」で始め、"
+            "「- 」「**強調**」等のMarkdown記法は使わないこと。"
             + subsidy_note +
             "「内容を取得しました」「回答をまとめます」のような作業経過の前置きは"
             "一切書かず、回答本文から直接始めること。"
@@ -657,10 +660,15 @@ def _scrub_body_urls(
     allowlist = allowlist or []
 
     def repl(match: re.Match) -> str:
-        url = match.group(0)
+        raw = match.group(0)
+        # モデルが「**URL**」「`URL`」のようにMarkdownで囲んだ場合、末尾の記号は
+        # URLの一部として取り込まれる（_URL_REは*や`を除外しない）。記号を切り離して
+        # 素のURLで照合しないと、検証済みの正当なURLまで（URL省略）になってしまう
+        url = raw.rstrip("*`")
+        trailing = raw[len(url):]
         if any(url.startswith(prefix) for prefix in allowlist):
-            return url
-        return url if _url_in_handbook(url, handbook) else "（URL省略）"
+            return url + trailing
+        return (url if _url_in_handbook(url, handbook) else "（URL省略）") + trailing
 
     return _URL_RE.sub(repl, text)
 
@@ -670,12 +678,46 @@ def display_name(file_name: str) -> str:
     return file_name[:-3] if file_name.endswith(".md") else file_name
 
 
-def sanitize_for_chatwork(text: str) -> str:
-    """モデル由来文字列のChatworkタグを無害化する（[toall]等の注入防止）。
+# ChatworkはMarkdownを表示できないため、モデルが混ぜた記法をプレーン表記へ変換する
+_MD_BOLD_RE = re.compile(r"\*\*([^*\n]+?)\*\*|__([^_\n]+?)__")
+_MD_CODE_RE = re.compile(r"`([^`\n]+)`")
+_MD_HEADING_RE = re.compile(r"^(\s*)#{1,6}\s+", re.MULTILINE)
+_MD_BULLET_RE = re.compile(r"^(\s*)[-*+]\s+", re.MULTILINE)
 
-    角括弧を全角に置換してタグとして解釈されないようにする。
+
+def _strip_markdown(text: str) -> str:
+    """Markdown記法をChatwork向けの表記に直す（箇条書きは「・」、強調・コードは中身のみ）。
+
+    URL区間はプレースホルダへ退避してから変換する。Google DocsのID等には「__」や
+    ハイフンがMarkdown記法と同じ文字列として正当に含まれるため、退避しないと
+    実在するURLを破壊してしまう。URLを囲む**や`は記法としてURLの外に出し、
+    通常の強調・コードのペアとして除去させる。
     """
-    return text.replace("[", "［").replace("]", "］")
+    urls: list[str] = []
+
+    def _shield(match: re.Match) -> str:
+        url = match.group(0).rstrip("*`")
+        trailing = match.group(0)[len(url):]
+        urls.append(url)
+        return f"\x00{len(urls) - 1}\x00{trailing}"
+
+    text = _URL_RE.sub(_shield, text)
+    text = _MD_BOLD_RE.sub(lambda m: m.group(1) or m.group(2) or "", text)
+    text = _MD_CODE_RE.sub(r"\1", text)
+    text = _MD_HEADING_RE.sub(r"\1", text)
+    text = _MD_BULLET_RE.sub(r"\1・", text)
+    for i, url in enumerate(urls):
+        text = text.replace(f"\x00{i}\x00", url)
+    return text
+
+
+def sanitize_for_chatwork(text: str) -> str:
+    """モデル由来文字列をChatwork表示用に整える。
+
+    - Chatworkタグの無害化（[toall]等の注入防止。角括弧を全角へ）
+    - Markdown記法の除去（Chatworkは表示できず記号がそのまま見えるため）
+    """
+    return _strip_markdown(text).replace("[", "［").replace("]", "］")
 
 
 def format_reply(answer: Answer, event_account_id: int, room_id: int, message_id: str) -> str:
