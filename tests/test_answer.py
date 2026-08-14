@@ -76,7 +76,8 @@ class TestAnswerGenerator:
         answer = gen.generate("取得手順は？", handbook)
         assert answer.has_answer
         assert answer.sources == [
-            {"file": "銀行明細取得.md", "heading": "銀行明細取得", "url": REAL_URL}
+            {"file": "銀行明細取得.md", "heading": "銀行明細取得", "url": REAL_URL,
+             "title": "銀行明細取得"}
         ]
         assert answer.usage["input_tokens"] == 1000
 
@@ -244,7 +245,8 @@ class TestAnswerGenerator:
         assert answer.has_answer
         # 実在しない見出しは落とし、原本URLはリンク集から補完される
         assert answer.sources == [
-            {"file": "銀行明細取得.md", "heading": "", "url": REAL_URL}
+            {"file": "銀行明細取得.md", "heading": "", "url": REAL_URL,
+             "title": "銀行明細取得"}
         ]
 
     def test_broken_json_returns_failure(self, tmp_path):

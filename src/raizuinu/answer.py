@@ -523,7 +523,15 @@ class AnswerGenerator:
             if not url:
                 # モデルがurlを埋め忘れても、原本URLを機械的に補完する
                 url = _lookup_manual_url(normalized, handbook)
-            valid.append({"file": normalized, "heading": heading, "url": url})
+            valid.append(
+                {
+                    "file": normalized,
+                    "heading": heading,
+                    "url": url,
+                    # 表示は内部ファイル名ではなく原本の文書名（冒頭見出し）を使う
+                    "title": _manual_title(normalized, handbook),
+                }
+            )
         answer.sources = valid
         answer.text = _scrub_body_urls(answer.text, handbook, allowlist)
         # 出典なし回答の扱い（ガードレール1）。例外は次のintentのみ:
@@ -786,6 +794,14 @@ def _lookup_manual_url(file_name: str, handbook: Handbook) -> str:
     return hits[0] if len(hits) == 1 else ""
 
 
+def _manual_title(file_name: str, handbook: Handbook) -> str:
+    """出典表示に使う原本の文書名（冒頭見出し）。無ければファイル名から作る。"""
+    target = next((f for f in handbook.files if f.name == file_name), None)
+    if target and target.headings:
+        return target.headings[0].strip()
+    return display_name(file_name)
+
+
 def _url_belongs_to_file(url: str, file_name: str, handbook: Handbook) -> bool:
     """そのURLが、出典として挙げられたマニュアル自身に載っているURLか。
 
@@ -892,7 +908,7 @@ def format_reply(answer: Answer, event_account_id: int, room_id: int, message_id
         lines.append("【出典】")
         seen = set()
         for src in answer.sources:
-            label = display_name(src["file"])
+            label = src.get("title") or display_name(src["file"])
             if src.get("heading"):
                 label += f"（{src['heading']}）"
             label = sanitize_for_chatwork(label)

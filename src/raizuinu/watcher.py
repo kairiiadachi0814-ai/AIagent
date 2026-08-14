@@ -252,7 +252,7 @@ class DiscussionWatcher:
 
         labels = []
         for s in sources:
-            label = display_name(s.get("file", ""))
+            label = s.get("title") or display_name(s.get("file", ""))
             if s.get("url"):
                 label = (label + " " if label else "") + s["url"]
             if label and label not in labels:
