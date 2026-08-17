@@ -799,6 +799,52 @@ class TestAnswerGenerator:
         assert answer.reference_url == NTA_URL
         assert "2千円" in answer.text
 
+    def test_tax_question_misclassified_as_internal_is_rescued(self, tmp_path):
+        # 税法の質問が社内手順の質問と誤判定され「記載なし」になる事象の救済
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["web_fetch_enabled"] = True
+        config.data["web_fetch_allowed_domains"] = ["www.nta.go.jp"]
+        stage1 = {
+            "intent": "question",  # 誤判定
+            "reference_url": "",
+            "has_answer": False,  # ハンドブックに根拠なし
+            "answer": "契約の中身によって変わるため一概には言えません。",
+            "sources": [],
+            "suggested_file": "",
+            "reported_manuals": [],
+        }
+        client = FakeClient(
+            [fake_response(stage1), self._stage2_response("第7号文書で4,000円です。※")]
+        )
+        gen = AnswerGenerator(config, client=client)
+        answer = gen.generate("業務委託基本契約書の収入印紙はいくら？", handbook)
+        assert client.calls == 2
+        assert answer.has_answer
+        assert "4,000円" in answer.text
+        assert answer.intent == "general_knowledge"
+
+    def test_internal_answer_is_not_rescued(self, tmp_path):
+        # ハンドブックで答えられた社内手順の回答は、税目キーワードがあっても変えない
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["web_fetch_enabled"] = True
+        config.data["web_fetch_allowed_domains"] = ["www.nta.go.jp"]
+        payload = {
+            "intent": "question",
+            "reference_url": "",
+            "has_answer": True,
+            "answer": "当社では収入印紙は総務で管理しています",
+            "sources": [{"file": "銀行明細取得.md", "heading": "", "url": ""}],
+            "suggested_file": "",
+            "reported_manuals": [],
+        }
+        client = FakeClient(fake_response(payload))
+        gen = AnswerGenerator(config, client=client)
+        answer = gen.generate("収入印紙はどこで受け取れますか？", handbook)
+        assert client.calls == 1  # 2段目を呼ばない
+        assert "総務で管理" in answer.text
+
     def test_junk_tool_keywords_rejected(self):
         from raizuinu.answer import _is_placeholder_value
 

@@ -401,12 +401,21 @@ class AnswerGenerator:
 
         cfg = self._config
         allowed_hosts = {d.lower() for d in cfg.web_fetch_allowed_domains}
-        if (
-            answer.intent != "general_knowledge"
-            or not cfg.web_fetch_enabled
-            or not allowed_hosts
-        ):
+        if not cfg.web_fetch_enabled or not allowed_hosts:
             return answer
+
+        if answer.intent != "general_knowledge":
+            # 税法の質問が社内手順の質問（question）と誤判定される事象が実測で発生。
+            # ハンドブックで答えられなかった場合に限り、税目から国税庁ページを引いて救済する
+            # （社内手順の回答は has_answer=True なので壊さない）
+            if answer.intent != "question" or answer.has_answer:
+                return answer
+            rescue = _lookup_tax_url(question, handbook, allowed_hosts)
+            if not rescue:
+                return answer
+            answer.intent = "general_knowledge"
+            answer.reference_url = rescue
+            answer.stage2 = "recovered"
 
         url = answer.reference_url
         if not _fetchable_reference(url, allowed_hosts, handbook):
