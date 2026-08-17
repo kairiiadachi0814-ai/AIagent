@@ -245,11 +245,23 @@ class TestTemplateFill:
         out = render_xlsx(data, "汎用", {"D10": "株式会社テスト"})
         before = set(zipfile.ZipFile(io.BytesIO(data)).namelist())
         after = set(zipfile.ZipFile(io.BytesIO(out)).namelist())
-        # 差分は計算チェーン（Excelが作り直す）だけ。図形・フォームコントロール・
-        # 印刷設定を落とさない
-        assert before - after == {"xl/calcChain.xml"}
+        # 図形・フォームコントロール・印刷設定・計算チェーンを1つも落とさない
+        assert before == after
         assert any(n.startswith("xl/ctrlProps/") for n in after)
         assert any(n.startswith("xl/printerSettings/") for n in after)
+
+    def test_overwriting_a_formula_drops_only_its_calcchain_entry(self):
+        import pathlib
+
+        data = (pathlib.Path(REPO_TEMPLATES) / "FAX送付状.xlsx").read_bytes()
+        chain_before = zipfile.ZipFile(io.BytesIO(data)).read("xl/calcChain.xml").decode()
+        assert '<c r="E6"' in chain_before  # =TODAY() が登録されている
+        out = render_xlsx(data, "汎用", {"E6": "2026年9月1日"})
+        z = zipfile.ZipFile(io.BytesIO(out))
+        # 消した数式が計算チェーンに残るとExcelが壊れたファイルとして扱う。
+        # ファイルごと消すと[Content_Types].xml等の参照が宙に浮くため該当行だけ抜く
+        assert '<c r="E6"' not in z.read("xl/calcChain.xml").decode()
+        assert "xl/calcChain.xml" in z.namelist()
 
 
 class TestMultipart:

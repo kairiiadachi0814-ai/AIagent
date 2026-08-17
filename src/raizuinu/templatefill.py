@@ -21,6 +21,8 @@ from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
 
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+# 段落IDは文書内で一意。段落を複製したら必ず外す
+W14_PARA_ID = "{http://schemas.microsoft.com/office/word/2010/wordml}paraId"
 _XMLNS_RE = re.compile(r'xmlns:([A-Za-z0-9_]+)="([^"]+)"')
 _ROOT_TAG_RE = re.compile(r"<w:document\b[^>]*>")
 _PLACEHOLDER_RE = re.compile(r"\{\{[a-z_]+\}\}")
@@ -75,6 +77,7 @@ def render_docx(template: bytes, scalars: dict[str, str], repeats: dict[str, lis
             body.remove(child)
             for offset, row in enumerate(rows):
                 clone = ET.fromstring(ET.tostring(child))
+                clone.attrib.pop(W14_PARA_ID, None)  # 段落IDの重複を避ける
                 _replace_in_para(clone, row)
                 body.insert(position + offset, clone)
             break  # 目印の段落はひな形に1つだけ
@@ -153,14 +156,24 @@ def render_xlsx(template: bytes, sheet_name: str, cells: dict[str, Any]) -> byte
 
     path, index = sheet_path_by_name(parts, sheet_name)
     sheet_xml = parts[path].decode("utf-8")
+    overwritten_formulas = []
     for ref, value in cells.items():
         if value is None or value == "":
             continue
+        before = _cell_re(ref).search(sheet_xml)
+        if before and "<f" in (before.group("inner") or ""):
+            overwritten_formulas.append(ref)
         sheet_xml = _set_cell(sheet_xml, ref, value)
     parts[path] = sheet_xml.encode("utf-8")
 
-    # 数式を数値で上書きした場合に備え、計算チェーンは捨てる（Excelが作り直す）
-    parts.pop("xl/calcChain.xml", None)
+    # 数式を消したセルが計算チェーンに残ると、Excelが壊れたファイルとして扱う。
+    # ファイルごと消すと[Content_Types].xml等の参照が宙に浮くため、該当行だけ抜く
+    chain = parts.get("xl/calcChain.xml")
+    if chain and overwritten_formulas:
+        text = chain.decode("utf-8")
+        for ref in overwritten_formulas:
+            text = re.sub(rf'<c r="{ref}"[^>]*/>', "", text)
+        parts["xl/calcChain.xml"] = text.encode("utf-8")
     parts["xl/workbook.xml"] = re.sub(
         r'(<workbookView\b[^>]*?)\sactiveTab="\d+"',
         rf'\1 activeTab="{index}"',

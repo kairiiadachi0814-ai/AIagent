@@ -10,14 +10,13 @@ Boxにある3つの送付状ファイルは、過去に送った分が1ファイ
 
 実行はローカルPC（Box同期フォルダが見える環境）のみ。VPSでは動かさない。
 
-    python tools/build_soufujo_templates.py
+    python tools/build_templates.py
 """
 
 from __future__ import annotations
 
 import copy
 import re
-
 import sys
 import zipfile
 from pathlib import Path
@@ -47,7 +46,7 @@ SPECS = [
             659: None,  # 宛先2行目・3行目は削除し、1行目を必要な数だけ複製する
             660: None,
             668: f"担当： 経理財務部　{PH_STAFF}",
-            684: f"■{PH_ITEM}\t\t{PH_QTY}",
+            684: f"■{PH_ITEM}\t{PH_QTY}",
         },
     },
     {
@@ -60,7 +59,7 @@ SPECS = [
             2: PH_TO,
             3: None,
             13: f"担当： 経理財務部　{PH_STAFF}",
-            29: f"■{PH_ITEM}\t\t{PH_QTY}",
+            29: f"■{PH_ITEM}\t{PH_QTY}",
         },
     },
     {
@@ -116,6 +115,26 @@ def set_para_text(p: ET.Element, text: str) -> None:
         t.text = chunk
 
 
+def set_right_tab_stop(p: ET.Element, pos_twips: int = 8500) -> None:
+    """段落に右揃えのタブ位置を1つ定義する。
+
+    原本の明細行は品名の長さに合わせてタブや全角空白の数を手で調整しており、
+    品名を差し替えると部数の位置がずれる。右揃えタブを1つ置けば、品名の
+    長さによらず部数が同じ位置で揃う。
+    """
+    ppr = p.find(W + "pPr")
+    if ppr is None:
+        ppr = ET.Element(W + "pPr")
+        p.insert(0, ppr)
+    for existing in ppr.findall(W + "tabs"):
+        ppr.remove(existing)
+    tabs = ET.Element(W + "tabs")
+    tab = ET.SubElement(tabs, W + "tab")
+    tab.set(W + "val", "right")
+    tab.set(W + "pos", str(pos_twips))
+    ppr.insert(0, tabs)  # <w:tabs>は<w:pPr>の先頭側に置く
+
+
 def strip_page_breaks(p: ET.Element) -> None:
     """切り出した1通に、元ファイルの改ページが残らないようにする。"""
     for run in p.findall(W + "r"):
@@ -168,6 +187,8 @@ def build(spec: dict) -> Path:
         if new_text is None:
             continue
         set_para_text(paras[index], new_text)
+        if PH_QTY in new_text:  # 部数を右端で揃える
+            set_right_tab_stop(paras[index])
     for p in paras[start : end + 1]:
         strip_page_breaks(p)
 

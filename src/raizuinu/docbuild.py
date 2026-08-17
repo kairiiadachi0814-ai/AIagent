@@ -388,8 +388,10 @@ class DocBuildRunner:
                 cells[FAX_CELLS["pages"]] = pages
             for ref, line in zip(FAX_BODY_ROWS, fields.get("body_lines") or []):
                 cells[ref] = str(line)
-            if fields.get("date"):
-                cells["E6"] = date  # 日付の指定があるときだけ =TODAY() を上書きする
+            now = datetime.now(JST)
+            if date and date != f"{now.year}年{now.month}月{now.day}日":
+                # 今日以外の日付を指定されたときだけ =TODAY() を上書きする
+                cells["E6"] = date
             out = render_xlsx(data, template["sheet"], cells)
 
         suffix = ".docx" if template["kind"] == "docx" else ".xlsx"
