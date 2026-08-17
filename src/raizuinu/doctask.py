@@ -36,6 +36,29 @@ _GID_RE = re.compile(r"[?#&]gid=(\d+)")
 
 _SUPPORTED_EXTS = (".docx", ".txt", ".md", ".csv", ".tsv", ".log")
 _MAX_FILES_PER_TASK = 5
+_URL_RE = re.compile(r"https?://[^\s<>\"|）)。、]+")
+
+# 契約書アップロード時の追加対応（印紙税の判定・要点抽出）
+_STAMP_KEYWORDS = ("印紙", "収入印紙", "印紙税")
+_STAMP_TABLE_TITLES = ("印紙税額の一覧表（その1）", "印紙税額の一覧表（その2）")
+_TAX_LINK_FILE = "税法リンク集_国税庁.md"
+# 契約書らしさの判定（この語が複数出れば契約書とみなす）
+_CONTRACT_MARKERS = ("契約", "甲", "乙", "第1条", "第１条", "本契約", "締結", "覚書", "注文請書")
+
+CONTRACT_NOTE = """
+この文書は契約書とみられます。次を守ること。
+- 要点をまとめる場合の構成: ■契約の種類 ／■当事者 ／■契約期間・自動更新の有無 ／■金額・支払条件 ／■解約・中途解除の条件 ／■その他の注意点（管轄・秘密保持・再委託の可否など）。いずれも契約書に書かれている事実のみを写し、書かれていない項目は「記載なし」とすること。
+- **条項の法的な妥当性・有利不利・リスクの評価は行わないこと**（例:「この条項は不利です」「問題ありません」と書いてはならない）。それは顧問弁護士とLegalForceによるリーガルチェックの領域である。判断が必要そうな点に気づいた場合は「リーガルチェックで確認されるとよいと思います」と伝えるにとどめる。
+"""
+
+STAMP_NOTE = """
+印紙税について質問されている。次の手順で答えること。
+1. 契約書の内容から、印紙税法上どの号文書に当たりそうかを判断する（例: 請負なら第2号文書、継続的取引の基本となる契約書なら第7号文書、売上代金の受取書なら第17号文書）。判断の根拠を1行で示す。
+2. 契約書に記載された契約金額（記載金額）を読み取る。消費税額が区分記載されている場合は、その扱いにも触れる。
+3. 与えられた国税庁の印紙税額一覧表のページをweb_fetchで取得し、**該当する区分と金額の帯（「○円を超え○円以下」）を省略せずに**、表のとおりの税額を答える。税額は絶対に丸めたり概算にしたりしない。
+4. 契約金額の記載がない場合や、号数の判断が契約内容によって分かれる場合は、断定せず候補と条件を示し、税理士への確認を案内する。
+5. 回答の最後に必ず「※国税庁の掲載情報に基づく参考情報です。最終的な判断は原文の確認および税理士へのご相談をお願いします。」を付けること。
+"""
 
 # 添付が過去メッセージにある場合、この語を含む依頼のときだけ文書タスクとみなす
 _TASK_KEYWORDS = (
@@ -138,6 +161,32 @@ def mentions_google_doc(body: str) -> bool:
     「ハンドブック原本なのでQ&Aへ回した」ことを意味するため、案内文を出さない判定に使う。
     """
     return bool(_GOOGLE_URL_RE.search(_QUOTE_RE.sub("", body)))
+
+
+def looks_like_contract(text: str) -> bool:
+    """文書が契約書とみられるか（要点抽出の構成を切り替えるための判定）。"""
+    head = text[:3000]
+    return sum(1 for m in _CONTRACT_MARKERS if m in head) >= 3
+
+
+def wants_stamp_duty(instruction: str) -> bool:
+    return any(k in instruction for k in _STAMP_KEYWORDS)
+
+
+def stamp_table_urls(config: Config) -> list[str]:
+    """印紙税額一覧表のURLを税法リンク集から取得する（URLの正はリンク集側）。"""
+    for root in config.handbook.get("roots", ["."]):
+        path = config.resolve_path(root) / _TAX_LINK_FILE
+        if not path.exists():
+            continue
+        urls: list[str] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if any(t in line for t in _STAMP_TABLE_TITLES):
+                match = _URL_RE.search(line)
+                if match and match.group(0) not in urls:
+                    urls.append(match.group(0))
+        return urls
+    return []
 
 
 def _has_pasted_material(question: str) -> bool:
@@ -410,6 +459,8 @@ class DocTaskRunner:
     def _generate(
         self, instruction: str, text: str, label: str, truncated: bool
     ) -> tuple[str, dict[str, int]]:
+        from .answer import _call_with_continuation
+
         cfg = self._config
         # 注意書きは文書本文より前（信頼できる指示側）に置く
         note = (
@@ -418,35 +469,54 @@ class DocTaskRunner:
             if truncated
             else ""
         )
-        response = self._client.messages.create(
-            model=cfg.model,
-            max_tokens=int(cfg.max_tokens),
-            system=SYSTEM_PROMPT.format(agent_name=cfg.agent_name),
-            output_config={"effort": cfg.effort},
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        f"依頼: {instruction}\n{note}\n"
-                        f"===文書「{label}」ここから===\n{text}\n===文書ここまで==="
-                    ),
-                }
-            ],
+        system = SYSTEM_PROMPT.format(agent_name=cfg.agent_name)
+        user_parts = [f"依頼: {instruction}", note]
+
+        # 契約書の場合は要点の構成を指定し、法的な妥当性判断は行わせない
+        if looks_like_contract(text):
+            system += "\n" + CONTRACT_NOTE
+
+        kwargs: dict[str, Any] = {
+            "model": cfg.model,
+            "max_tokens": int(cfg.max_tokens),
+            "output_config": {"effort": cfg.effort},
+        }
+        # 印紙税を聞かれた場合のみ、国税庁の税額表を取得できるようにする
+        stamp_urls = (
+            stamp_table_urls(cfg)
+            if (wants_stamp_duty(instruction) and cfg.web_fetch_enabled)
+            else []
         )
-        usage: dict[str, int] = {}
-        for key in (
-            "input_tokens",
-            "output_tokens",
-            "cache_creation_input_tokens",
-            "cache_read_input_tokens",
-        ):
-            value = getattr(getattr(response, "usage", None), key, None)
-            if value:
-                usage[key] = int(value)
-        if getattr(response, "stop_reason", None) == "max_tokens":
+        if stamp_urls:
+            system += "\n" + STAMP_NOTE
+            user_parts.append(
+                "印紙税額の一覧表（国税庁）:\n" + "\n".join(stamp_urls)
+            )
+            kwargs["tools"] = [
+                {
+                    "type": "web_fetch_20260209",
+                    "name": "web_fetch",
+                    "max_uses": cfg.web_fetch_max_uses,
+                    "allowed_domains": ["www.nta.go.jp"],
+                    "max_content_tokens": cfg.web_fetch_max_content_tokens,
+                }
+            ]
+        kwargs["system"] = system
+        user_parts.append(f"===文書「{label}」ここから===\n{text}\n===文書ここまで===")
+        messages = [{"role": "user", "content": "\n".join(p for p in user_parts if p)}]
+        response, usage, _ = _call_with_continuation(
+            self._client.messages.create, kwargs, messages
+        )
+        stop_reason = getattr(response, "stop_reason", None)
+        if stop_reason == "max_tokens":
             return (
                 "すみません、文書が長く、まとめが途中で切れてしまいました。"
                 "範囲を分けて（例: 前半だけ）依頼し直していただけますか。"
+            ), usage
+        if stop_reason in ("tool_use", "pause_turn"):
+            return (
+                "すみません、資料の確認に手間取ってしまい、回答をまとめきれませんでした。"
+                "もう一度お試しいただけますか。"
             ), usage
         reply = next(
             (b.text for b in reversed(response.content) if getattr(b, "type", "") == "text"),

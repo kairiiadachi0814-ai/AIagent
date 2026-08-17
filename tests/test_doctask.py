@@ -302,6 +302,72 @@ class TestDocTaskRunner:
         assert content.index("途中まで") < content.index("===文書")  # 注意書きは文書より前
 
 
+CONTRACT_TEXT = (
+    "業務委託基本契約書\n"
+    "株式会社ライズクリエイション（以下「甲」という）と株式会社◯◯（以下「乙」という）は、"
+    "次のとおり本契約を締結する。\n"
+    "第1条（目的）本契約は、甲が乙に業務を委託することを定める。\n"
+    "第2条（委託料）月額50万円とし、翌月末日までに支払う。\n"
+    "第3条（契約期間）本契約の有効期間は1年とし、異議なき場合は自動更新する。\n"
+)
+
+
+class TestContractMode:
+    def test_contract_detection(self):
+        from raizuinu.doctask import looks_like_contract
+
+        assert looks_like_contract(CONTRACT_TEXT)
+        assert not looks_like_contract("経理定例会議 2026-08-14\n参加者: 坂田、田中\n決定事項: なし")
+
+    def test_stamp_table_urls_read_from_link_collection(self, tmp_path):
+        from raizuinu.doctask import stamp_table_urls
+
+        u1 = "https://www.nta.go.jp/taxes/shiraberu/taxanswer/inshi/7140.htm"
+        u2 = "https://www.nta.go.jp/taxes/shiraberu/taxanswer/inshi/7141.htm"
+        (tmp_path / "税法リンク集_国税庁.md").write_text(
+            f"# 税法\n| No.7140 印紙税額の一覧表（その1）第1号文書から | 印紙 | {u1} |\n"
+            f"| No.7141 印紙税額の一覧表（その2）第5号文書から | 印紙 | {u2} |\n"
+            "| No.7105 領収書 | 領収書 | https://www.nta.go.jp/x.htm |\n",
+            encoding="utf-8",
+        )
+        config = Config.load(tmp_path / "no-config.json")
+        config.base_dir = tmp_path
+        config.data["handbook"] = {"roots": ["."], "include": ["*.md"], "exclude": []}
+        assert stamp_table_urls(config) == [u1, u2]
+
+    def test_contract_summary_forbids_legal_judgement(self, tmp_path):
+        runner, client = make_runner(tmp_path, docx_data=make_docx([CONTRACT_TEXT]))
+        runner.run("この契約書の要点をまとめて", file_doc(filename="業務委託契約書.docx"), 12345)
+        system = client.kwargs["system"]
+        assert "契約期間・自動更新の有無" in system  # 契約書用の構成を指示
+        assert "法的な妥当性・有利不利・リスクの評価は行わない" in system
+        assert "tools" not in client.kwargs  # 印紙の依頼でなければ取得しない
+
+    def test_stamp_duty_request_enables_nta_fetch(self, tmp_path):
+        u1 = "https://www.nta.go.jp/taxes/shiraberu/taxanswer/inshi/7140.htm"
+        (tmp_path / "税法リンク集_国税庁.md").write_text(
+            f"# 税法\n| No.7140 印紙税額の一覧表（その1） | 印紙 | {u1} |\n", encoding="utf-8"
+        )
+        runner, client = make_runner(tmp_path, docx_data=make_docx([CONTRACT_TEXT]))
+        runner._config.base_dir = tmp_path
+        runner._config.data["handbook"] = {"roots": ["."], "include": ["*.md"], "exclude": []}
+        runner._config.data["web_fetch_enabled"] = True
+        runner.run("この契約書の印紙はいくら？", file_doc(filename="業務委託契約書.docx"), 12345)
+        assert client.kwargs["tools"][0]["allowed_domains"] == ["www.nta.go.jp"]
+        assert u1 in client.kwargs["messages"][0]["content"]  # 表のURLを渡す
+        system = client.kwargs["system"]
+        assert "号文書" in system
+        assert "丸めたり概算にしたりしない" in system
+
+    def test_stamp_request_without_link_collection_skips_fetch(self, tmp_path):
+        runner, client = make_runner(tmp_path, docx_data=make_docx([CONTRACT_TEXT]))
+        runner._config.base_dir = tmp_path
+        runner._config.data["handbook"] = {"roots": ["."], "include": ["*.md"], "exclude": []}
+        runner._config.data["web_fetch_enabled"] = True
+        runner.run("印紙はいくら？", file_doc(filename="契約書.docx"), 12345)
+        assert "tools" not in client.kwargs  # リンク集が無ければ取得しない（推測で答えさせない）
+
+
 class TestDocumentRequestDetection:
     def test_looks_like_document_request(self):
         from raizuinu.doctask import looks_like_document_request
