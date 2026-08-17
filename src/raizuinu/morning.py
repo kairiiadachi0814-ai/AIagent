@@ -61,7 +61,13 @@ class MorningNotifier:
         start, end = day_range(target)
         schedule = collect(sources, start, end)
         owner = str(cfg.get("owner_name", "")) or "担当者"
-        body = format_day(schedule, target, owner)
+        body = format_day(
+            schedule,
+            target,
+            owner,
+            mark_source=str(cfg.get("unsynced_source", "")),
+            mark_note=str(cfg.get("unsynced_note", "")),
+        )
         account_id = cfg.get("notify_account_id")
         if account_id:
             body = f"[To:{int(account_id)}]\n" + body

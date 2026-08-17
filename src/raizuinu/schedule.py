@@ -310,15 +310,32 @@ def collect(sources: Iterable[Any], start: datetime, end: datetime) -> Schedule:
 _WEEKDAYS = "月火水木金土日"
 
 
-def format_day(schedule: Schedule, target: date, owner: str) -> str:
+def _line(event: Event, mark_source: str = "", mark_note: str = "") -> str:
+    """予定1件の表示行。指定した出どころのものには印を付ける。
+
+    トヨクモ スケジューラーは外部から予定を登録できず、Googleカレンダーからの
+    取り込みも一度きりで自動更新されない。そのためGoogleにしか無い予定は
+    トヨクモの画面に出ない。黙って食い違わせないよう印で示す。
+    """
+    location = f"　＠{event.location}" if event.location else ""
+    note = mark_note if (mark_source and event.source == mark_source) else ""
+    return f"・{event.time_label()}　{event.summary}{location}{note}"
+
+
+def format_day(
+    schedule: Schedule,
+    target: date,
+    owner: str,
+    mark_source: str = "",
+    mark_note: str = "",
+) -> str:
     """その日1日の予定をChatworkの本文にする。"""
     heading = f"{target.year}年{target.month}月{target.day}日（{_WEEKDAYS[target.weekday()]}）"
     lines = [f"[info][title]{owner}さん 本日の予定　{heading}[/title]"]
     if not schedule.events:
         lines.append("登録されている予定はありません。")
     for event in schedule.events:
-        location = f"　＠{event.location}" if event.location else ""
-        lines.append(f"・{event.time_label()}　{event.summary}{location}")
+        lines.append(_line(event, mark_source, mark_note))
     if schedule.failed_sources:
         lines.append("")
         lines.append(
@@ -329,7 +346,14 @@ def format_day(schedule: Schedule, target: date, owner: str) -> str:
     return "\n".join(lines)
 
 
-def format_answer(schedule: Schedule, target: date, owner: str, span_days: int = 1) -> str:
+def format_answer(
+    schedule: Schedule,
+    target: date,
+    owner: str,
+    span_days: int = 1,
+    mark_source: str = "",
+    mark_note: str = "",
+) -> str:
     """メンバーからの照会への返答（枠で囲まず会話として返す）。"""
     if span_days > 1:
         heading = f"{target.month}月{target.day}日からの{span_days}日間"
@@ -345,8 +369,7 @@ def format_answer(schedule: Schedule, target: date, owner: str, span_days: int =
         if span_days > 1 and day != current:
             current = day
             lines.append(f"■{day.month}月{day.day}日（{_WEEKDAYS[day.weekday()]}）")
-        location = f"　＠{event.location}" if event.location else ""
-        lines.append(f"・{event.time_label()}　{event.summary}{location}")
+        lines.append(_line(event, mark_source, mark_note))
     if schedule.failed_sources:
         lines.append(
             "※" + "、".join(schedule.failed_sources) + "を読み取れなかったため、"

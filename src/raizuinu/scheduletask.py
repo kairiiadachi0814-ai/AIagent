@@ -171,7 +171,15 @@ class ScheduleRunner:
             "failed_sources": schedule.failed_sources,
         }
         owner = str(cfg.get("owner_name", "")) or "担当者"
-        return format_answer(schedule, target, owner, span), meta, {}
+        return (
+            format_answer(
+                schedule, target, owner, span,
+                mark_source=str(cfg.get("unsynced_source", "")),
+                mark_note=str(cfg.get("unsynced_note", "")),
+            ),
+            meta,
+            {},
+        )
 
     def register(self, question: str) -> tuple[str, dict[str, Any], dict[str, int]]:
         """予定を登録する（Googleカレンダーへ書き、内容を復唱する）。"""
@@ -341,6 +349,10 @@ class ScheduleRunner:
         lines.append("")
         # 「登録した」という事実はモデルの文面任せにせず、こちらで必ず書く
         lines.append("上記で登録しました。違っていたら「さっきの予定を取り消して」とお知らせください。")
+        # 登録先はGoogleカレンダー。トヨクモへは自動反映されないため黙らない
+        note = str(self._config.schedule.get("register_note", "")).strip()
+        if note:
+            lines.append(note)
         return "\n".join(lines)
 
 

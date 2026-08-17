@@ -469,3 +469,49 @@ class TestRegisteredReplyTense:
         reply, _, _ = runner.register("来週水曜15時から面談を入れて")
         # 「登録した」という事実は文面任せにしない
         assert "上記で登録しました。" in reply
+
+
+class TestUnsyncedMarking:
+    """トヨクモに反映されない予定を黙って混ぜない。"""
+
+    def _schedule(self):
+        toyokumo = ev("朝礼", 9, source="トヨクモ スケジューラー")
+        google = ev("南都銀行 訪問", 14, location="本店営業部", source="Googleカレンダー")
+        return Schedule(events=[toyokumo, google])
+
+    def test_morning_marks_google_only_events(self):
+        body = format_day(
+            self._schedule(), date(2026, 8, 18), "足立",
+            mark_source="Googleカレンダー", mark_note="（トヨクモ未反映）",
+        )
+        assert "・09:00〜10:00　朝礼" in body
+        assert "（トヨクモ未反映）" in body
+        # トヨクモ由来には印を付けない
+        assert "朝礼（トヨクモ未反映）" not in body
+
+    def test_answer_marks_too(self):
+        text = format_answer(
+            self._schedule(), date(2026, 8, 18), "足立",
+            mark_source="Googleカレンダー", mark_note="（トヨクモ未反映）",
+        )
+        assert "南都銀行 訪問　＠本店営業部（トヨクモ未反映）" in text
+
+    def test_no_marking_when_not_configured(self):
+        body = format_day(self._schedule(), date(2026, 8, 18), "足立")
+        assert "（トヨクモ未反映）" not in body
+
+    def test_register_reply_warns_about_toyokumo(self, tmp_path, monkeypatch):
+        writer = FakeWriter()
+        monkeypatch.setattr("raizuinu.scheduletask.build_writer", lambda cfg: writer)
+        client = fake_client(
+            {
+                "events": [{"summary": "面談", "date": "2026-08-26", "start_time": "15:00",
+                            "end_time": "16:30", "all_day": False, "location": ""}],
+                "missing": [], "opening": "面談ですね。登録しました。",
+            }
+        )
+        config = make_config(tmp_path)
+        config.data["schedule"]["register_note"] = "※トヨクモへは自動反映されません。"
+        runner = ScheduleRunner(config, client=client)
+        reply, _, _ = runner.register("来週水曜15時から面談を入れて")
+        assert "※トヨクモへは自動反映されません。" in reply

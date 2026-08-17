@@ -94,6 +94,11 @@ _DEFAULTS: dict[str, Any] = {
         "notify_account_id": None,
         "notify_weekdays_only": True,
         "ics_labels": ["トヨクモ スケジューラー"],
+        # トヨクモは外部から予定を登録できず、取り込みも一度きりで自動更新されない。
+        # Googleにしか無い予定はトヨクモの画面に出ないため、印で示す
+        "unsynced_source": "Googleカレンダー",
+        "unsynced_note": "（トヨクモ未反映）",
+        "register_note": "",
     },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {
