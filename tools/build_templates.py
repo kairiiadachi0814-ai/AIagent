@@ -16,6 +16,7 @@ Boxにある3つの送付状ファイルは、過去に送った分が1ファイ
 from __future__ import annotations
 
 import copy
+import io
 import re
 import sys
 import zipfile
@@ -231,18 +232,125 @@ FAX_CELLS = {
 }
 
 
+def strip_to_general_sheet(data: bytes, keep: str = "汎用") -> bytes:
+    """FAX送付状ひな形から「汎用」以外のシートを取り除く。
+
+    原本には取引先別のシートが15枚あり、他社の担当者名・FAX番号・過去の
+    送信本文が入っている。そのまま同梱すると、1社あてに作った下書きの中に
+    他14社の連絡先が付いてくるため、白紙の「汎用」1枚だけにする。
+    連絡先は fax_destinations.json に切り出してあるので機能は落ちない。
+
+    openpyxlで開き直すとチェックボックス・プルダウン・印刷設定が消えるため、
+    zipの中身を直接編集する。
+    """
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        parts = {name: z.read(name) for name in z.namelist()}
+
+    workbook = parts["xl/workbook.xml"].decode("utf-8")
+    rels = parts["xl/_rels/workbook.xml.rels"].decode("utf-8")
+    targets = {
+        m.group(1): m.group(2)
+        for m in re.finditer(r'Id="(rId\d+)"[^>]*Target="([^"]+)"', rels)
+    }
+    sheets = re.findall(
+        r'<sheet name="([^"]+)" sheetId="(\d+)"[^>]*r:id="(rId\d+)"[^>]*/>', workbook
+    )
+    if not any(name == keep for name, _, _ in sheets):
+        raise SystemExit(f"{FAX_SRC}: 「{keep}」シートが見つかりません")
+
+    def part_path(target: str) -> str:
+        target = target.lstrip("/")
+        return target if target.startswith("xl/") else "xl/" + target
+
+    def related(sheet_path: str) -> list[str]:
+        """シートが参照している部品（図形・フォームコントロール・印刷設定）。"""
+        rels_path = sheet_path.replace("worksheets/", "worksheets/_rels/") + ".rels"
+        if rels_path not in parts:
+            return []
+        found = [rels_path]
+        for target in re.findall(r'Target="([^"]+)"', parts[rels_path].decode("utf-8")):
+            found.append(part_path(target.replace("../", "")))
+        return found
+
+    # 1) 残すシートの共有文字列をインライン文字列へ移し、共有文字列表を空にする
+    #    （表を残すと、シートを消しても他社名がファイル内に残ってしまう）
+    keep_path = part_path(targets[next(r for n, _, r in sheets if n == keep)])
+    shared = re.findall(
+        r"<si>(.*?)</si>", parts["xl/sharedStrings.xml"].decode("utf-8"), re.S
+    )
+    sheet_xml = parts[keep_path].decode("utf-8")
+
+    def inline(match: re.Match[str]) -> str:
+        attrs = match.group("attrs").replace(' t="s"', "")
+        # ふりがな（<rPh>）は本文ではない。残すと「FAX送信状ソウシンジョウ」になる
+        si = re.sub(r"<rPh\b.*?</rPh>", "", shared[int(match.group("idx"))], flags=re.S)
+        text = "".join(re.findall(r"<t[^>]*>(.*?)</t>", si, re.S))
+        return f'<c{attrs} t="inlineStr"><is><t xml:space="preserve">{text}</t></is></c>'
+
+    sheet_xml = re.sub(
+        r'<c(?P<attrs>[^>]*\st="s"[^>]*)><v>(?P<idx>\d+)</v></c>', inline, sheet_xml
+    )
+    # 発信者の担当者名（O12）は依頼者ごとに変わるので、ひな形からは外す
+    sheet_xml = re.sub(
+        r'<c r="O12"([^>]*?)(?:/>|>.*?</c>)', r'<c r="O12"\1/>', sheet_xml, count=1
+    )
+    parts[keep_path] = sheet_xml.encode("utf-8")
+    parts["xl/sharedStrings.xml"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
+        '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'count="0" uniqueCount="0"/>'
+    ).encode("utf-8")
+
+    # 2) 残すシート以外と、それが抱えている部品を消す
+    removed: set[str] = set()
+    for name, _sheet_id, rid in sheets:
+        if name == keep:
+            continue
+        path = part_path(targets[rid])
+        removed.update([path, *related(path)])
+        workbook = re.sub(rf'<sheet name="{re.escape(name)}"[^>]*/>', "", workbook)
+        rels = re.sub(rf'<Relationship Id="{rid}"[^>]*/>', "", rels)
+    keep_sheet_id = next(sid for n, sid, _ in sheets if n == keep)
+    chain = parts.get("xl/calcChain.xml", b"").decode("utf-8")
+    chain = re.sub(r'<c r="[^"]+" i="(?!' + keep_sheet_id + r'")\d+"[^>]*/>', "", chain)
+    parts["xl/calcChain.xml"] = chain.encode("utf-8")
+
+    for path in removed:
+        parts.pop(path, None)
+    content_types = parts["[Content_Types].xml"].decode("utf-8")
+    for path in removed:
+        content_types = re.sub(
+            rf'<Override PartName="/{re.escape(path)}"[^>]*/>', "", content_types
+        )
+    parts["[Content_Types].xml"] = content_types.encode("utf-8")
+
+    # 3) 1枚だけになるので、開いたときに必ずそのシートが選ばれるようにする
+    workbook = re.sub(
+        r'<workbookView\b[^>]*?/>',
+        '<workbookView xWindow="-120" yWindow="-120" windowWidth="29040" '
+        'windowHeight="15720" firstSheet="0" activeTab="0"/>',
+        workbook,
+        count=1,
+    )
+    parts["xl/workbook.xml"] = workbook.encode("utf-8")
+    parts["xl/_rels/workbook.xml.rels"] = rels.encode("utf-8")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, blob in parts.items():
+            z.writestr(name, blob)
+    return buf.getvalue()
+
+
 def build_fax() -> None:
     import json
-    import shutil
 
     from openpyxl import load_workbook
 
     src = BOX / FAX_SRC
     out = OUT_DIR / FAX_SRC
     OUT_DIR.mkdir(exist_ok=True)
-    # 原本をそのまま置く。フォームコントロール・印刷設定を壊さないため、
-    # 差し込みは実行時にシートXMLを直接書き換える（templatefill.render_xlsx）
-    shutil.copyfile(src, out)
+    out.write_bytes(strip_to_general_sheet(src.read_bytes()))
 
     wb = load_workbook(src)
     if "汎用" not in wb.sheetnames:
@@ -273,7 +381,11 @@ def build_fax() -> None:
     path.write_text(
         json.dumps(directory, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
-    print(f"{out.name}: 原本をコピー（{out.stat().st_size:,}バイト）")
+    leaked = [e["company"] for e in directory if e["company"] in out.read_bytes().decode("latin-1", "ignore")]
+    wb_out = load_workbook(out)
+    print(f"{out.name}: シート{wb_out.sheetnames} / {out.stat().st_size:,}バイト")
+    if leaked or wb_out.sheetnames != ["汎用"]:
+        raise SystemExit(f"{FAX_SRC}: 取引先データが残っています: {leaked or wb_out.sheetnames}")
     print(f"{path.name}: 宛先{len(directory)}件")
     for entry in directory:
         print(f"    {entry['company']} / {entry.get('person','-')} / FAX {entry.get('fax','-')}")

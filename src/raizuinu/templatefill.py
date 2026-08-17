@@ -131,21 +131,26 @@ def _set_cell(sheet_xml: str, ref: str, value: Any) -> str:
     return sheet_xml[: match.start()] + cell + sheet_xml[match.end() :]
 
 
-def sheet_path_by_name(parts: dict[str, bytes], name: str) -> tuple[str, int]:
-    """シート名から (xl/worksheets/sheetN.xml, 0始まりのシート位置) を返す。"""
+def sheet_path_by_name(parts: dict[str, bytes], name: str) -> tuple[str, int, str]:
+    """シート名から (xl/worksheets/sheetN.xml, 0始まりの位置, sheetId) を返す。
+
+    sheetIdは計算チェーン（calcChain.xml）のi属性が指す値で、位置とは別物。
+    """
     workbook = parts["xl/workbook.xml"].decode("utf-8")
     rels = parts["xl/_rels/workbook.xml.rels"].decode("utf-8")
     targets = {
         m.group(1): m.group(2)
         for m in re.finditer(r'Id="(rId\d+)"[^>]*Target="([^"]+)"', rels)
     }
-    sheets = re.findall(r'<sheet name="([^"]+)"[^>]*r:id="(rId\d+)"', workbook)
-    for index, (sheet_name, rid) in enumerate(sheets):
+    sheets = re.findall(
+        r'<sheet name="([^"]+)" sheetId="(\d+)"[^>]*r:id="(rId\d+)"', workbook
+    )
+    for index, (sheet_name, sheet_id, rid) in enumerate(sheets):
         if sheet_name == name:
             target = targets[rid].lstrip("/")
             if not target.startswith("xl/"):
                 target = "xl/" + target
-            return target, index
+            return target, index, sheet_id
     raise TemplateError(f"ひな形にシート「{name}」が見つかりませんでした")
 
 
@@ -154,7 +159,7 @@ def render_xlsx(template: bytes, sheet_name: str, cells: dict[str, Any]) -> byte
     with zipfile.ZipFile(io.BytesIO(template)) as z:
         parts = {name: z.read(name) for name in z.namelist()}
 
-    path, index = sheet_path_by_name(parts, sheet_name)
+    path, index, sheet_id = sheet_path_by_name(parts, sheet_name)
     sheet_xml = parts[path].decode("utf-8")
     overwritten_formulas = []
     for ref, value in cells.items():
@@ -167,13 +172,27 @@ def render_xlsx(template: bytes, sheet_name: str, cells: dict[str, Any]) -> byte
     parts[path] = sheet_xml.encode("utf-8")
 
     # 数式を消したセルが計算チェーンに残ると、Excelが壊れたファイルとして扱う。
-    # ファイルごと消すと[Content_Types].xml等の参照が宙に浮くため、該当行だけ抜く
+    # i属性はシートID。同じ座標が他シートにもあるため、必ずIDまで見て抜く
     chain = parts.get("xl/calcChain.xml")
     if chain and overwritten_formulas:
         text = chain.decode("utf-8")
         for ref in overwritten_formulas:
-            text = re.sub(rf'<c r="{ref}"[^>]*/>', "", text)
-        parts["xl/calcChain.xml"] = text.encode("utf-8")
+            text = re.sub(rf'<c r="{ref}" i="{sheet_id}"[^>]*/>', "", text)
+        if not re.search(r"<c\b", text):
+            # 中身が空の<calcChain>は不正。参照ごと外す
+            parts.pop("xl/calcChain.xml", None)
+            parts["[Content_Types].xml"] = re.sub(
+                r'<Override PartName="/xl/calcChain\.xml"[^>]*/>',
+                "",
+                parts["[Content_Types].xml"].decode("utf-8"),
+            ).encode("utf-8")
+            parts["xl/_rels/workbook.xml.rels"] = re.sub(
+                r'<Relationship[^>]*Target="calcChain\.xml"[^>]*/>',
+                "",
+                parts["xl/_rels/workbook.xml.rels"].decode("utf-8"),
+            ).encode("utf-8")
+        else:
+            parts["xl/calcChain.xml"] = text.encode("utf-8")
     parts["xl/workbook.xml"] = re.sub(
         r'(<workbookView\b[^>]*?)\sactiveTab="\d+"',
         rf'\1 activeTab="{index}"',

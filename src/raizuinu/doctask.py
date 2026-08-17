@@ -78,7 +78,12 @@ _TASK_KEYWORDS = (
     "アクション",
 )
 # 手順を尋ねる形の質問はQ&A（過去の添付に遡らない）
-_HOWTO_MARKERS = ("書き方", "方法", "やり方", "とは", "って何", "作り方")
+# 手順を尋ねる質問の目印。「とは」を素の部分一致にすると「ことは」「あとは」に
+# 当たって依頼を取りこぼすため、語形を限定した正規表現で見る
+_HOWTO_RE = re.compile(
+    r"書き方|作り方|やり方|方法(を|は|が|について)|って何|"
+    r"(^|[。、\s])(何|なん|どういう意味)?とは"
+)
 # 文書そのものを指す名詞。「経費精算の資料をまとめて教えて」のような
 # 通常のQ&Aを拾わないよう、下の参照語との同時出現を必須にする
 _DOC_NOUN_RE = re.compile(
@@ -200,7 +205,7 @@ def _has_pasted_material(question: str) -> bool:
 
 def _is_doc_task_phrasing(question: str) -> bool:
     """文書に対する作業依頼の言い回しか（作業語＋文書を指す名詞、手順質問でない）。"""
-    if any(m in question for m in _HOWTO_MARKERS):
+    if _HOWTO_RE.search(question):
         return False
     if _has_pasted_material(question):
         return False  # 貼り付け素材つきの依頼はtaskフローで処理する

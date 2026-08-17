@@ -64,16 +64,19 @@ TEMPLATES: dict[str, dict[str, Any]] = {
     },
 }
 
-# FAX送付状「汎用」シートの差し込み先
+# FAX送付状「汎用」シートの差し込み先。敬称は会社名と別の欄（H10）にある
 FAX_CELLS = {
     "to_company": "D10",
+    "honorific": "H10",
     "to_person": "D12",
     "to_fax": "D14",
     "to_tel": "D16",
     "subject": "E19",
     "pages": "N6",
+    "sender_staff": "O12",
 }
 FAX_BODY_ROWS = ("B23", "B24", "B25", "B26", "B27")
+_HONORIFIC_RE = re.compile(r"[\s　]*(御中|様|殿)$")
 
 # 契約書ひな形は生成しない（締結前のリーガルチェックが必須のため案内に倒す）
 CONTRACT_GUIDANCE = (
@@ -83,30 +86,48 @@ CONTRACT_GUIDANCE = (
     "作成後は、締結前にLegalForceでのリーガルチェックをお願いします。"
 )
 
+# 「作る」を指す語だけを見る。「ください」「お願いします」は丁寧語であって
+# 作成の指示ではない（それらを含めると送付状に触れた質問がすべて吸われる）
 _BUILD_VERB_RE = re.compile(
-    r"(作成|作って|作りたい|つくって|つくりたい|用意し|準備し|起こして|出して|"
-    r"仕上げて|お願いし|ください|下さい|ほしい|欲しい)"
+    r"(作成|作って|作り|作れ|つくって|つくり|用意し|準備し|起こして|仕上げて|"
+    r"発行し|出力し|埋めて)"
 )
-_DOC_NAME_RE = re.compile(r"(送付状|送信状|添え状|添付状|そえじょう|そうふじょう)")
-# 「書き方」「どこにある」等はQ&Aで答える（作成依頼ではない）
+_DOC_NAME_RE = re.compile(
+    r"(送付状|送信状|送り状|添え状|添付状|送付票|カバーレター|そえじょう|そうふじょう)"
+)
+# 「書き方」「どこにある」等はQ&Aで答える（作成依頼ではない）。
+# 「手順」「ルール」のような、作成依頼の文中でも自然に出る語は入れない
 _EXCLUDE_RE = re.compile(
-    r"(書き方|作り方|やり方|手順|どこにあ|どこです|どこ[？?]|場所は|保管|"
-    r"とは何|の意味|注意点|ルール)"
+    r"(書き方|作り方|やり方|どこにあ|どこです|どこ[？?]|場所は|保管|"
+    r"とは何|の意味|どんな時|どういう時|違いは|必要ですか|誰が作)"
 )
+# 既にある文書を読ませる依頼（要約・議事録化など）。添付があるならそちらが優先
+_READ_TASK_RE = re.compile(r"(要約|議事録|まとめて|整理して|抽出|読んで|内容を確認|チェックして)")
+_ATTACHMENT_RE = re.compile(r"\[download:\d+\]")
+# 「送付状お願いします」のような依頼語。ただし疑問形なら質問として扱う
+_REQUEST_RE = re.compile(r"(お願い|ください|下さい|ほしい|欲しい|頼み)")
+_QUESTION_RE = re.compile(r"(ですか|でしょうか|ますか|ますでしょ|[？?]\s*$)")
 _CONTRACT_RE = re.compile(r"(契約書|覚書|念書|誓約書|NDA|秘密保持)")
 
 
-def looks_like_document_build_request(question: str) -> bool:
+def looks_like_document_build_request(question: str, body: str = "") -> bool:
     """「送付状を作って」のような書類作成依頼かどうか。
 
-    書類名（送付状・FAX送付状 等）と作成の語が両方あり、
+    書類名（送付状・FAX送付状 等）と「作る」を指す語が両方あり、
     「書き方を教えて」のような質問でないときだけ真。
+    添付ファイルつきで「要約して」のように読み取りを頼まれた場合は、
+    こちらではなく文書タスク（議事録・要約）で扱う。
     """
     if not _DOC_NAME_RE.search(question):
         return False
     if _EXCLUDE_RE.search(question):
         return False
-    return bool(_BUILD_VERB_RE.search(question))
+    if _READ_TASK_RE.search(question) and _ATTACHMENT_RE.search(body or question):
+        return False
+    if _BUILD_VERB_RE.search(question):
+        return True
+    # 「送付状お願いします」は作成依頼。「送付状って要りますか？」は質問
+    return bool(_REQUEST_RE.search(question)) and not _QUESTION_RE.search(question)
 
 
 def wants_contract_template(question: str) -> bool:
@@ -117,7 +138,15 @@ def wants_contract_template(question: str) -> bool:
 
 
 class DocumentBuildError(Exception):
-    """書類の作成に失敗した（利用者向けの文面をそのまま持つ）。"""
+    """書類の作成に失敗した（利用者向けの文面をそのまま持つ）。
+
+    失敗しても、すでに消費したトークンはコストに計上する必要があるため
+    usage を持ち回る。
+    """
+
+    def __init__(self, message: str, usage: dict[str, int] | None = None) -> None:
+        super().__init__(message)
+        self.usage = usage or {}
 
 
 SYSTEM_PROMPT = """あなたは株式会社ライズクリエイション経理財務部のアシスタント「{agent_name}」です。
@@ -134,7 +163,8 @@ SYSTEM_PROMPT = """あなたは株式会社ライズクリエイション経理�
 宛先の書き方（to_lines）は1行ずつ配列にする。例:
   ["株式会社大塚商会", "大阪南CADグループ", "販売２課　濵野 康一　様"]
 
-送付書類（items）は依頼文にある物だけを並べる。部数の指定がなければ qty は "1部" にする。
+送付書類（items）は依頼文にある物だけを並べる。部数の指定がない物は qty を空文字にする
+（こちらで「1部」と仮置きし、その旨を利用者に伝える）。
 """
 
 _FIELDS_SCHEMA = {
@@ -218,6 +248,7 @@ class DocBuildRunner:
             return CONTRACT_GUIDANCE, meta, {}
 
         fields, usage = self._extract(instruction, context, requester_name)
+        _normalize(fields)  # 空白だけの宛先・品名を捨ててから不足判定にかける
         meta["fields"] = {k: v for k, v in fields.items() if k != "opening"}
 
         template_id = str(fields.get("template_id") or "")
@@ -244,7 +275,8 @@ class DocBuildRunner:
         except TemplateError as exc:
             raise DocumentBuildError(
                 "すみません、ひな形への差し込みでつまずいてしまいました。"
-                f"（{exc}）お手数ですが、もう一度ご依頼いただけますか。"
+                f"（{exc}）お手数ですが、もう一度ご依頼いただけますか。",
+                usage,
             ) from exc
         meta["artifact"] = (filename, data)
         meta["output_filename"] = filename
@@ -314,7 +346,8 @@ class DocBuildRunner:
         except (json.JSONDecodeError, TypeError) as exc:
             raise DocumentBuildError(
                 "すみません、依頼の内容をうまく読み取れませんでした。"
-                "宛先と送付する書類を書き添えて、もう一度お願いできますか。"
+                "宛先と送付する書類を書き添えて、もう一度お願いできますか。",
+                usage,
             ) from exc
         if not fields.get("date"):
             fields["date"] = today
@@ -376,35 +409,49 @@ class DocBuildRunner:
                 },
             )
         else:
+            # 「汎用」シートは会社名と敬称が別の欄。敬称込みで会社名を入れると
+            # 「○○ 御中 御中」になるため、末尾の敬称を切り離す
+            company, honorific = _split_honorific(to_lines[0] if to_lines else "")
             cells: dict[str, Any] = {
-                FAX_CELLS["to_company"]: to_lines[0] if to_lines else "",
+                FAX_CELLS["to_company"]: company,
+                FAX_CELLS["honorific"]: honorific,
                 FAX_CELLS["to_person"]: "　".join(to_lines[1:]),
                 FAX_CELLS["to_fax"]: str(fields.get("to_fax") or ""),
                 FAX_CELLS["to_tel"]: str(fields.get("to_tel") or ""),
                 FAX_CELLS["subject"]: str(fields.get("subject") or ""),
+                FAX_CELLS["sender_staff"]: str(fields.get("staff") or ""),
             }
             pages = fields.get("pages")
             if isinstance(pages, int) and pages > 0:
                 cells[FAX_CELLS["pages"]] = pages
             for ref, line in zip(FAX_BODY_ROWS, fields.get("body_lines") or []):
                 cells[ref] = str(line)
-            now = datetime.now(JST)
-            if date and date != f"{now.year}年{now.month}月{now.day}日":
+            if date and _ymd(date) != datetime.now(JST).strftime("%Y%m%d"):
                 # 今日以外の日付を指定されたときだけ =TODAY() を上書きする
+                # （「2026/8/17」のような表記ゆれで無用に潰さないよう年月日で比べる）
                 cells["E6"] = date
             out = render_xlsx(data, template["sheet"], cells)
 
         suffix = ".docx" if template["kind"] == "docx" else ".xlsx"
         stem = template_id if template["kind"] == "xlsx" else template_id.split("_")[0]
-        name = f"{stem}_{_safe_name(to_lines[0] if to_lines else '宛先未定')}_{_ymd(date)}{suffix}"
+        label = _split_honorific(to_lines[0])[0] if to_lines else "宛先未定"
+        name = f"{stem}_{_safe_name(label)}_{_ymd(date)}{suffix}"
         return name, out
 
     def _reply(self, fields: dict[str, Any], template: dict[str, Any]) -> str:
         opening = str(fields.get("opening") or "").strip()
         if not opening:
             opening = "承知しました。下書きを作ってお送りしますね。"
+        assumed = [
+            item["name"] for item in fields.get("items") or [] if not item.get("qty")
+        ]
+        note = ""
+        if assumed:
+            # 推測で埋めた箇所は黙って通さず、必ず伝える
+            note = "部数の指定がなかった「" + "」「".join(assumed) + "」は1部としています。\n"
         return (
             f"{opening}\n\n"
+            f"{note}"
             f"ひな形: {template['label']}\n"
             f"出典: {template['box_url']}\n"
             "※下書きです。日付・宛名・部数をご確認のうえ、印刷や送付はお手元でお願いします。"
@@ -435,6 +482,35 @@ class DocBuildRunner:
                 f"・{m}" for m in others
             )
         return text
+
+
+def _split_honorific(line: str) -> tuple[str, str]:
+    """「株式会社○○ 御中」→ ("株式会社○○", "御中")。敬称が無ければ既定の「御中」。"""
+    text = str(line).strip()
+    match = _HONORIFIC_RE.search(text)
+    if match:
+        return text[: match.start()].strip(), match.group(1)
+    return text, "御中"
+
+
+def _normalize(fields: dict[str, Any]) -> None:
+    """空白だけの要素を落とす。
+
+    不足判定（_missing）と差し込み（_render）で見え方が違うと、
+    「宛先あり」と判定したのに宛先の無い書類ができてしまう。
+    """
+    fields["to_lines"] = [
+        str(line).strip() for line in fields.get("to_lines") or [] if str(line).strip()
+    ]
+    items = []
+    for item in fields.get("items") or []:
+        name = str((item or {}).get("name", "")).strip()
+        if name:
+            items.append({"name": name, "qty": str((item or {}).get("qty", "")).strip()})
+    fields["items"] = items
+    for key in ("subject", "staff", "to_fax", "to_tel", "date"):
+        if key in fields:
+            fields[key] = str(fields[key] or "").strip()
 
 
 def _safe_name(text: str) -> str:

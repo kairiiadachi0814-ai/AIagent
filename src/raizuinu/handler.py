@@ -249,7 +249,8 @@ class RaizuinuHandler:
         if self._doc_build is not None:
             from .docbuild import looks_like_document_build_request
 
-            build_request = looks_like_document_build_request(question)
+            # 本文も渡す。添付つきで「要約して」と言われた依頼は文書タスクへ回す
+            build_request = looks_like_document_build_request(question, event.body)
             if build_request:
                 self._process_doc_build(event, question, context, messages)
                 return
@@ -402,55 +403,67 @@ class RaizuinuHandler:
                 requester_name=_display_name(messages, event.account_id),
             )
         except DocumentBuildError as exc:
+            # 失敗しても消費済みトークンは計上する（月次上限の根拠を欠かさない）
+            self._add_usage_safely(exc.usage)
             self._reply_and_audit(event, question, str(exc), "doc_build_failed")
             return
 
-        status = None
-        try:
-            if usage:
-                status = self._cost.add_usage(usage)
-        except Exception:
-            print("[warn] コスト計上に失敗: " + traceback.format_exc(), flush=True)
+        status = self._add_usage_safely(usage)
 
         body = _reply_tag(event) + sanitize_for_chatwork(reply_text)
         artifact = meta.pop("artifact", None)
-        uploaded = ""
-        if artifact and self._config.doc_build.get("attach_to_chatwork", True):
-            filename, data = artifact
-            uploaded = self._chatwork.upload_file(
-                event.room_id, sanitize_for_chatwork(filename), data, message=body
-            )
-        else:
-            self._chatwork.send_message(event.room_id, body)
+        record = {
+            "type": "doc_build" if artifact else "doc_build_not_ready",
+            "room_id": event.room_id,
+            "account_id": event.account_id,
+            "message_id": event.message_id,
+            "question": question,
+            "template": meta.get("template"),
+            "output_filename": meta.get("output_filename"),
+            "uploaded_file_id": "",
+            "detail": meta,
+            "answer": reply_text[:2000],
+            "model": self._config.model,
+            "usage": usage,
+            "cost_jpy": round(self._cost.estimate_cost_jpy(usage), 3) if usage else 0.0,
+            "monthly_total_jpy": round(status.total_jpy, 2) if status else None,
+        }
+        try:
+            if artifact and self._config.doc_build.get("attach_to_chatwork", True):
+                filename, data = artifact
+                record["uploaded_file_id"] = self._chatwork.upload_file(
+                    event.room_id, sanitize_for_chatwork(filename), data, message=body
+                )
+            else:
+                self._chatwork.send_message(event.room_id, body)
+        except Exception:
+            # 送信に失敗しても「何を作ろうとしたか」は監査へ残す（NFR-03）
+            record["type"] = "doc_build_send_failed"
+            record["error"] = traceback.format_exc().splitlines()[-1]
+            self._audit_safely(record)
+            raise
 
         # 返信成功後の後処理での例外は失敗メッセージを送らない（二重送信防止）
         try:
             if status is not None:
                 self._maybe_alert(status)
-            self._audit_safely(
-                {
-                    "type": "doc_build" if artifact else "doc_build_not_ready",
-                    "room_id": event.room_id,
-                    "account_id": event.account_id,
-                    "message_id": event.message_id,
-                    "question": question,
-                    "template": meta.get("template"),
-                    "output_filename": meta.get("output_filename"),
-                    "uploaded_file_id": uploaded,
-                    "detail": meta,
-                    "answer": reply_text[:2000],
-                    "model": self._config.model,
-                    "usage": usage,
-                    "cost_jpy": round(self._cost.estimate_cost_jpy(usage), 3) if usage else 0.0,
-                    "monthly_total_jpy": round(status.total_jpy, 2) if status else None,
-                }
-            )
+            self._audit_safely(record)
         except Exception:
             print(
                 "[warn] 返信後の通知・監査処理に失敗（返信自体は成功）: "
                 + traceback.format_exc(),
                 flush=True,
             )
+
+    def _add_usage_safely(self, usage: dict) -> object | None:
+        """コストを計上する。計上の失敗で返信自体を止めない。"""
+        if not usage:
+            return None
+        try:
+            return self._cost.add_usage(usage)
+        except Exception:
+            print("[warn] コスト計上に失敗: " + traceback.format_exc(), flush=True)
+            return None
 
     def _process_doc_task(self, event: MentionEvent, question: str, document: dict) -> None:
         """文書つき依頼を処理して返信する（ハンドブック・出典検証は使わない）。"""

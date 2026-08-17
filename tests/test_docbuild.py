@@ -259,9 +259,10 @@ class TestTemplateFill:
         out = render_xlsx(data, "汎用", {"E6": "2026年9月1日"})
         z = zipfile.ZipFile(io.BytesIO(out))
         # 消した数式が計算チェーンに残るとExcelが壊れたファイルとして扱う。
-        # ファイルごと消すと[Content_Types].xml等の参照が宙に浮くため該当行だけ抜く
-        assert '<c r="E6"' not in z.read("xl/calcChain.xml").decode()
-        assert "xl/calcChain.xml" in z.namelist()
+        # 中身が空になる場合は、参照ごと外さないと今度は空タグが不正になる
+        assert "xl/calcChain.xml" not in z.namelist()
+        assert "calcChain" not in z.read("[Content_Types].xml").decode()
+        assert "calcChain" not in z.read("xl/_rels/workbook.xml.rels").decode()
 
 
 class TestMultipart:
@@ -403,3 +404,137 @@ class TestHandlerIntegration:
         handler.handle_webhook(raw, signature)
         assert not chatwork.uploads and chatwork.sent  # 成果物が無いときは本文だけ
         assert audit.records[-1]["type"] == "doc_build_not_ready"
+
+
+class TestReviewRegressions:
+    """レビューで再現した欠陥。同じ壊れ方を繰り返さないための固定。"""
+
+    def test_honorific_is_not_doubled_on_fax(self, tmp_path):
+        # 「汎用」シートは会社名(D10)と敬称(H10)が別欄。敬称込みで入れると二重になる
+        client = fake_client(
+            {
+                "template_id": "FAX送付状", "date": "", "to_lines": ["株式会社大塚商会 御中"],
+                "staff": "坂田", "items": [], "subject": "請求書送付の件",
+                "missing": [], "opening": "",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        _, meta, _ = runner.run("大塚商会あてのFAX送付状を作って")
+        openpyxl = pytest.importorskip("openpyxl")
+        ws = openpyxl.load_workbook(io.BytesIO(meta["artifact"][1]))["汎用"]
+        assert ws["D10"].value == "株式会社大塚商会"
+        assert ws["H10"].value == "御中"
+        assert "御中" not in meta["artifact"][0]  # ファイル名にも混ぜない
+
+    def test_person_recipient_gets_sama(self, tmp_path):
+        client = fake_client(
+            {
+                "template_id": "FAX送付状", "date": "", "to_lines": ["濵野 康一 様"],
+                "staff": "坂田", "items": [], "subject": "件名", "missing": [], "opening": "",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        _, meta, _ = runner.run("濵野様あてのFAX送付状を作って")
+        openpyxl = pytest.importorskip("openpyxl")
+        ws = openpyxl.load_workbook(io.BytesIO(meta["artifact"][1]))["汎用"]
+        assert (ws["D10"].value, ws["H10"].value) == ("濵野 康一", "様")
+
+    def test_sender_staff_is_written_not_left_as_template_default(self, tmp_path):
+        client = fake_client(
+            {
+                "template_id": "FAX送付状", "date": "", "to_lines": ["株式会社A"],
+                "staff": "山田", "items": [], "subject": "件名", "missing": [], "opening": "",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        _, meta, _ = runner.run("株式会社AあてのFAX送付状を作って")
+        openpyxl = pytest.importorskip("openpyxl")
+        ws = openpyxl.load_workbook(io.BytesIO(meta["artifact"][1]))["汎用"]
+        assert ws["O12"].value == "山田"  # 依頼者名が入る（誰が作っても固定名にしない）
+
+    def test_template_carries_no_other_companies(self):
+        # 1社あての下書きに他社の連絡先が付いてこないこと
+        import json
+        import pathlib
+
+        raw = (pathlib.Path(REPO_TEMPLATES) / "FAX送付状.xlsx").read_bytes()
+        blob = raw.decode("latin-1", "ignore")
+        directory = json.loads(
+            (pathlib.Path(REPO_TEMPLATES) / "fax_destinations.json").read_text(encoding="utf-8")
+        )
+        openpyxl = pytest.importorskip("openpyxl")
+        assert openpyxl.load_workbook(io.BytesIO(raw)).sheetnames == ["汎用"]
+        for entry in directory:
+            for key in ("company", "person", "fax"):
+                if entry.get(key):
+                    assert entry[key] not in blob
+
+    def test_blank_recipient_lines_are_asked_for(self, tmp_path):
+        # 空白だけの宛先を「あり」と数えると、宛先のない書類が出来てしまう
+        client = fake_client(
+            {
+                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "to_lines": ["", "  ", "　"], "staff": "足立",
+                "items": [{"name": "", "qty": ""}], "missing": [], "opening": "",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        reply, meta, _ = runner.run("送付状を作って")
+        assert "artifact" not in meta
+        assert "宛先" in reply and "送付する書類" in reply
+
+    def test_assumed_quantity_is_stated_in_the_reply(self, tmp_path):
+        client = fake_client(
+            {
+                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "to_lines": ["株式会社A"], "staff": "足立",
+                "items": [{"name": "請求書", "qty": ""}, {"name": "契約書", "qty": "2部"}],
+                "missing": [], "opening": "承知しました。",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        reply, meta, _ = runner.run("株式会社Aあての送付状を作って")
+        assert "「請求書」は1部としています" in reply  # 仮置きを黙って通さない
+        assert "契約書" not in reply.split("ひな形:")[0].replace("承知しました。", "")
+
+    def test_usage_is_kept_when_rendering_fails(self, tmp_path):
+        from raizuinu.docbuild import DocumentBuildError
+
+        client = fake_client(
+            {
+                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "to_lines": ["株式会社A"], "staff": "", "items": [{"name": "契約書", "qty": "1部"}],
+                "missing": [], "opening": "",
+            }
+        )
+        config = make_config(tmp_path)
+        config.data["doc_build"]["templates_dir"] = str(tmp_path)  # ひな形が無い状態にする
+        runner = DocBuildRunner(config, client=client)
+        with pytest.raises((DocumentBuildError, OSError)) as exc:
+            runner.run("株式会社Aあての送付状を作って")
+        if isinstance(exc.value, DocumentBuildError):
+            assert exc.value.usage["input_tokens"] == 1200  # 消費済みトークンを捨てない
+
+    @pytest.mark.parametrize(
+        "question,body,expected",
+        [
+            ("ヤマトライジングの送付状お願いします", "", True),
+            ("南都銀行あての送り状を作成して", "", True),
+            ("いつもの手順で大塚商会あての送付状を作って", "", True),  # 「手順」で打ち消さない
+            ("送付状って必要ですか？", "", False),
+            ("送付状はどんな時に使いますか", "", False),
+            ("送付状は誰が作るんですか", "", False),
+            ("添付の送付状を要約してください", "[download:11]送付状.docx[/download]", False),
+            ("送付状を要約してほしい", "", True),  # 添付が無ければ作成依頼のまま
+        ],
+    )
+    def test_routing_edges(self, question, body, expected):
+        assert looks_like_document_build_request(question, body) is expected
+
+    def test_howto_marker_does_not_match_kotoha(self):
+        # 「ことは」「あとは」が「とは」に部分一致して依頼を取りこぼしていた
+        from raizuinu.doctask import find_document
+
+        recent = [{"body": "[download:555]会議.docx (10 KB)[/download]"}]
+        q = "細かいことは気にしなくていいので、さっきの文字起こしを議事録にまとめて"
+        assert find_document(f"[To:999] {q}", recent, q)["files"][0]["file_id"] == 555
