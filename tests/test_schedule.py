@@ -132,14 +132,14 @@ class TestFormatting:
             *day_range(date(2026, 8, 18)),
         )
         body = format_day(schedule, date(2026, 8, 18), "足立")
-        assert body.startswith("[info][title]足立さん 本日の予定　2026年8月18日（火）[/title]")
+        assert body.startswith("[info][title]足立さん 本日のご予定　2026年8月18日（火）[/title]")
         assert "・終日　月次締め" in body
         assert "・14:00〜15:00　南都銀行 訪問　＠本店営業部" in body
         assert body.endswith("[/info]")
 
     def test_empty_day(self):
         body = format_day(Schedule(), date(2026, 8, 18), "足立")
-        assert "登録されている予定はありません。" in body
+        assert "ご予定は入っておりません。" in body
 
     def test_failed_source_is_disclosed(self):
         schedule = Schedule(events=[], failed_sources=["トヨクモ スケジューラー"])
@@ -373,7 +373,7 @@ class TestMorning:
         assert len(sent) == 1
         room, body = sent[0]
         assert room == 384793683
-        assert body.startswith("[To:6945415]\n[info][title]足立さん 本日の予定")
+        assert body.startswith("[To:6945415]\n[info][title]足立さん 本日のご予定")
 
     def test_skips_weekend(self, tmp_path):
         sent = []
@@ -387,7 +387,7 @@ class TestMorning:
         chatwork = SimpleNamespace(send_message=lambda room, body: sent.append(body) or "1")
         notifier = self._notifier(tmp_path, [FakeSource([])], chatwork)
         assert notifier.run_once(today=date(2026, 8, 18)) is True
-        assert "登録されている予定はありません。" in sent[0]
+        assert "ご予定は入っておりません。" in sent[0]
 
     def test_disabled_does_nothing(self, tmp_path):
         sent = []
@@ -529,15 +529,15 @@ class TestMorningGreeting:
         monday = morning_lead(date(2026, 8, 17), self._sched(ev("朝礼", 9)))
         friday = morning_lead(date(2026, 8, 21), self._sched(ev("朝礼", 9)))
         wednesday = morning_lead(date(2026, 8, 19), self._sched(ev("朝礼", 9)))
-        assert monday.startswith("おはようございます。今週もよろしくお願いします。")
-        assert friday.startswith("おはようございます。今週もあと1日ですね。")
+        assert monday.startswith("おはようございます。今週もよろしくお願いいたします。")
+        assert friday.startswith("おはようございます。今週も残り1日となりました。")
         assert wednesday.startswith("おはようございます。\n")  # 平日中日は挨拶だけ
 
     def test_mentions_the_first_appointment(self):
         from raizuinu.schedule import morning_lead
 
         text = morning_lead(date(2026, 8, 19), self._sched(ev("朝礼", 9), ev("面談", 14)))
-        assert "今日は2件です。最初は09:00からの「朝礼」です。" in text
+        assert "本日のご予定は2件です。最初は9時からの「朝礼」です。" in text
 
     def test_busy_day_is_called_out(self):
         from raizuinu.schedule import morning_lead
@@ -546,20 +546,20 @@ class TestMorningGreeting:
             date(2026, 8, 19),
             self._sched(ev("A", 9), ev("B", 11), ev("C", 14), ev("D", 16)),
         )
-        assert "4件と少し立て込んでいます" in text
+        assert "本日のご予定は4件、少し立て込んでおります。" in text
 
     def test_single_and_all_day(self):
         from raizuinu.schedule import morning_lead
 
         one = morning_lead(date(2026, 8, 19), self._sched(ev("面談", 14)))
-        assert one.endswith("今日は14:00からの「面談」1件です。")
+        assert one.endswith("本日のご予定は、14時からの「面談」1件です。")
         allday = morning_lead(date(2026, 8, 19), self._sched(ev("月次締め")))
-        assert allday.endswith("今日は終日の「月次締め」が1件だけです。")
+        assert allday.endswith("本日のご予定は、終日の「月次締め」1件です。")
 
     def test_empty_day(self):
         from raizuinu.schedule import morning_lead
 
-        assert morning_lead(date(2026, 8, 19), self._sched()).endswith("今日は予定が入っていません。")
+        assert morning_lead(date(2026, 8, 19), self._sched()).endswith("本日のご予定は入っておりません。")
 
     def test_greeting_appears_before_the_box(self):
         body = format_day(
@@ -567,7 +567,7 @@ class TestMorningGreeting:
             greeting="おはようございます。",
         )
         assert body.startswith("おはようございます。")
-        assert "[info][title]足立さん 本日の予定" in body
+        assert "[info][title]足立さん 本日のご予定" in body
 
     def test_no_greeting_when_not_configured(self):
         body = format_day(self._sched(ev("朝礼", 9)), date(2026, 8, 19), "足立")
