@@ -291,11 +291,7 @@ class DocBuildRunner:
             "max_tokens": int(cfg.max_tokens),
             "output_config": {
                 "effort": cfg.effort,
-                "format": {
-                    "type": "json_schema",
-                    "name": "document_fields",
-                    "schema": _FIELDS_SCHEMA,
-                },
+                "format": {"type": "json_schema", "schema": _FIELDS_SCHEMA},
             },
             "system": SYSTEM_PROMPT.format(agent_name=cfg.agent_name),
         }
