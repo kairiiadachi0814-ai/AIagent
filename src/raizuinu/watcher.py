@@ -154,18 +154,26 @@ class DiscussionWatcher:
         )
 
         # 1段目: 軽量スクリーニング（ハンドブックなし）
-        if not self._screen(batch):
+        screen_usage: dict[str, int] = {}
+        if not self._screen(batch, screen_usage):
+            # 介入しない場合もAPIは消費しているため必ず記録する（費用の可視化）
+            self._audit_usage(room_id, "screen_only", screen_usage)
             return
 
         # 2段目: ハンドブック・法令で裏取り（Q&Aと同じ検証パイプラインを再利用）
         handbook = self._handbook_loader.load()
         answer = self._generator.generate(VERIFY_PROMPT.format(batch=batch), handbook)
         self._cost.add_usage(answer.usage)
+        total_usage = dict(screen_usage)
+        for key, value in (answer.usage or {}).items():
+            total_usage[key] = total_usage.get(key, 0) + value
         if not answer.has_answer or not (answer.sources or answer.intent == "legal_knowledge"):
+            self._audit_usage(room_id, "verified_no_issue", total_usage)
             return
 
         cited = sorted({s.get("file", "") or s.get("url", "") for s in answer.sources})
         if cited and cited in (state.get("cited_today") or []):
+            self._audit_usage(room_id, "duplicate_source", total_usage)
             return  # 同じ根拠での再介入は同日中は行わない
 
         advice = sanitize_for_chatwork(answer.text)
@@ -198,7 +206,7 @@ class DiscussionWatcher:
             fresh.append(m)
         return fresh
 
-    def _screen(self, batch: str) -> bool:
+    def _screen(self, batch: str, usage_out: dict[str, int] | None = None) -> bool:
         try:
             response = self._screen_client.messages.create(
                 model=self._config.model,
@@ -219,6 +227,8 @@ class DiscussionWatcher:
             if value:
                 usage[key] = int(value)
         self._cost.add_usage(usage)
+        if usage_out is not None:
+            usage_out.update(usage)
         text = next(
             (b.text for b in reversed(response.content) if getattr(b, "type", "") == "text"),
             "",
@@ -260,6 +270,28 @@ class DiscussionWatcher:
         if not labels:
             return ""
         return "\n\n【出典】\n" + "\n".join(f"・{label}" for label in labels)
+
+    def _audit_usage(self, room_id: int, outcome: str, usage: dict[str, int]) -> None:
+        """介入しなかった巡回のAPI消費を記録する（費用の可視化・効果測定の前提）。"""
+        if not usage:
+            return
+        try:
+            from .audit import AuditLogger
+
+            AuditLogger(
+                log_dir=self._config.resolve_path(self._config.audit_log_dir),
+                retention_days=self._config.audit_log_retention_days,
+            ).log(
+                {
+                    "type": "watch_scan",
+                    "room_id": room_id,
+                    "outcome": outcome,
+                    "usage": usage,
+                    "cost_jpy": round(self._cost.estimate_cost_jpy(usage), 3),
+                }
+            )
+        except Exception:
+            print("[warn] 巡回の監査記録に失敗: " + traceback.format_exc(), flush=True)
 
     def _audit(self, room_id: int, mode: str, advice: str, answer) -> None:
         try:

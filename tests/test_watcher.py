@@ -137,6 +137,12 @@ class TestScreening:
         assert screen.calls == 1
         assert generator.calls == []  # 2段目に進まない
         assert chatwork.sent == []
+        # 介入しなくてもAPI消費は監査ログに残る（費用の可視化）
+        log = (tmp_path / "logs").glob("audit-*.jsonl")
+        records = [json.loads(l) for p in log for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+        scans = [r for r in records if r["type"] == "watch_scan"]
+        assert scans and scans[0]["outcome"] == "screen_only"
+        assert scans[0]["usage"]["input_tokens"] == 100
 
 
 class TestIntervention:
@@ -175,12 +181,24 @@ class TestIntervention:
         assert chatwork.sent == []
 
     def test_silent_when_no_confirmed_error(self, tmp_path):
-        no_error = Answer(has_answer=False, text="明らかな誤りはありません")
+        no_error = Answer(
+            has_answer=False, text="明らかな誤りはありません",
+            usage={"input_tokens": 5000, "output_tokens": 50},
+        )
         watcher, chatwork, _, _ = make_watcher(
             tmp_path, DISCUSSION, answer=no_error, preset_last_seen=99
         )
         watcher.run_once()
         assert chatwork.sent == []  # 裏取りできなければ沈黙
+        # 2段目まで走った分の費用も記録される（1段目＋2段目の合算）
+        records = [
+            json.loads(l) for p in (tmp_path / "logs").glob("audit-*.jsonl")
+            for l in p.read_text(encoding="utf-8").splitlines() if l.strip()
+        ]
+        scan = next(r for r in records if r["type"] == "watch_scan")
+        assert scan["outcome"] == "verified_no_issue"
+        assert scan["usage"]["input_tokens"] == 5100  # 100（1段目）+ 5000（2段目）
+        assert scan["cost_jpy"] > 0
 
     def test_daily_limit_stops_interventions(self, tmp_path):
         watcher, chatwork, generator, screen = make_watcher(
