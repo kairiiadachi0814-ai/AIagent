@@ -114,16 +114,19 @@ def _cell_re(ref: str) -> re.Pattern[str]:
     return _CELL_RE_CACHE[ref]
 
 
-def _set_cell(sheet_xml: str, ref: str, value: Any) -> str:
+def set_cell(sheet_xml: str, ref: str, value: Any) -> str:
     """セル1つを書き換える。書式（s属性）は残し、値だけ差し替える。
 
     文字列は共有文字列表を触らずに済むインライン文字列で入れる。
+    value が None のときは空セルにする。
     """
     match = _cell_re(ref).search(sheet_xml)
     if not match:
         raise TemplateError(f"ひな形にセル {ref} が見つかりませんでした")
     attrs = re.sub(r'\s+t="[^"]*"', "", match.group("attrs")).rstrip("/").rstrip()
-    if isinstance(value, (int, float)):
+    if value is None:
+        cell = f'<c r="{ref}"{attrs}/>'
+    elif isinstance(value, (int, float)):
         cell = f'<c r="{ref}"{attrs}><v>{value}</v></c>'
     else:
         text = escape(str(value))
@@ -168,7 +171,7 @@ def render_xlsx(template: bytes, sheet_name: str, cells: dict[str, Any]) -> byte
         before = _cell_re(ref).search(sheet_xml)
         if before and "<f" in (before.group("inner") or ""):
             overwritten_formulas.append(ref)
-        sheet_xml = _set_cell(sheet_xml, ref, value)
+        sheet_xml = set_cell(sheet_xml, ref, value)
     parts[path] = sheet_xml.encode("utf-8")
 
     # 数式を消したセルが計算チェーンに残ると、Excelが壊れたファイルとして扱う。

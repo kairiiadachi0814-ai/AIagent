@@ -710,3 +710,39 @@ class TestStaffRoster:
         runner = DocBuildRunner(make_config(tmp_path), client=client)
         _, meta, _ = runner.run("株式会社Aあての送付状を作って", requester_name="足立海里")
         assert "担当： 経理財務部　足立" in "".join(docx_texts(meta["artifact"][1]))
+
+
+class TestRosterMaintenance:
+    """名簿の増減が、JSONとExcelのドロップダウンの両方へ反映されること。"""
+
+    def _roster(self):
+        import json
+        import pathlib
+
+        return json.loads(
+            (pathlib.Path(REPO_TEMPLATES) / "staff_roster.json").read_text(encoding="utf-8")
+        )["staff"]
+
+    def test_leavers_are_removed(self):
+        for name in ("倉本", "進地", "坂口"):  # 退職・他部署
+            assert name not in self._roster()
+
+    def test_new_member_is_added(self):
+        assert "岩永" in self._roster()  # 2026-09-09入社
+
+    def test_dropdown_matches_the_roster(self):
+        import pathlib
+
+        openpyxl = pytest.importorskip("openpyxl")
+        pull = openpyxl.load_workbook(pathlib.Path(REPO_TEMPLATES) / "FAX送付状.xlsx")[
+            "プルダウンリスト"
+        ]
+        # 列全体を参照するドロップダウンなので、余った行は空でなければならない
+        column = [pull[f"B{row}"].value for row in range(1, 11)]
+        assert [v for v in column if v] == self._roster()
+        assert all(v is None for v in column[len(self._roster()) :])
+
+    def test_new_member_surname_can_be_split(self):
+        from raizuinu.docbuild import surname
+
+        assert surname("岩永太郎", tuple(self._roster())) == "岩永"

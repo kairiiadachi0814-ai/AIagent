@@ -234,6 +234,22 @@ FAX_CELLS = {
 
 FAX_KEEP_SHEETS = ("プルダウンリスト", "汎用")
 
+# 経理財務部の担当者名簿。Box原本のプルダウンは古いままなので、ここで差分を当てる。
+# 名簿は「Chatworkの表示名から苗字を切り出すときの照合」と「Excelのドロップダウン」の
+# 両方に効く。人の出入りがあったらこの2つを直して再生成する。
+STAFF_REMOVED = ("倉本", "進地", "坂口")  # 退職・他部署（2026-08-17時点）
+STAFF_ADDED = ("岩永",)  # 2026-09-09入社
+# ドロップダウンが参照する列（プルダウンリスト!$B:$B）。空欄も選択肢に出るため、
+# 使わない行は必ず空セルへ戻す
+ROSTER_COLUMN = "B"
+ROSTER_MAX_ROWS = 10
+
+
+def build_roster(names: list[str]) -> list[str]:
+    """原本のプルダウンに差分を当てた名簿を返す（並び順は原本を尊重）。"""
+    kept = [n for n in names if n not in STAFF_REMOVED]
+    return kept + [n for n in STAFF_ADDED if n not in kept]
+
 
 def strip_to_general_sheet(data: bytes, keep: tuple[str, ...] = FAX_KEEP_SHEETS) -> bytes:
     """FAX送付状ひな形から取引先別のシートを取り除く。
@@ -356,6 +372,31 @@ def strip_to_general_sheet(data: bytes, keep: tuple[str, ...] = FAX_KEEP_SHEETS)
     return buf.getvalue()
 
 
+def apply_roster(data: bytes, staff: list[str]) -> bytes:
+    """ひな形の「プルダウンリスト」シートを、渡した名簿の内容に揃える。
+
+    ドロップダウンは列全体（$B:$B）を参照しているので、使わない行は
+    空セルへ戻さないと空欄が選択肢として並ぶ。
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from raizuinu.templatefill import set_cell, sheet_path_by_name
+
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        parts = {name: z.read(name) for name in z.namelist()}
+    path, _index, _sheet_id = sheet_path_by_name(parts, "プルダウンリスト")
+    sheet_xml = parts[path].decode("utf-8")
+    for row in range(1, ROSTER_MAX_ROWS + 1):
+        value = staff[row - 1] if row <= len(staff) else None
+        sheet_xml = set_cell(sheet_xml, f"{ROSTER_COLUMN}{row}", value)
+    parts[path] = sheet_xml.encode("utf-8")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, blob in parts.items():
+            z.writestr(name, blob)
+    return buf.getvalue()
+
+
 def build_fax() -> None:
     import json
 
@@ -364,7 +405,7 @@ def build_fax() -> None:
     src = BOX / FAX_SRC
     out = OUT_DIR / FAX_SRC
     OUT_DIR.mkdir(exist_ok=True)
-    out.write_bytes(strip_to_general_sheet(src.read_bytes()))
+    stripped = strip_to_general_sheet(src.read_bytes())
 
     wb = load_workbook(src)
     if "汎用" not in wb.sheetnames:
@@ -400,12 +441,17 @@ def build_fax() -> None:
             for row in range(1, 20)
             if isinstance(pull[f"A{row}"].value, str) and pull[f"A{row}"].value.strip()
         ],
-        "staff": [
-            str(pull[f"B{row}"].value).strip()
-            for row in range(1, 30)
-            if isinstance(pull[f"B{row}"].value, str) and pull[f"B{row}"].value.strip()
-        ],
+        "staff": build_roster(
+            [
+                str(pull[f"{ROSTER_COLUMN}{row}"].value).strip()
+                for row in range(1, ROSTER_MAX_ROWS + 1)
+                if isinstance(pull[f"{ROSTER_COLUMN}{row}"].value, str)
+                and pull[f"{ROSTER_COLUMN}{row}"].value.strip()
+            ]
+        ),
     }
+    # ひな形のドロップダウンも同じ名簿に揃える（人が選ぶときに古い名前を出さない）
+    out.write_bytes(apply_roster(stripped, roster["staff"]))
     roster_path = OUT_DIR / "staff_roster.json"
     roster_path.write_text(
         json.dumps(roster, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
