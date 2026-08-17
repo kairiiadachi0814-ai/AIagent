@@ -68,6 +68,20 @@ _DEFAULTS: dict[str, Any] = {
         # 「さっきのファイル」を探すときだけ、文脈用より広くメッセージを遡る
         "search_message_count": 60,
     },
+    # ひな形からの書類作成（送付状・FAX送付状）。ひな形の実体は templates/ に同梱
+    "doc_build": {
+        "enabled": False,
+        "templates_dir": "templates",
+        # 契約書ひな形はここに入れない（締結前のリーガルチェックが必須のため）
+        "allowed_templates": [
+            "書類送付状_ライズ",
+            "書類送付状_ヤマトライジング",
+            "書類送付状_楽天軒",
+            "FAX送付状",
+        ],
+        "max_items": 20,
+        "attach_to_chatwork": True,
+    },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {
         "enabled": False,

@@ -49,6 +49,18 @@
     "max_text_chars": 120000,
     "search_message_count": 60
   },
+  "doc_build": {
+    "enabled": true,
+    "templates_dir": "templates",
+    "allowed_templates": [
+      "書類送付状_ライズ",
+      "書類送付状_ヤマトライジング",
+      "書類送付状_楽天軒",
+      "FAX送付状"
+    ],
+    "max_items": 20,
+    "attach_to_chatwork": true
+  },
   "webhook_async": true,
   "webhook_max_concurrency": 2,
   "webhook_max_queue": 10,

@@ -45,6 +45,20 @@ class WebhookResult:
     detail: str
 
 
+def _reply_tag(event: MentionEvent) -> str:
+    """返信先を指すChatworkタグ（本文の先頭に置く）。"""
+    return f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n"
+
+
+def _display_name(messages: list, account_id: int) -> str:
+    """直近メッセージから依頼者の表示名を拾う（書類の差出人担当者に使う）。"""
+    for msg in reversed(messages or []):
+        account = msg.get("account") or {}
+        if int(account.get("account_id", 0) or 0) == int(account_id):
+            return str(account.get("name", "")).strip()
+    return ""
+
+
 class RaizuinuHandler:
     def __init__(self, config: Config | None = None, **overrides) -> None:
         self._config = config or Config.load()
@@ -77,6 +91,11 @@ class RaizuinuHandler:
             from .doctask import DocTaskRunner
 
             self._doc_task = DocTaskRunner(cfg, self._chatwork)
+        self._doc_build = overrides.get("doc_build")
+        if self._doc_build is None and cfg.doc_build.get("enabled"):
+            from .docbuild import DocBuildRunner
+
+            self._doc_build = DocBuildRunner(cfg)
         self._dedupe_lock = threading.Lock()
         self._processed_ids: dict[str, None] = {}  # 挿入順を保つLRU代替
         self._dedupe_path = cfg.resolve_path(cfg.state_dir) / "processed_messages.json"
@@ -120,7 +139,7 @@ class RaizuinuHandler:
                 try:
                     self._chatwork.send_message(
                         event.room_id,
-                        f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n"
+                        _reply_tag(event)
                         + BUSY_MESSAGE,
                     )
                 except Exception:
@@ -159,7 +178,7 @@ class RaizuinuHandler:
             try:
                 self._chatwork.send_message(
                     event.room_id,
-                    f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n"
+                    _reply_tag(event)
                     + FAILURE_MESSAGE,
                 )
             except Exception:
@@ -185,7 +204,7 @@ class RaizuinuHandler:
             self._notify_stopped_once(status)
             self._chatwork.send_message(
                 event.room_id,
-                f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n"
+                _reply_tag(event)
                 + STOPPED_MESSAGE,
             )
             self._audit_safely(
@@ -223,9 +242,21 @@ class RaizuinuHandler:
                 "ハンドブックが1件も読み込めません。handbook.roots の設定を確認してください"
             )
 
+        # ひな形からの書類作成（送付状・FAX送付状）→ 専用フロー。
+        # 議事録フローより先に見る。ひな形ファイルを添えて依頼された場合、
+        # find_document がキーワードを見ずに文書タスクへ吸い込んでしまうため
+        build_request = False
+        if self._doc_build is not None:
+            from .docbuild import looks_like_document_build_request
+
+            build_request = looks_like_document_build_request(question)
+            if build_request:
+                self._process_doc_build(event, question, context, messages)
+                return
+
         # 文書つき雑務依頼（会議ファイルの議事録作成・要約など）→ 専用フロー。
         # マニュアル原本のURL（ハンドブック記載）は対象外にしてQ&Aで扱う
-        if self._doc_task is not None:
+        if self._doc_task is not None and not build_request:
             from .answer import _url_in_handbook
             from .doctask import (
                 NO_DOCUMENT_GUIDANCE,
@@ -272,7 +303,7 @@ class RaizuinuHandler:
             self._notify_stopped_once(status)
             self._chatwork.send_message(
                 event.room_id,
-                f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n"
+                _reply_tag(event)
                 + STOPPED_MESSAGE,
             )
             return
@@ -337,7 +368,7 @@ class RaizuinuHandler:
 
         self._chatwork.send_message(
             event.room_id,
-            f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n"
+            _reply_tag(event)
             + sanitize_for_chatwork(text),
         )
         self._audit_safely(
@@ -351,6 +382,76 @@ class RaizuinuHandler:
             }
         )
 
+    def _process_doc_build(
+        self, event: MentionEvent, question: str, context: str, messages: list
+    ) -> None:
+        """ひな形から書類を作り、下書きをルームへ添付して返す。"""
+        from .answer import sanitize_for_chatwork
+        from .docbuild import DocumentBuildError
+
+        status = self._cost.status()
+        if status.over_limit:
+            self._notify_stopped_once(status)
+            self._chatwork.send_message(event.room_id, _reply_tag(event) + STOPPED_MESSAGE)
+            return
+
+        try:
+            reply_text, meta, usage = self._doc_build.run(
+                question,
+                context=context,
+                requester_name=_display_name(messages, event.account_id),
+            )
+        except DocumentBuildError as exc:
+            self._reply_and_audit(event, question, str(exc), "doc_build_failed")
+            return
+
+        status = None
+        try:
+            if usage:
+                status = self._cost.add_usage(usage)
+        except Exception:
+            print("[warn] コスト計上に失敗: " + traceback.format_exc(), flush=True)
+
+        body = _reply_tag(event) + sanitize_for_chatwork(reply_text)
+        artifact = meta.pop("artifact", None)
+        uploaded = ""
+        if artifact and self._config.doc_build.get("attach_to_chatwork", True):
+            filename, data = artifact
+            uploaded = self._chatwork.upload_file(
+                event.room_id, sanitize_for_chatwork(filename), data, message=body
+            )
+        else:
+            self._chatwork.send_message(event.room_id, body)
+
+        # 返信成功後の後処理での例外は失敗メッセージを送らない（二重送信防止）
+        try:
+            if status is not None:
+                self._maybe_alert(status)
+            self._audit_safely(
+                {
+                    "type": "doc_build" if artifact else "doc_build_not_ready",
+                    "room_id": event.room_id,
+                    "account_id": event.account_id,
+                    "message_id": event.message_id,
+                    "question": question,
+                    "template": meta.get("template"),
+                    "output_filename": meta.get("output_filename"),
+                    "uploaded_file_id": uploaded,
+                    "detail": meta,
+                    "answer": reply_text[:2000],
+                    "model": self._config.model,
+                    "usage": usage,
+                    "cost_jpy": round(self._cost.estimate_cost_jpy(usage), 3) if usage else 0.0,
+                    "monthly_total_jpy": round(status.total_jpy, 2) if status else None,
+                }
+            )
+        except Exception:
+            print(
+                "[warn] 返信後の通知・監査処理に失敗（返信自体は成功）: "
+                + traceback.format_exc(),
+                flush=True,
+            )
+
     def _process_doc_task(self, event: MentionEvent, question: str, document: dict) -> None:
         """文書つき依頼を処理して返信する（ハンドブック・出典検証は使わない）。"""
         from .answer import sanitize_for_chatwork
@@ -361,7 +462,7 @@ class RaizuinuHandler:
             self._notify_stopped_once(status)
             self._chatwork.send_message(
                 event.room_id,
-                f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n"
+                _reply_tag(event)
                 + STOPPED_MESSAGE,
             )
             return
@@ -377,7 +478,7 @@ class RaizuinuHandler:
 
         self._chatwork.send_message(
             event.room_id,
-            f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n"
+            _reply_tag(event)
             + sanitize_for_chatwork(reply_text),
         )
 
@@ -436,7 +537,7 @@ class RaizuinuHandler:
 
         ack = sanitize_for_chatwork(answer.text) or "マニュアル更新のご報告、受け付けました。"
         reply = (
-            f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n"
+            _reply_tag(event)
             + ack
             + "\n\n反映作業のリストに追加しました。反映が済むまでは、少し前の内容でお答えすることがある点だけご了承ください。"
         )
@@ -501,7 +602,7 @@ class RaizuinuHandler:
         )
         self._chatwork.send_message(
             event.room_id,
-            f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n" + ack,
+            _reply_tag(event) + ack,
         )
 
         admin_room = self._config.admin_room_id

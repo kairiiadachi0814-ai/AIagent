@@ -1,17 +1,22 @@
 """Chatwork REST APIクライアント。
 
-Phase 1で使う操作は「メッセージ送信」と「直近メッセージ取得」の2つのみ
-（要件定義書4章の判断どおりMCPは使わずREST直接）。送信ロジックを本クラスに
-隔離しているため、将来公式MCPへ差し替える場合も本ファイルの変更で完結する。
+使う操作は「メッセージ送信」「直近メッセージ取得」「添付ファイルの取得」
+「ファイルのアップロード」の4つ（要件定義書4章の判断どおりMCPは使わずREST直接）。
+送信ロジックを本クラスに隔離しているため、将来公式MCPへ差し替える場合も
+本ファイルの変更で完結する。
 """
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
 API_BASE = "https://api.chatwork.com/v2"
+# ファイルアップロードのAPI上限（プランによらず1ファイル5MB）
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 
 
 class ChatworkError(Exception):
@@ -55,6 +60,28 @@ class ChatworkClient:
         self._raise_for_status(resp)
         return resp.json()
 
+    def upload_file(
+        self, room_id: int, filename: str, data: bytes, message: str = ""
+    ) -> str:
+        """ファイルをルームへアップロードし、file_idを返す。
+
+        本文（message）を添えると、ファイルの前にその本文が付いた1件の
+        メッセージとして投稿される。
+        """
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise ChatworkError(
+                f"ファイルが大きすぎます（{len(data):,}バイト / 上限 {MAX_UPLOAD_BYTES:,}バイト）"
+            )
+        body, content_type = _multipart(filename, data, message)
+        resp = requests.post(
+            f"{API_BASE}/rooms/{room_id}/files",
+            headers={**self._headers, "Content-Type": content_type},
+            data=body,
+            timeout=self._timeout,
+        )
+        self._raise_for_status(resp)
+        return str(resp.json().get("file_id", ""))
+
     def get_recent_messages(self, room_id: int, limit: int = 20) -> list[dict[str, Any]]:
         """直近のメッセージを古い順で最大limit件返す。
 
@@ -79,6 +106,35 @@ class ChatworkClient:
             raise ChatworkError(
                 f"Chatwork APIエラー: HTTP {resp.status_code} {resp.text[:200]}"
             )
+
+
+def _multipart(filename: str, data: bytes, message: str) -> tuple[bytes, str]:
+    """multipart/form-dataの本文を自前で組む。
+
+    requestsのfiles=に任せると filename* が付かず、日本語ファイル名が
+    Chatwork側で文字化けする。ASCIIの代替名と filename*=UTF-8'' の両方を
+    書いて、どちらの解釈でも読めるようにする。
+    """
+    boundary = uuid.uuid4().hex
+    ascii_name = filename.encode("ascii", "replace").decode("ascii").replace("?", "_")
+    parts: list[bytes] = []
+    if message:
+        parts += [
+            f'--{boundary}\r\nContent-Disposition: form-data; name="message"\r\n\r\n'.encode(),
+            message.encode("utf-8"),
+            b"\r\n",
+        ]
+    parts += [
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{ascii_name}"; '
+            f"filename*=UTF-8''{quote(filename)}\r\n"
+            "Content-Type: application/octet-stream\r\n\r\n"
+        ).encode(),
+        data,
+        f"\r\n--{boundary}--\r\n".encode(),
+    ]
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
 def format_context(messages: list[dict[str, Any]], exclude_message_id: str | None = None) -> str:

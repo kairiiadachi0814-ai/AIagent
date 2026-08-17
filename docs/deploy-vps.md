@@ -175,6 +175,32 @@ ssh -i C:\Users\admin\.ssh\raizuinu_vps ubuntu@tk2-262-40529.vs.sakura.ne.jp "su
   「リンクを知っている全員が閲覧可」への変更か、Wordファイルでの添付を案内する
 - 監査ログは `type: doc_task`。設定は `config.json` の `doc_task`（enabled／max_file_mb／max_text_chars）
 
+## ひな形からの書類作成（2026-08-17追加。要件定義書 FR-07／FR-08）
+
+「南都銀行あての書類送付状を作って」「三十三銀行あてのFAX送付状を作成して」のような
+依頼を受けたら、社内ひな形に差し込んだ下書きを作り、ルームへ添付して返す。
+
+- 判定はコード側で決定的に行う（`docbuild.looks_like_document_build_request`）。
+  書類名（送付状・FAX送付状 等）と作成の語が両方あるときだけ。「書き方を教えて」
+  「ひな形はどこ？」はQ&Aのまま。議事録フローより**先**に判定する（ひな形を添付して
+  依頼されると `find_document` がキーワードを見ずに文書タスクへ吸い込むため）
+- ひな形の実体は `templates/` に同梱（VPSからBoxは見えない）。Boxの原本は過去に送った分が
+  1ファイルに積み上がっているため、1通分だけを切り出して宛先・書類名を白紙化してある。
+  作り直しは `python tools/build_templates.py`（Box同期フォルダが見えるローカルPCで実行）
+- 差し込みは `templatefill.py`。ライブラリで開き直して保存すると書式が壊れるため、
+  zipの中の該当XMLだけを書き換える。Wordは段落テキストの置換（繰り返し行は段落を複製）、
+  Excelはセルをインライン文字列で置換。FAX送付状はフォームコントロール・印刷設定・
+  図形を持つので、この方式でないと落ちる（openpyxlは使わない）
+- FAX送付状の宛先は `templates/fax_destinations.json`（原本の取引先別シートから機械抽出した
+  15件）を参照し、会社名が一致すればFAX番号・TEL・担当者を自動で埋める
+- 契約書ひな形は生成しない。ひな形リンク集のURL案内に倒す（締結前のリーガルチェックが必須）
+- 出力は下書き。返信に必ず「ひな形名・Box URL・下書きである旨」を付ける
+- Chatworkへのアップロードは `POST /rooms/{id}/files`（1ファイル5MB上限）。日本語ファイル名が
+  文字化けするため multipart を自前で組み、`filename` と `filename*=UTF-8''` を併記している
+- 監査ログは `type: doc_build`（成果物なしの聞き返しは `doc_build_not_ready`、
+  差し込み失敗は `doc_build_failed`）。設定は `config.json` の `doc_build`
+- コストは項目抽出の1回だけ（ハンドブックを載せない軽量フロー。1件あたり数円）
+
 ## コストの実測・目安
 
 claude-opus-5での実測（2026-08-13、変更前）:
