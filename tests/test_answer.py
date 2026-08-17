@@ -675,6 +675,50 @@ class TestAnswerGenerator:
         assert client.calls == 1  # 2段目に進まない
         assert answer.stage2 == ""
 
+    def test_program_name_lookup_when_no_url_anywhere(self, tmp_path):
+        # reference_urlも本文URLも無い場合、制度名からリンク集を引いて必ず取得へ回す
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["web_fetch_enabled"] = True
+        config.data["web_fetch_allowed_domains"] = ["mirasapo-plus.go.jp"]
+        stage1 = {
+            "intent": "general_knowledge",
+            "reference_url": "",
+            "has_answer": True,
+            "answer": "補助率は公募回によって変わります。※一般的な制度知識としての説明です。",
+            "sources": [],
+            "suggested_file": "",
+            "reported_manuals": [],
+        }
+        client = FakeClient(
+            [fake_response(stage1), self._stage2_response("上限4,000万円です。※")]
+        )
+        gen = AnswerGenerator(config, client=client)
+        answer = gen.generate("デジタル化・AI導入補助金の上限額は？", handbook)
+        assert client.calls == 2
+        assert answer.reference_url == MIRASAPO_URL
+        assert "4,000万円" in answer.text
+
+    def test_program_lookup_skipped_for_generic_or_ambiguous_questions(self, tmp_path):
+        from raizuinu.answer import _lookup_program_url
+
+        (tmp_path / "補助金リンク集_ミラサポplus.md").write_text(
+            "# 補助金リンク集\n"
+            "- ものづくり補助金（設備投資）: https://mirasapo-plus.go.jp/subsidy/manufacturing/\n"
+            "- 省力化投資補助金（省力化）: https://mirasapo-plus.go.jp/subsidy/shoryokuka/\n",
+            encoding="utf-8",
+        )
+        handbook = HandbookLoader([tmp_path], ["*.md"], [], 300).load()
+        hosts = {"mirasapo-plus.go.jp"}
+        # 制度名が特定できる質問だけ引く
+        assert _lookup_program_url("ものづくり補助金の上限は？", handbook, hosts).endswith(
+            "/manufacturing/"
+        )
+        # 総覧的な質問・該当なしは引かない（的外れなページを読ませない）
+        assert _lookup_program_url("補助金について教えて", handbook, hosts) == ""
+        assert _lookup_program_url("キャリアアップ助成金の要件は？", handbook, hosts) == ""
+        assert _lookup_program_url("経費精算の締め日は？", handbook, hosts) == ""
+
     def test_junk_tool_keywords_rejected(self):
         from raizuinu.answer import _is_placeholder_value
 

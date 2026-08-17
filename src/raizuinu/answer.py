@@ -422,6 +422,9 @@ class AnswerGenerator:
                 "",
             )
             if not url:
+                # 本文にもURLが無い場合、制度名からリンク集を直接引く
+                url = _lookup_program_url(question, handbook, allowed_hosts)
+            if not url:
                 return answer
             answer.reference_url = url
             answer.stage2 = "recovered"
@@ -807,6 +810,39 @@ def _lookup_manual_url(file_name: str, handbook: Handbook) -> str:
     # 場合に備え、マニュアル名がリンク集の見出しに含まれ、候補が1件のときだけ許す
     hits = [url for title, url in mapping.items() if key in title]
     return hits[0] if len(hits) == 1 else ""
+
+
+# 質問文に現れる制度名（例: ものづくり補助金・業務改善助成金）。
+# 「補助金について教えて」のような総覧質問は拾わないよう、前に2文字以上を要求する
+_PROGRAM_NAME_RE = re.compile(r"[^\s　（(）)「」：:｜|、。,.]{2,20}?(?:補助金|助成金|給付金)")
+
+
+def _lookup_program_url(
+    question: str, handbook: Handbook, allowed_hosts: set[str]
+) -> str:
+    """質問に含まれる制度名で補助金リンク集を引く（一意に定まる場合のみ）。
+
+    モデルがreference_urlを埋め忘れても、公募状況が変わる制度の質問では
+    必ず最新ページを取得しに行けるようにするための保険。
+    """
+    names = {n for n in _PROGRAM_NAME_RE.findall(question)}
+    if not names:
+        return ""
+    hits: list[str] = []
+    for f in handbook.files:
+        if "補助金リンク集" not in f.name:
+            continue
+        for line in f.content.splitlines():
+            match = _URL_RE.search(line)
+            if not match:
+                continue
+            title = line[: match.start()]
+            if any(name in title for name in names):
+                hits.append(match.group(0))
+    unique = list(dict.fromkeys(hits))
+    if len(unique) != 1:
+        return ""  # 候補が絞れないときは取得しない（的外れなページを読ませない）
+    return unique[0] if _fetchable_reference(unique[0], allowed_hosts, handbook) else ""
 
 
 def _fetchable_reference(url: str, allowed_hosts: set[str], handbook: Handbook) -> bool:
