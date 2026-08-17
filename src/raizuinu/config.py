@@ -26,6 +26,9 @@ _DEFAULTS: dict[str, Any] = {
     "context_message_count": 20,
     "allowed_room_ids": [],
     "admin_room_id": None,
+    # 書き込みを伴う依頼（予定の登録・取り消し）を受け付けるアカウント。
+    # Chatworkの「管理者」役割は部署の多くが持つため、役割ではなくIDで絞る
+    "admin_account_ids": [],
     "agent_account_id": None,
     "handbook": {
         "roots": ["."],
@@ -81,6 +84,16 @@ _DEFAULTS: dict[str, Any] = {
         ],
         "max_items": 20,
         "attach_to_chatwork": True,
+    },
+    # 予定の照会・登録と朝の通知。トヨクモ スケジューラーは読み取り専用のため、
+    # 読みは iCal（トヨクモ）＋Googleカレンダー、書きはGoogleカレンダーのみ
+    "schedule": {
+        "enabled": False,
+        "owner_name": "",
+        "notify_room_id": None,
+        "notify_account_id": None,
+        "notify_weekdays_only": True,
+        "ics_labels": ["トヨクモ スケジューラー"],
     },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {

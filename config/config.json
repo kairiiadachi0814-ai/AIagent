@@ -88,5 +88,18 @@
     "min_message_chars": 10,
     "max_batch_messages": 30,
     "max_verifications_per_day": 10
+  },
+  "admin_account_ids": [
+    6945415
+  ],
+  "schedule": {
+    "enabled": false,
+    "owner_name": "足立",
+    "notify_room_id": 384793683,
+    "notify_account_id": 6945415,
+    "notify_weekdays_only": true,
+    "ics_labels": [
+      "トヨクモ スケジューラー"
+    ]
   }
 }

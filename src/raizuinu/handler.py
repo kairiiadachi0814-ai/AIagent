@@ -50,6 +50,23 @@ def _reply_tag(event: MentionEvent) -> str:
     return f"[rp aid={event.account_id} to={event.room_id}-{event.message_id}]\n"
 
 
+def _read_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_json(path: Path, data: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        print("[warn] 状態の書き込みに失敗: " + traceback.format_exc(), flush=True)
+
+
 def _display_name(messages: list, account_id: int) -> str:
     """直近メッセージから依頼者の表示名を拾う（書類の差出人担当者に使う）。"""
     for msg in reversed(messages or []):
@@ -96,6 +113,11 @@ class RaizuinuHandler:
             from .docbuild import DocBuildRunner
 
             self._doc_build = DocBuildRunner(cfg)
+        self._schedule = overrides.get("schedule")
+        if self._schedule is None and cfg.schedule.get("enabled"):
+            from .scheduletask import ScheduleRunner
+
+            self._schedule = ScheduleRunner(cfg)
         self._dedupe_lock = threading.Lock()
         self._processed_ids: dict[str, None] = {}  # 挿入順を保つLRU代替
         self._dedupe_path = cfg.resolve_path(cfg.state_dir) / "processed_messages.json"
@@ -242,6 +264,25 @@ class RaizuinuHandler:
                 "ハンドブックが1件も読み込めません。handbook.roots の設定を確認してください"
             )
 
+        # 予定の照会・登録・取り消し → 専用フロー。
+        # 登録は管理者アカウントからの依頼だけ受け付ける（ルーム制限とは別に効かせる）
+        if self._schedule is not None:
+            from .scheduletask import (
+                NOT_ADMIN_MESSAGE,
+                is_cancel_request,
+                is_register_request,
+                looks_like_schedule_request,
+            )
+
+            owner = str(cfg.schedule.get("owner_name", ""))
+            if looks_like_schedule_request(question, owner):
+                writes = is_register_request(question) or is_cancel_request(question)
+                if writes and event.account_id not in set(cfg.admin_account_ids):
+                    self._reply_and_audit(event, question, NOT_ADMIN_MESSAGE, "schedule_denied")
+                    return
+                self._process_schedule(event, question)
+                return
+
         # ひな形からの書類作成（送付状・FAX送付状）→ 専用フロー。
         # 議事録フローより先に見る。ひな形ファイルを添えて依頼された場合、
         # find_document がキーワードを見ずに文書タスクへ吸い込んでしまうため
@@ -382,6 +423,67 @@ class RaizuinuHandler:
                 "answer": text,
             }
         )
+
+    def _process_schedule(self, event: MentionEvent, question: str) -> None:
+        """予定の照会・登録・取り消しを処理して返信する。"""
+        from .answer import sanitize_for_chatwork
+        from .scheduletask import is_cancel_request, is_register_request
+
+        status = self._cost.status()
+        if status.over_limit:
+            self._notify_stopped_once(status)
+            self._chatwork.send_message(event.room_id, _reply_tag(event) + STOPPED_MESSAGE)
+            return
+
+        state_path = self._config.resolve_path(self._config.state_dir) / "schedule_last.json"
+        if is_cancel_request(question):
+            last = _read_json(state_path).get("registered") or []
+            reply, meta, usage = self._schedule.cancel(last)
+            kind = "schedule_cancel"
+            if not meta.get("error"):
+                _write_json(state_path, {})
+        elif is_register_request(question):
+            reply, meta, usage = self._schedule.register(question)
+            kind = "schedule_register"
+            if meta.get("registered"):
+                # 「さっきの予定を取り消して」で消せるよう直前の1件を覚えておく
+                _write_json(state_path, {"registered": meta["registered"]})
+        else:
+            reply, meta, usage = self._schedule.answer(question)
+            kind = "schedule_answer"
+
+        cost_status = self._add_usage_safely(usage)
+        self._chatwork.send_message(
+            event.room_id, _reply_tag(event) + sanitize_for_chatwork(reply)
+        )
+
+        # 返信成功後の後処理での例外は失敗メッセージを送らない（二重送信防止）
+        try:
+            if cost_status is not None:
+                self._maybe_alert(cost_status)
+            self._audit_safely(
+                {
+                    "type": kind,
+                    "room_id": event.room_id,
+                    "account_id": event.account_id,
+                    "message_id": event.message_id,
+                    "question": question,
+                    "detail": meta,
+                    "answer": reply[:2000],
+                    "model": self._config.model,
+                    "usage": usage,
+                    "cost_jpy": round(self._cost.estimate_cost_jpy(usage), 3) if usage else 0.0,
+                    "monthly_total_jpy": (
+                        round(cost_status.total_jpy, 2) if cost_status else None
+                    ),
+                }
+            )
+        except Exception:
+            print(
+                "[warn] 返信後の通知・監査処理に失敗（返信自体は成功）: "
+                + traceback.format_exc(),
+                flush=True,
+            )
 
     def _process_doc_build(
         self, event: MentionEvent, question: str, context: str, messages: list
