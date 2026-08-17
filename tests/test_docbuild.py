@@ -538,3 +538,59 @@ class TestReviewRegressions:
         recent = [{"body": "[download:555]会議.docx (10 KB)[/download]"}]
         q = "細かいことは気にしなくていいので、さっきの文字起こしを議事録にまとめて"
         assert find_document(f"[To:999] {q}", recent, q)["files"][0]["file_id"] == 555
+
+
+class TestReplyOpening:
+    """成果物を渡す返信の書き出しが、依頼した側の言い方にならないこと。"""
+
+    @pytest.mark.parametrize(
+        "opening",
+        [
+            "よろしくお願いいたします。",
+            "よろしくお願いします",
+            "お願いいたします。",
+            "ご対応のほどよろしくお願いします。",
+            "お手数ですが、ご確認をお願いします。",
+            "",
+        ],
+    )
+    def test_asking_style_opening_is_replaced(self, tmp_path, opening):
+        client = fake_client(
+            {
+                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "to_lines": ["エムズステップ　南様"], "staff": "足立",
+                "items": [{"name": "倉庫寄託契約書", "qty": "1通"}],
+                "missing": [], "opening": opening,
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        reply, _, _ = runner.run("エムズステップ南様あての送付状を作って")
+        head = reply.split("\n")[0]
+        assert "お願い" not in head  # 依頼を受けた側の返事として噛み合わせる
+        assert head == "承知しました。下書きを作成しました。"
+
+    def test_delivering_opening_is_kept(self, tmp_path):
+        client = fake_client(
+            {
+                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "to_lines": ["エムズステップ　南様"], "staff": "足立",
+                "items": [{"name": "倉庫寄託契約書", "qty": "1通"}],
+                "missing": [],
+                "opening": "エムズステップ　南様あての送付状ですね。倉庫寄託契約書1通で作成しました。",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        reply, _, _ = runner.run("エムズステップ南様あての送付状を作って")
+        assert reply.startswith("エムズステップ　南様あての送付状ですね。")
+
+    def test_ask_back_opening_is_also_guarded(self, tmp_path):
+        client = fake_client(
+            {
+                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "to_lines": [], "staff": "", "items": [],
+                "missing": [], "opening": "よろしくお願いいたします。",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        reply, _, _ = runner.run("送付状を作って")
+        assert not reply.startswith("よろしく")

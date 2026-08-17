@@ -107,6 +107,13 @@ _ATTACHMENT_RE = re.compile(r"\[download:\d+\]")
 # 「送付状お願いします」のような依頼語。ただし疑問形なら質問として扱う
 _REQUEST_RE = re.compile(r"(お願い|ください|下さい|ほしい|欲しい|頼み)")
 _QUESTION_RE = re.compile(r"(ですか|でしょうか|ますか|ますでしょ|[？?]\s*$)")
+# 作った側が使ってはいけない書き出し（依頼する側の言い方）。
+# 「よろしくお願いいたします。」だけを返すと、依頼を受けた返事として噛み合わない
+_ASKING_OPENING_RE = re.compile(
+    r"^(?:[^。\n]*(?:よろしく|宜しく)お願い|お願いいたします|お願いします|"
+    r"ご対応(?:のほど)?|恐れ入りますが|お手数ですが)"
+)
+DEFAULT_OPENING = "承知しました。下書きを作成しました。"
 _CONTRACT_RE = re.compile(r"(契約書|覚書|念書|誓約書|NDA|秘密保持)")
 
 
@@ -160,6 +167,14 @@ SYSTEM_PROMPT = """あなたは株式会社ライズクリエイション経理�
 - 日付の指定がなければ today をそのまま使う
 - 数字・固有名詞は依頼文のまま写す（丸めたり言い換えたりしない）
 
+返信の書き出し（opening）は、**依頼を受けて書類を作り終えた側の言葉**にすること。
+依頼を短く受け止め、作ったことを伝える1〜2文にする。例:
+  「エムズステップ　南様あての送付状ですね。倉庫寄託契約書1通で作成しました。」
+  「承知しました。大塚商会あての送付状、下記のとおり作成しました。」
+**「よろしくお願いいたします」「お願いします」「ご対応ください」「ご確認をお願いします」の
+ような、依頼する側・お願いする側の言い方で書き出してはならない**（依頼したのは相手であり、
+作ったのはこちらのため、会話として噛み合わなくなる）。
+
 宛先の書き方（to_lines）は1行ずつ配列にする。例:
   ["株式会社大塚商会", "大阪南CADグループ", "販売２課　濵野 康一　様"]
 
@@ -211,7 +226,10 @@ _FIELDS_SCHEMA = {
         },
         "opening": {
             "type": "string",
-            "description": "依頼への一言。話し言葉で1〜2文。書類の中身は書かない",
+            "description": (
+                "作り終えたことを伝える書き出し。1〜2文。"
+                "「よろしくお願いいたします」等の依頼する側の言い方は禁止"
+            ),
         },
     },
     "required": ["template_id", "date", "to_lines", "staff", "items", "missing", "opening"],
@@ -439,9 +457,7 @@ class DocBuildRunner:
         return name, out
 
     def _reply(self, fields: dict[str, Any], template: dict[str, Any]) -> str:
-        opening = str(fields.get("opening") or "").strip()
-        if not opening:
-            opening = "承知しました。下書きを作ってお送りしますね。"
+        opening = _delivering_opening(fields.get("opening"))
         assumed = [
             item["name"] for item in fields.get("items") or [] if not item.get("qty")
         ]
@@ -459,7 +475,7 @@ class DocBuildRunner:
 
     @staticmethod
     def _ask_for(opening: str, missing: list[str]) -> str:
-        lead = opening.strip() or "書類の下書き、お作りしますね。"
+        lead = _delivering_opening(opening, "書類の下書き、お作りしますね。")
         items = "\n".join(f"・{m}" for m in missing)
         return (
             f"{lead}\n\n"
@@ -469,7 +485,7 @@ class DocBuildRunner:
 
     @staticmethod
     def _choose_guidance(allowed: list[str], opening: str, missing: list[str]) -> str:
-        lead = opening.strip() or "送付状ですね、お作りします。"
+        lead = _delivering_opening(opening, "送付状ですね、お作りします。")
         names = "\n".join(f"・{TEMPLATES[t]['label']}" for t in allowed)
         text = (
             f"{lead}\n\n"
@@ -482,6 +498,18 @@ class DocBuildRunner:
                 f"・{m}" for m in others
             )
         return text
+
+
+def _delivering_opening(text: Any, default: str = DEFAULT_OPENING) -> str:
+    """依頼を受けた側の書き出しにする。
+
+    「よろしくお願いいたします」のような依頼する側の言い方で始まっていたら、
+    受領・完了を伝える言い方へ置き換える（依頼したのは相手のため噛み合わない）。
+    """
+    opening = str(text or "").strip()
+    if not opening or _ASKING_OPENING_RE.match(opening):
+        return default
+    return opening
 
 
 def _split_honorific(line: str) -> tuple[str, str]:
