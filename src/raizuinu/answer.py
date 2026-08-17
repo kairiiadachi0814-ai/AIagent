@@ -442,7 +442,12 @@ class AnswerGenerator:
         answer.text = _scrub_body_urls(text, handbook)
         answer.has_answer = True
         answer.sources = [
-            {"file": source_file or "", "heading": "", "url": url}
+            {
+                "file": source_file or "",
+                "heading": "",
+                "url": url,
+                "title": _manual_title(source_file, handbook) if source_file else "",
+            }
         ] if source_file else answer.sources
         return answer
 

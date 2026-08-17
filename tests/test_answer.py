@@ -323,7 +323,8 @@ class TestAnswerGenerator:
         assert answer.has_answer
         assert "800万円" in answer.text
         assert answer.sources == [
-            {"file": "会計基礎知識リンク集_freee.md", "heading": "", "url": FREEE_URL}
+            {"file": "会計基礎知識リンク集_freee.md", "heading": "", "url": FREEE_URL,
+             "title": "会計リンク集"}  # 出典欄には内部ファイル名でなく文書名を出す
         ]
         # 2段目にはweb_fetchツールが付き、URLがユーザーメッセージに入る
         assert client.kwargs["tools"][0]["type"] == "web_fetch_20260209"
@@ -352,7 +353,8 @@ class TestAnswerGenerator:
         assert answer.has_answer
         assert "ITツール" in answer.text
         assert answer.sources == [
-            {"file": "補助金リンク集_ミラサポplus.md", "heading": "", "url": MIRASAPO_URL}
+            {"file": "補助金リンク集_ミラサポplus.md", "heading": "", "url": MIRASAPO_URL,
+             "title": "補助金リンク集"}
         ]
         # 2段目のシステム指示には補助金向け免責文（公募要領の確認）が入る
         assert "公募要領" in client.kwargs["system"]
