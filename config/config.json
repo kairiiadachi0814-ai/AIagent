@@ -4,12 +4,20 @@
   "effort": "medium",
   "max_tokens": 16000,
   "context_message_count": 20,
-  "allowed_room_ids": [444781726],
-  "admin_room_id": 444781726,
+  "allowed_room_ids": [
+    384793683,
+    444945031,
+    444781726
+  ],
+  "admin_room_id": 444945031,
   "agent_account_id": null,
   "handbook": {
-    "roots": ["."],
-    "include": ["*.md"],
+    "roots": [
+      "."
+    ],
+    "include": [
+      "*.md"
+    ],
     "exclude": [
       "CLAUDE.md",
       "README.md",
@@ -23,11 +31,17 @@
   "prompt_cache_ttl": "1h",
   "fallback_enabled": false,
   "web_fetch_enabled": true,
-  "web_fetch_allowed_domains": ["www.freee.co.jp", "mirasapo-plus.go.jp", "www.nta.go.jp"],
+  "web_fetch_allowed_domains": [
+    "www.freee.co.jp",
+    "mirasapo-plus.go.jp",
+    "www.nta.go.jp"
+  ],
   "web_fetch_max_uses": 3,
   "web_fetch_max_content_tokens": 30000,
   "legal_enabled": true,
-  "body_url_allowlist": ["https://laws.e-gov.go.jp/"],
+  "body_url_allowlist": [
+    "https://laws.e-gov.go.jp/"
+  ],
   "monthly_cost_limit_jpy": 15000,
   "cost_alert_threshold": 0.7,
   "usd_jpy_rate": 155.0,
@@ -66,10 +80,13 @@
   "webhook_max_queue": 10,
   "discussion_watch": {
     "enabled": true,
-    "room_ids": [444781726],
+    "room_ids": [
+      384793683
+    ],
     "mode": "shadow",
     "max_interventions_per_day": 3,
     "min_message_chars": 10,
-    "max_batch_messages": 30
+    "max_batch_messages": 30,
+    "max_verifications_per_day": 10
   }
 }

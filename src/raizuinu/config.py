@@ -88,6 +88,9 @@ _DEFAULTS: dict[str, Any] = {
         "room_ids": [],
         "mode": "shadow",
         "max_interventions_per_day": 3,
+        # 2段目の裏取りはハンドブック全文を載せるため1回が高い。介入に至らない
+        # 分も消費するので、介入回数とは別に日次の上限を持つ
+        "max_verifications_per_day": 10,
         "min_message_chars": 10,
         "max_batch_messages": 30,
     },

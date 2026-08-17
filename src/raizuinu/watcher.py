@@ -142,10 +142,17 @@ class DiscussionWatcher:
         if state.get("date") != today:
             state["date"] = today
             state["count"] = 0
+            state["verified"] = 0
             state["cited_today"] = []
         if state["count"] >= int(watch.get("max_interventions_per_day", 3)):
             return
         if self._cost.status().over_limit:
+            return
+        # 2段目（ハンドブック全文を載せる裏取り）は1回あたりの費用が大きい。
+        # 介入に至らなくても消費するため、介入回数とは別に日次の上限を持つ
+        max_verifications = int(watch.get("max_verifications_per_day", 10))
+        if int(state.get("verified", 0)) >= max_verifications:
+            self._audit_usage(room_id, "verify_budget_reached", {})
             return
 
         batch = "\n".join(
@@ -161,6 +168,8 @@ class DiscussionWatcher:
             return
 
         # 2段目: ハンドブック・法令で裏取り（Q&Aと同じ検証パイプラインを再利用）
+        state["verified"] = int(state.get("verified", 0)) + 1
+        self._save_state(room_id, state)  # 呼ぶ前に数える（失敗しても消費は起きるため）
         handbook = self._handbook_loader.load()
         answer = self._generator.generate(VERIFY_PROMPT.format(batch=batch), handbook)
         self._cost.add_usage(answer.usage)
