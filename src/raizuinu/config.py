@@ -99,6 +99,7 @@ _DEFAULTS: dict[str, Any] = {
         "unsynced_source": "Googleカレンダー",
         "unsynced_note": "（トヨクモ未反映）",
         "register_note": "",
+        "greeting": "おはようございます。",
     },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {

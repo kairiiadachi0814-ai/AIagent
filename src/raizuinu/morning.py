@@ -67,6 +67,7 @@ class MorningNotifier:
             owner,
             mark_source=str(cfg.get("unsynced_source", "")),
             mark_note=str(cfg.get("unsynced_note", "")),
+            greeting=str(cfg.get("greeting", "")),
         )
         account_id = cfg.get("notify_account_id")
         if account_id:

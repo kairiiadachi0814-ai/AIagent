@@ -322,16 +322,57 @@ def _line(event: Event, mark_source: str = "", mark_note: str = "") -> str:
     return f"・{event.time_label()}　{event.summary}{location}{note}"
 
 
+def morning_lead(target: date, schedule: Schedule, greeting: str = "おはようございます。") -> str:
+    """朝の挨拶と、その日の予定にひとこと触れる導入。
+
+    毎朝同じ文面だと読み飛ばされるため、曜日と予定の入り方で言い方を変える。
+    AIは使わない（毎日のことなので費用を掛けない）。
+    """
+    head = greeting
+    if target.weekday() == 0:
+        head += "今週もよろしくお願いします。"
+    elif target.weekday() == 4:
+        head += "今週もあと1日ですね。"
+
+    events = schedule.events
+    if not events:
+        return head + "\n今日は予定が入っていません。"
+
+    first = events[0]
+    if first.all_day:
+        detail = f"終日の「{first.summary}」があります。"
+    else:
+        detail = f"最初は{first.start.astimezone(JST):%H:%M}からの「{first.summary}」です。"
+
+    if len(events) == 1:
+        if first.all_day:
+            body = f"今日は終日の「{first.summary}」が1件だけです。"
+        else:
+            body = (
+                f"今日は{first.start.astimezone(JST):%H:%M}からの"
+                f"「{first.summary}」1件です。"
+            )
+    elif len(events) >= 4:
+        body = f"今日は{len(events)}件と少し立て込んでいます。{detail}"
+    else:
+        body = f"今日は{len(events)}件です。{detail}"
+    return head + "\n" + body
+
+
 def format_day(
     schedule: Schedule,
     target: date,
     owner: str,
     mark_source: str = "",
     mark_note: str = "",
+    greeting: str = "",
 ) -> str:
     """その日1日の予定をChatworkの本文にする。"""
     heading = f"{target.year}年{target.month}月{target.day}日（{_WEEKDAYS[target.weekday()]}）"
-    lines = [f"[info][title]{owner}さん 本日の予定　{heading}[/title]"]
+    lines = []
+    if greeting:
+        lines += [morning_lead(target, schedule, greeting), ""]
+    lines.append(f"[info][title]{owner}さん 本日の予定　{heading}[/title]")
     if not schedule.events:
         lines.append("登録されている予定はありません。")
     for event in schedule.events:
