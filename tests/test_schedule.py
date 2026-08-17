@@ -411,3 +411,61 @@ class TestIcsSourceSecrecy:
         # URL自体が認証情報なので、メッセージにも監査ログにも出さない
         assert "SECRETTOKEN12345" not in str(exc.value)
         assert "トヨクモ スケジューラー" in str(exc.value)
+
+
+class TestRegisteredReplyTense:
+    """登録済みなのに「これから登録します」と読める返信にしない。"""
+
+    @pytest.mark.parametrize(
+        "opening",
+        [
+            "承知しました。以下の予定を登録します。",
+            "了解です。予定に入れておきます。",
+            "追加しときますね。",
+            "よろしくお願いいたします。",
+            "",
+        ],
+    )
+    def test_future_or_asking_opening_is_replaced(self, tmp_path, monkeypatch, opening):
+        writer = FakeWriter()
+        monkeypatch.setattr("raizuinu.scheduletask.build_writer", lambda cfg: writer)
+        client = fake_client(
+            {
+                "events": [{"summary": "面談", "date": "2026-08-26", "start_time": "15:00",
+                            "end_time": "16:30", "all_day": False, "location": ""}],
+                "missing": [], "opening": opening,
+            }
+        )
+        runner = ScheduleRunner(make_config(tmp_path), client=client)
+        reply, _, _ = runner.register("来週水曜15時から面談を入れて")
+        head = reply.split("\n")[0]
+        assert head == "承知しました。次の予定で登録しました。"
+
+    def test_past_tense_opening_is_kept(self, tmp_path, monkeypatch):
+        writer = FakeWriter()
+        monkeypatch.setattr("raizuinu.scheduletask.build_writer", lambda cfg: writer)
+        client = fake_client(
+            {
+                "events": [{"summary": "面談", "date": "2026-08-26", "start_time": "15:00",
+                            "end_time": "16:30", "all_day": False, "location": ""}],
+                "missing": [], "opening": "南都銀行との面談ですね。登録しました。",
+            }
+        )
+        runner = ScheduleRunner(make_config(tmp_path), client=client)
+        reply, _, _ = runner.register("来週水曜15時から面談を入れて")
+        assert reply.startswith("南都銀行との面談ですね。登録しました。")
+
+    def test_completion_is_stated_by_code_not_the_model(self, tmp_path, monkeypatch):
+        writer = FakeWriter()
+        monkeypatch.setattr("raizuinu.scheduletask.build_writer", lambda cfg: writer)
+        client = fake_client(
+            {
+                "events": [{"summary": "面談", "date": "2026-08-26", "start_time": "15:00",
+                            "end_time": "16:30", "all_day": False, "location": ""}],
+                "missing": [], "opening": "南都銀行との面談ですね。",
+            }
+        )
+        runner = ScheduleRunner(make_config(tmp_path), client=client)
+        reply, _, _ = runner.register("来週水曜15時から面談を入れて")
+        # 「登録した」という事実は文面任せにしない
+        assert "上記で登録しました。" in reply

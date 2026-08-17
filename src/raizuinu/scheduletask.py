@@ -134,8 +134,9 @@ SYSTEM_PROMPT = """あなたは株式会社ライズクリエイション経理�
 - 終了時刻の指定が無ければ end_time は空文字にする（こちらで1時間を仮置きする）
 - 時刻の指定が無く「終日」「1日」の意味なら all_day を true にする
 - 件名は依頼文の言い方をそのまま使う（言い換えない）
-- opening は、依頼を受けて登録した側の一言にする。「よろしくお願いします」のような
-  依頼する側の言い方は使わない
+- opening は、**登録し終えた側**の一言にする。「登録します」「入れておきます」のような
+  これからやる言い方や、「よろしくお願いします」のような依頼する側の言い方は使わない
+  （実際にはこの返信の時点で登録は完了している）
 """
 
 
@@ -328,10 +329,7 @@ class ScheduleRunner:
         )
 
     def _registered_reply(self, fields: dict[str, Any], events: list[Event]) -> str:
-        lead = str(fields.get("opening") or "").strip()
-        if not lead or re.match(r"^([^。\n]*よろしくお願い|お願いし)", lead):
-            lead = "承知しました。次の予定で登録しました。"
-        lines = [lead, ""]
+        lines = [_done_opening(fields.get("opening")), ""]
         for event in events:
             day = event.start.astimezone(JST)
             weekday = "月火水木金土日"[day.weekday()]
@@ -341,8 +339,30 @@ class ScheduleRunner:
                 f"{event.summary}{location}"
             )
         lines.append("")
-        lines.append("違っていたら「さっきの予定を取り消して」とお知らせください。")
+        # 「登録した」という事実はモデルの文面任せにせず、こちらで必ず書く
+        lines.append("上記で登録しました。違っていたら「さっきの予定を取り消して」とお知らせください。")
         return "\n".join(lines)
+
+
+# 「登録します」のような、これからやる言い方。返信の時点では登録済みなので使わせない
+_FUTURE_OPENING_RE = re.compile(
+    r"(登録|入れ|追加|押さえ|控え)[^。\n]{0,6}"
+    r"(します|いたします|ますね|ておきます|ときます|しておく|しとく)"
+)
+_ASKING_OPENING_RE = re.compile(r"^[^。\n]*(よろしくお願い|お願いし|ご対応)")
+DONE_OPENING = "承知しました。次の予定で登録しました。"
+
+
+def _done_opening(text: Any) -> str:
+    """登録し終えた側の書き出しにする。
+
+    「これから登録します」と読める文面だと、確認待ちだと誤解される。
+    実際にはこの返信を出す時点で登録は完了している。
+    """
+    opening = str(text or "").strip()
+    if not opening or _FUTURE_OPENING_RE.search(opening) or _ASKING_OPENING_RE.match(opening):
+        return DONE_OPENING
+    return opening
 
 
 def _combine(day: date, hhmm: str) -> datetime:
