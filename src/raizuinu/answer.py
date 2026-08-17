@@ -422,8 +422,10 @@ class AnswerGenerator:
                 "",
             )
             if not url:
-                # 本文にもURLが無い場合、制度名からリンク集を直接引く
+                # 本文にもURLが無い場合、制度名・税目からリンク集を直接引く
                 url = _lookup_program_url(question, handbook, allowed_hosts)
+            if not url:
+                url = _lookup_tax_url(question, handbook, allowed_hosts)
             if not url:
                 return answer
             answer.reference_url = url
@@ -845,6 +847,39 @@ def _lookup_manual_url(file_name: str, handbook: Handbook) -> str:
 # 質問文に現れる制度名（例: ものづくり補助金・業務改善助成金）。
 # 「補助金について教えて」のような総覧質問は拾わないよう、前に2文字以上を要求する
 _PROGRAM_NAME_RE = re.compile(r"[^\s　（(）)「」：:｜|、。,.]{2,20}?(?:補助金|助成金|給付金)")
+
+
+# 税法の頻出テーマ → 税法リンク集の見出し（部分一致）。URLはリンク集側を正とし、
+# ページが移転してもmdの更新だけで追従できるようにする
+_TAX_TOPIC_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("収入印紙", "印紙税", "印紙"), "印紙税額の一覧表（その1）"),
+    (("源泉徴収", "源泉税"), "源泉徴収が必要な報酬・料金等"),
+    (("インボイス", "適格請求書"), "適格請求書等保存方式（インボイス制度）"),
+    (("交際費",), "交際費等の範囲と損金不算入額の計算"),
+)
+
+
+def _lookup_tax_url(question: str, handbook: Handbook, allowed_hosts: set[str]) -> str:
+    """税法の頻出テーマから国税庁ページを引く（見出しの部分一致で一意なもののみ）。
+
+    税額はモデルの記憶で答えさせないため、参考URLの取りこぼしを機械的に補う。
+    """
+    target = next(
+        (title for keys, title in _TAX_TOPIC_HINTS if any(k in question for k in keys)),
+        "",
+    )
+    if not target:
+        return ""
+    for f in handbook.files:
+        if "税法リンク集" not in f.name:
+            continue
+        for line in f.content.splitlines():
+            if target not in line:
+                continue
+            match = _URL_RE.search(line)
+            if match and _fetchable_reference(match.group(0), allowed_hosts, handbook):
+                return match.group(0)
+    return ""
 
 
 def _lookup_program_url(

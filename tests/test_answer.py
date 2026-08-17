@@ -755,6 +755,50 @@ class TestAnswerGenerator:
         assert _lookup_program_url("キャリアアップ助成金の要件は？", handbook, hosts) == ""
         assert _lookup_program_url("経費精算の締め日は？", handbook, hosts) == ""
 
+    def test_tax_topic_lookup(self, tmp_path):
+        from raizuinu.answer import _lookup_tax_url
+
+        inshi = "https://www.nta.go.jp/taxes/shiraberu/taxanswer/inshi/7140.htm"
+        gensen = "https://www.nta.go.jp/taxes/shiraberu/taxanswer/gensen/2792.htm"
+        (tmp_path / "税法リンク集_国税庁.md").write_text(
+            "# 税法リンク集\n"
+            f"| No.7140 印紙税額の一覧表（その1）第1号文書から第4号文書まで | 印紙額 | {inshi} |\n"
+            f"| No.2792 源泉徴収が必要な報酬・料金等とは | 源泉 | {gensen} |\n",
+            encoding="utf-8",
+        )
+        handbook = HandbookLoader([tmp_path], ["*.md"], [], 300).load()
+        hosts = {"www.nta.go.jp"}
+        assert _lookup_tax_url("収入印紙はいくら？", handbook, hosts) == inshi
+        assert _lookup_tax_url("源泉徴収の税率は？", handbook, hosts) == gensen
+        # 税法と無関係な質問では引かない
+        assert _lookup_tax_url("経費精算の締め日は？", handbook, hosts) == ""
+        # 許可ドメイン外の設定なら取得しない
+        assert _lookup_tax_url("収入印紙はいくら？", handbook, {"www.freee.co.jp"}) == ""
+
+    def test_tax_question_falls_back_to_link_collection(self, tmp_path):
+        # モデルが参考URLを埋め忘れても、税額の質問では必ず国税庁ページを取得する
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["web_fetch_enabled"] = True
+        config.data["web_fetch_allowed_domains"] = ["www.nta.go.jp"]
+        stage1 = {
+            "intent": "general_knowledge",
+            "reference_url": "",
+            "has_answer": True,
+            "answer": "文書の種類によって変わります。※一般的な制度知識としての説明です。",
+            "sources": [],
+            "suggested_file": "",
+            "reported_manuals": [],
+        }
+        client = FakeClient(
+            [fake_response(stage1), self._stage2_response("500万円の請負契約書は2千円です。※")]
+        )
+        gen = AnswerGenerator(config, client=client)
+        answer = gen.generate("収入印紙は請負契約書500万円だといくら？", handbook)
+        assert client.calls == 2
+        assert answer.reference_url == NTA_URL
+        assert "2千円" in answer.text
+
     def test_junk_tool_keywords_rejected(self):
         from raizuinu.answer import _is_placeholder_value
 
