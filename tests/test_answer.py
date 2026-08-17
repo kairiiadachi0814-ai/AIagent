@@ -9,6 +9,7 @@ from raizuinu.handbook import HandbookLoader
 REAL_URL = "https://docs.google.com/document/d/abc123/edit"
 FREEE_URL = "https://www.freee.co.jp/kb/kb-accounting/entertainment-expenses/"
 MIRASAPO_URL = "https://mirasapo-plus.go.jp/subsidy/ithojo/"
+NTA_URL = "https://www.nta.go.jp/taxes/shiraberu/taxanswer/inshi/7140.htm"
 
 
 def make_handbook(tmp_path):
@@ -21,6 +22,9 @@ def make_handbook(tmp_path):
     )
     (tmp_path / "補助金リンク集_ミラサポplus.md").write_text(
         f"# 補助金リンク集\n- デジタル化・AI導入補助金: {MIRASAPO_URL}\n", encoding="utf-8"
+    )
+    (tmp_path / "税法リンク集_国税庁.md").write_text(
+        f"# 税法リンク集\n| No.7140 印紙税額の一覧表（その1） | {NTA_URL} |\n", encoding="utf-8"
     )
     return HandbookLoader([tmp_path], ["*.md"], [], 300).load()
 
@@ -362,6 +366,36 @@ class TestAnswerGenerator:
         assert "税理士" in _disclaimer_for_url("")  # 不明時は従来の免責文
         # 偽装ドメインはミラサポ扱いにしない
         assert "税理士" in _disclaimer_for_url("https://mirasapo-plus.go.jp.evil.com/x/")
+        # 国税庁は専用の免責文
+        nta = _disclaimer_for_url(NTA_URL)
+        assert "国税庁の掲載情報" in nta
+        assert "税理士" in nta
+        assert "国税庁" not in _disclaimer_for_url("https://www.nta.go.jp.evil.com/x/")
+
+    def test_tax_page_summary_prompt_demands_exact_amounts(self, tmp_path):
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["web_fetch_enabled"] = True
+        config.data["web_fetch_allowed_domains"] = ["www.nta.go.jp"]
+        stage1 = {
+            "intent": "general_knowledge",
+            "reference_url": NTA_URL,
+            "has_answer": False,
+            "answer": f"参考: {NTA_URL}",
+            "sources": [],
+            "suggested_file": "",
+            "reported_manuals": [],
+        }
+        client = FakeClient(
+            [fake_response(stage1), self._stage2_response("200円です。※国税庁の掲載情報に基づきます。")]
+        )
+        gen = AnswerGenerator(config, client=client)
+        answer = gen.generate("請負契約書100万円の印紙はいくら？", handbook)
+        assert client.calls == 2
+        system = client.kwargs["system"]
+        assert "金額の帯" in system  # 該当区分が分かるように書かせる
+        assert "丸めたり概算にしたりしない" in system
+        assert answer.sources[0]["file"] == "税法リンク集_国税庁.md"
 
     def test_subsidy_stage2_prompt_requires_acceptance_status(self, tmp_path):
         handbook = make_handbook(tmp_path)
