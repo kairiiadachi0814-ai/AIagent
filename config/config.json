@@ -93,7 +93,7 @@
     6945415
   ],
   "schedule": {
-    "enabled": false,
+    "enabled": true,
     "owner_name": "足立",
     "notify_room_id": 384793683,
     "notify_account_id": 6945415,
