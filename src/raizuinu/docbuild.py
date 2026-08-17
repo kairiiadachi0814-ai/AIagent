@@ -267,6 +267,9 @@ class DocBuildRunner:
 
         fields, usage = self._extract(instruction, context, requester_name)
         _normalize(fields)  # 空白だけの宛先・品名を捨ててから不足判定にかける
+        # 差出人の担当者は、依頼文に指定がなければ依頼者の苗字にする。
+        # モデルがフルネームを返した場合もここで苗字へ落とす
+        fields["staff"] = surname(fields.get("staff") or requester_name)
         meta["fields"] = {k: v for k, v in fields.items() if k != "opening"}
 
         template_id = str(fields.get("template_id") or "")
@@ -330,7 +333,9 @@ class DocBuildRunner:
         ]
         if requester_name:
             parts.append(
-                f"依頼者: {requester_name}（差出人の担当者名が依頼文になければこの姓を使う）"
+                f"依頼者の姓: {surname(requester_name)}"
+                "（差出人の担当者名は、依頼文に別の指定がなければこの姓にする。"
+                "staffには姓だけを入れ、フルネームや敬称は付けない）"
             )
         directory = self._fax_directory()
         if directory:
@@ -498,6 +503,34 @@ class DocBuildRunner:
                 f"・{m}" for m in others
             )
         return text
+
+
+# 表示名に書き足されがちな装飾（「足立 海里　資料作成集中（急ぎ案件のみ対応可）※土日休」）
+_NAME_NOISE_RE = re.compile(r"[（(【\[<].*?[）)】\]>]|[※≪＜].*$|[／/|｜].*$")
+_NAME_SUFFIX_RE = re.compile(r"(さん|様|氏|くん|ちゃん)$")
+# 「経理財務部 足立」のように部署が先に来る表示名では、次の語を苗字とみなす。
+# 「阿部」「服部」「渡部」を部署と誤らないよう、3文字以上のときだけ部署扱いにする
+_ORG_WORD_RE = re.compile(r"..(部|課|係|室|支店|チーム|グループ)$|(株式会社|有限会社|合同会社)")
+
+
+def surname(display_name: str) -> str:
+    """Chatworkの表示名から苗字を取り出す。
+
+    表示名には勤務状況などが書き足されていることがあるため、装飾を落として
+    から先頭の語を取る。区切りが無い場合（「足立海里」等）は、誤って途中で
+    切るより名前全体を残すほうが安全なのでそのまま返す。
+    """
+    name = unicodedata.normalize("NFKC", str(display_name or ""))
+    name = _NAME_NOISE_RE.sub("", name).strip()
+    if not name:
+        return ""
+    parts = [p for p in re.split(r"[\s,、･・]+", name) if p]
+    if not parts:
+        return ""
+    head = parts[0]
+    if len(parts) > 1 and _ORG_WORD_RE.search(head):
+        head = parts[1]
+    return _NAME_SUFFIX_RE.sub("", head)
 
 
 def _delivering_opening(text: Any, default: str = DEFAULT_OPENING) -> str:

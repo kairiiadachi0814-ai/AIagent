@@ -594,3 +594,69 @@ class TestReplyOpening:
         runner = DocBuildRunner(make_config(tmp_path), client=client)
         reply, _, _ = runner.run("送付状を作って")
         assert not reply.startswith("よろしく")
+
+
+class TestSenderStaff:
+    """差出人の担当者は、Chatworkで依頼してきた人の苗字にする。"""
+
+    @pytest.mark.parametrize(
+        "display_name,expected",
+        [
+            ("足立 海里", "足立"),
+            ("足立　海里", "足立"),
+            ("足立 海里　資料作成集中（急ぎ案件のみ対応可）※土日休", "足立"),  # 状況書きを落とす
+            ("足立(経理)", "足立"),
+            ("足立さん", "足立"),
+            ("経理財務部 足立", "足立"),  # 部署が先に来る表示名
+            ("株式会社ライズクリエイション 足立", "足立"),
+            ("阿部 太郎", "阿部"),  # 「部」で終わる苗字を部署と誤らない
+            ("服部 花子", "服部"),
+            ("足立海里", "足立海里"),  # 区切りが無ければ切らない（誤った苗字より安全）
+            ("", ""),
+        ],
+    )
+    def test_surname_extraction(self, display_name, expected):
+        from raizuinu.docbuild import surname
+
+        assert surname(display_name) == expected
+
+    def test_requester_surname_fills_the_staff_field(self, tmp_path):
+        client = fake_client(
+            {
+                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "to_lines": ["株式会社A"], "staff": "", "items": [{"name": "契約書", "qty": "1部"}],
+                "missing": [], "opening": "作成しました。",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        _, meta, _ = runner.run(
+            "株式会社Aあての送付状を作って", requester_name="足立 海里　※土日休"
+        )
+        assert "担当： 経理財務部　足立" in "".join(docx_texts(meta["artifact"][1]))
+
+    def test_full_name_from_the_model_is_reduced_to_surname(self, tmp_path):
+        client = fake_client(
+            {
+                "template_id": "FAX送付状", "date": "", "to_lines": ["株式会社A"],
+                "staff": "足立 海里", "items": [], "subject": "件名",
+                "missing": [], "opening": "作成しました。",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        _, meta, _ = runner.run("株式会社AあてのFAX送付状を作って", requester_name="足立 海里")
+        openpyxl = pytest.importorskip("openpyxl")
+        ws = openpyxl.load_workbook(io.BytesIO(meta["artifact"][1]))["汎用"]
+        assert ws["O12"].value == "足立"
+
+    def test_explicit_staff_in_the_request_wins(self, tmp_path):
+        client = fake_client(
+            {
+                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "to_lines": ["株式会社A"], "staff": "坂田",
+                "items": [{"name": "契約書", "qty": "1部"}],
+                "missing": [], "opening": "作成しました。",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        _, meta, _ = runner.run("担当は坂田で送付状を作って", requester_name="足立 海里")
+        assert "担当： 経理財務部　坂田" in "".join(docx_texts(meta["artifact"][1]))
