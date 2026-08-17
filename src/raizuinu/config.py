@@ -61,6 +61,9 @@ _DEFAULTS: dict[str, Any] = {
     "doc_task": {
         "enabled": False,
         "max_file_mb": 20,
+        # PDFはbase64化で約1.33倍になるため、APIの32MB上限に収まる範囲に抑える
+        "max_pdf_mb": 15,
+        "max_pdf_pages": 50,
         "max_text_chars": 120000,
         # 「さっきのファイル」を探すときだけ、文脈用より広くメッセージを遡る
         "search_message_count": 60,

@@ -44,6 +44,8 @@
   "doc_task": {
     "enabled": true,
     "max_file_mb": 20,
+    "max_pdf_mb": 15,
+    "max_pdf_pages": 50,
     "max_text_chars": 120000,
     "search_message_count": 60
   },

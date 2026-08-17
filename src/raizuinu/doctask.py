@@ -15,6 +15,7 @@ Googleドキュメント／スプレッドシートのURLを貼ってメンシ�
 
 from __future__ import annotations
 
+import base64
 import html
 import io
 import re
@@ -34,7 +35,10 @@ _GOOGLE_URL_RE = re.compile(
 )
 _GID_RE = re.compile(r"[?#&]gid=(\d+)")
 
-_SUPPORTED_EXTS = (".docx", ".txt", ".md", ".csv", ".tsv", ".log")
+_SUPPORTED_EXTS = (".docx", ".txt", ".md", ".csv", ".tsv", ".log", ".pdf")
+# PDFはテキスト抽出せずClaudeへ直接渡す（スキャン画像のPDFも読める）。
+# ページ数は本文から概算する（圧縮PDFでは数えられないことがあるため0は不明扱い）
+_PDF_PAGE_RE = re.compile(rb"/Type\s*/Page[^s]")
 _MAX_FILES_PER_TASK = 5
 _URL_RE = re.compile(r"https?://[^\s<>\"|）)。、]+")
 
@@ -148,9 +152,9 @@ def _document_in_text(text: str) -> dict[str, Any] | None:
 NO_DOCUMENT_GUIDANCE = (
     "すみません、直近のやり取りの中に読み取れる添付ファイルが見つかりませんでした。\n"
     "お手数ですが、次のいずれかでもう一度お声がけいただけますか。\n"
-    "・ファイル（.docx／.txt など）を添付したメッセージの中で、私宛にメンションして依頼する\n"
+    "・ファイル（PDF／.docx／.txt など）を添付したメッセージの中で、私宛にメンションして依頼する\n"
     "・GoogleドキュメントやスプレッドシートのURLを、依頼のメッセージに貼り付ける\n"
-    "（旧形式の .doc やPDFは読み取れないため、Wordで .docx として保存し直してください）"
+    "（旧形式の .doc は読み取れないため、Wordで .docx として保存し直してください）"
 )
 
 
@@ -278,7 +282,7 @@ def extract_docx_text(data: bytes) -> str:
     except (zipfile.BadZipFile, KeyError) as exc:
         raise DocumentTaskError(
             "すみません、Wordファイルをうまく開けませんでした。"
-            "お手数ですが .docx 形式で保存し直して、もう一度お試しいただけますか。"
+            "お手数ですが .docx 形式（またはPDF）で保存し直して、もう一度お試しいただけますか。"
         ) from exc
     # 変更履歴で削除されたテキストを本文に混ぜない（旧金額・旧決定事項の復活防止）。
     # 自己完結タグ（<w:del …/>）を先に消さないと、ペア形の除去が生きた本文を巻き込む
@@ -327,6 +331,8 @@ class DocTaskRunner:
             client = anthropic.Anthropic()
         self._client = client
         self._http_get = http_get or _default_http_get
+        self._pdfs: list[tuple[str, bytes]] = []  # 依頼ごとに run() で初期化する
+        self._pdf_pages: list[int] = []
 
     def run(
         self, instruction: str, document: dict[str, Any], room_id: int
@@ -336,13 +342,15 @@ class DocTaskRunner:
         文書を取得できない場合も、利用者向けの案内文を返信本文として返す。
         """
         meta: dict[str, Any] = {"document": document}
+        self._pdfs: list[tuple[str, bytes]] = []  # この依頼で読み込んだPDF
+        self._pdf_pages: list[int] = []
         if document.get("kind") == "unsupported_file":
             names = "、".join(f"「{e['filename']}」" for e in document.get("files", [])[:3])
             meta["error"] = "unsupported"
             return (
                 f"すみません、{names}の形式には今のところ対応していません。"
-                "Wordファイル（.docx）またはテキストファイル（.txt など）でお願いします。"
-                "旧形式の .doc やPDFの場合は、Wordで .docx として保存し直していただけると読み込めます。"
+                "PDF・Wordファイル（.docx）・テキストファイル（.txt など）でお願いします。"
+                "旧形式の .doc の場合は、Wordで .docx として保存し直していただけると読み込めます。"
             ), meta, {}
         try:
             text, label, notes = self._load_document(document, room_id)
@@ -355,7 +363,9 @@ class DocTaskRunner:
         if truncated:
             text = text[:max_chars]
             meta["truncated"] = True
-        if not text.strip():
+        if self._pdfs:
+            meta["pdf_files"] = [name for name, _ in self._pdfs]
+        if not text.strip() and not self._pdfs:
             meta["error"] = "empty"
             return (
                 f"「{label}」を開いてみたのですが、中身のテキストを読み取れませんでした。"
@@ -384,7 +394,8 @@ class DocTaskRunner:
         for entry in document.get("files", []):
             text, filename = self._load_one_file(int(entry["file_id"]), room_id)
             labels.append(filename)
-            parts.append(f"■ファイル「{filename}」\n{text}")
+            if text:  # PDFは本文を持たず self._pdfs に積まれる
+                parts.append(f"■ファイル「{filename}」\n{text}")
         notes = []
         total = int(document.get("total_files", len(labels)))
         if total > len(labels):
@@ -393,6 +404,36 @@ class DocTaskRunner:
                 "残りは分けてご依頼ください。"
             )
         return "\n\n".join(parts), "、".join(labels), notes
+
+    def _load_pdf(self, data: bytes, filename: str) -> str:
+        """PDFを検査してClaudeへ渡す候補に積む（本文テキストは返さない）。"""
+        cfg = self._config.doc_task
+        # 複数添付もまとめて1リクエストで送るため、上限は常に合計で判定する
+        max_mb = float(cfg.get("max_pdf_mb", 15))
+        total_bytes = sum(len(d) for _, d in self._pdfs) + len(data)
+        if total_bytes > max_mb * 1024 * 1024:
+            over = "PDFの合計サイズが" if self._pdfs else f"「{filename}」は"
+            raise DocumentTaskError(
+                f"{over}{max_mb:.0f}MBを超えているため読み込めませんでした。"
+                "ページを分けるか、必要な部分だけのPDFにしてお試しいただけますか。"
+            )
+        if not data.startswith(b"%PDF"):
+            raise DocumentTaskError(
+                f"「{filename}」はPDFとして読み取れませんでした。"
+                "ファイルが壊れていないかご確認いただけますか。"
+            )
+        pages = len(_PDF_PAGE_RE.findall(data))
+        max_pages = int(cfg.get("max_pdf_pages", 50))
+        total_pages = sum(self._pdf_pages) + pages
+        if total_pages > max_pages:  # 0件は「数えられなかった」ため加算されない
+            over = "PDFの合計が" if self._pdfs else f"「{filename}」は{pages}ページあり、"
+            raise DocumentTaskError(
+                f"{over}一度に読み込める{max_pages}ページを超えています。"
+                "対象の章や条項だけを抜き出したPDFでお試しいただけますか。"
+            )
+        self._pdf_pages.append(pages)
+        self._pdfs.append((filename, data))
+        return ""
 
     def _load_one_file(self, file_id: int, room_id: int) -> tuple[str, str]:
         try:
@@ -416,13 +457,15 @@ class DocTaskRunner:
                 "もう一度アップロードしてお試しいただけますか。"
             )
         lower = filename.lower()
+        if lower.endswith(".pdf"):
+            return self._load_pdf(data, filename), filename
         if lower.endswith(".docx"):
             return extract_docx_text(data), filename
         if lower.endswith((".txt", ".md", ".csv", ".tsv", ".log")):
             return decode_text(data), filename
         raise DocumentTaskError(
             f"「{filename}」の形式には今のところ対応していません。"
-            "Wordファイル（.docx）またはテキストファイル（.txt など）でお願いします。"
+            "PDF・Wordファイル（.docx）・テキストファイル（.txt など）でお願いします。"
         )
 
     def _load_google_doc(self, document: dict[str, Any]) -> tuple[str, str, list[str]]:
@@ -472,8 +515,12 @@ class DocTaskRunner:
         system = SYSTEM_PROMPT.format(agent_name=cfg.agent_name)
         user_parts = [f"依頼: {instruction}", note]
 
-        # 契約書の場合は要点の構成を指定し、法的な妥当性判断は行わせない
-        if looks_like_contract(text):
+        # 契約書の場合は要点の構成を指定し、法的な妥当性判断は行わせない。
+        # PDFは本文を持たないため、ファイル名・依頼文からも契約書らしさを判定する
+        contract_hint = label + " " + instruction
+        if looks_like_contract(text) or (
+            self._pdfs and any(k in contract_hint for k in ("契約", "覚書", "注文請書", "印紙"))
+        ):
             system += "\n" + CONTRACT_NOTE
 
         kwargs: dict[str, Any] = {
@@ -502,8 +549,31 @@ class DocTaskRunner:
                 }
             ]
         kwargs["system"] = system
-        user_parts.append(f"===文書「{label}」ここから===\n{text}\n===文書ここまで===")
-        messages = [{"role": "user", "content": "\n".join(p for p in user_parts if p)}]
+        if text.strip():
+            user_parts.append(f"===文書「{label}」ここから===\n{text}\n===文書ここまで===")
+        if self._pdfs:
+            names = "、".join(f"「{name}」" for name, _ in self._pdfs)
+            user_parts.append(f"（{names}のPDFは、このメッセージの前半に添付しています）")
+        content: list[dict[str, Any]] = []
+        for index, (filename, data) in enumerate(self._pdfs):
+            # PDFはテキスト抽出せず原本のまま渡す（スキャン画像のPDFも読み取れる）。
+            # documentブロックはテキストより前に置く
+            block: dict[str, Any] = {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": base64.standard_b64encode(data).decode("ascii"),
+                },
+                "title": filename,
+            }
+            # web_fetchを使う依頼は推論が複数回まわり、そのたびPDF全体が入力に乗る。
+            # 最後のPDFにキャッシュ印を付け、2回目以降を1/10の単価で読ませる
+            if stamp_urls and index == len(self._pdfs) - 1:
+                block["cache_control"] = {"type": "ephemeral"}
+            content.append(block)
+        content.append({"type": "text", "text": "\n".join(p for p in user_parts if p)})
+        messages = [{"role": "user", "content": content}]
         response, usage, _ = _call_with_continuation(
             self._client.messages.create, kwargs, messages
         )
