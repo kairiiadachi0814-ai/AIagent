@@ -224,7 +224,13 @@ class DocBuildRunner:
         allowed = self._allowed_templates()
         if template_id not in allowed:
             meta["error"] = "template_not_found"
-            return self._choose_guidance(allowed), meta, usage
+            return (
+                self._choose_guidance(
+                    allowed, fields.get("opening", ""), fields.get("missing") or []
+                ),
+                meta,
+                usage,
+            )
 
         template = TEMPLATES[template_id]
         meta["template"] = template_id
@@ -413,12 +419,20 @@ class DocBuildRunner:
         )
 
     @staticmethod
-    def _choose_guidance(allowed: list[str]) -> str:
+    def _choose_guidance(allowed: list[str], opening: str, missing: list[str]) -> str:
+        lead = opening.strip() or "送付状ですね、お作りします。"
         names = "\n".join(f"・{TEMPLATES[t]['label']}" for t in allowed)
-        return (
+        text = (
+            f"{lead}\n\n"
             "どのひな形で作るか決めきれませんでした。次のどれかを指定していただけますか。\n"
             f"{names}"
         )
+        others = [str(m) for m in missing if str(m).strip()]
+        if others:
+            text += "\n\nあわせて、これも教えていただけると一度で作れます。\n" + "\n".join(
+                f"・{m}" for m in others
+            )
+        return text
 
 
 def _safe_name(text: str) -> str:

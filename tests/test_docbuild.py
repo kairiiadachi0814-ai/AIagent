@@ -257,8 +257,8 @@ class TestMultipart:
         body, content_type = _multipart("書類送付状_南都銀行.docx", b"data", "本文です")
         assert content_type.startswith("multipart/form-data; boundary=")
         text = body.decode("utf-8", "replace")
-        assert "filename*=UTF-8''%E6%9B%B8%E9%A1%9E" in text  # 日本語名の文字化け対策
-        assert 'filename="' in text  # ASCII代替名も併記
+        assert "filename*=UTF-8''%E6%9B%B8%E9%A1%9E" in text  # RFC 5987の書き方
+        assert 'filename="書類送付状_南都銀行.docx"' in text  # 生UTF-8も併記（どちらの解釈でも読める）
         assert 'name="message"' in text and "本文です" in text
         assert body.endswith(b"--\r\n")
 

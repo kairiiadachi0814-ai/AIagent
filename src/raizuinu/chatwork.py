@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Any
 from urllib.parse import quote
@@ -111,12 +112,13 @@ class ChatworkClient:
 def _multipart(filename: str, data: bytes, message: str) -> tuple[bytes, str]:
     """multipart/form-dataの本文を自前で組む。
 
-    requestsのfiles=に任せると filename* が付かず、日本語ファイル名が
-    Chatwork側で文字化けする。ASCIIの代替名と filename*=UTF-8'' の両方を
-    書いて、どちらの解釈でも読めるようにする。
+    filename には生のUTF-8をそのまま書き（HTML5の流儀。requestsと同じ）、
+    加えて filename*=UTF-8'' も併記する（RFC 5987の流儀）。どちらの解釈でも
+    同じ名前が読めるようにして、日本語ファイル名の文字化けを避ける。
     """
     boundary = uuid.uuid4().hex
-    ascii_name = filename.encode("ascii", "replace").decode("ascii").replace("?", "_")
+    # ダブルクォートと改行はヘッダを壊すので落とす
+    safe_name = re.sub(r'[",\r\n]', "_", filename) or "document"
     parts: list[bytes] = []
     if message:
         parts += [
@@ -127,7 +129,7 @@ def _multipart(filename: str, data: bytes, message: str) -> tuple[bytes, str]:
     parts += [
         (
             f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="file"; filename="{ascii_name}"; '
+            f'Content-Disposition: form-data; name="file"; filename="{safe_name}"; '
             f"filename*=UTF-8''{quote(filename)}\r\n"
             "Content-Type: application/octet-stream\r\n\r\n"
         ).encode(),
