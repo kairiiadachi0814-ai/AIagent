@@ -45,6 +45,18 @@ class Event:
     location: str = ""
     source: str = ""
 
+    def __post_init__(self) -> None:
+        # カレンダー側で「00:00〜23:45」のように入れられた終日相当の予定は、
+        # 時刻付きでも終日として扱う（「最初は0時からの…」と読ませないため）
+        if not self.all_day:
+            start = self.start.astimezone(JST)
+            if (
+                start.hour == 0
+                and start.minute == 0
+                and self.end - self.start >= timedelta(hours=20)
+            ):
+                self.all_day = True
+
     def key(self) -> tuple[str, str, str]:
         """重複判定のキー。2つのカレンダーに同じ予定が出るため使う。"""
         return (
@@ -337,13 +349,13 @@ def morning_lead(target: date, schedule: Schedule, greeting: str = "おはよう
     """
     head = greeting
     if target.weekday() == 0:
-        head += "今週もよろしくお願いいたします。"
+        head += "今週もよろしくお願いします。"
     elif target.weekday() == 4:
-        head += "今週も残り1日となりました。"
+        head += "今週も残り1日です。"
 
     events = schedule.events
     if not events:
-        return head + "\n本日のご予定は入っておりません。"
+        return head + "\n今日は予定が入っていません。"
 
     first = events[0]
     if first.all_day:
@@ -353,16 +365,16 @@ def morning_lead(target: date, schedule: Schedule, greeting: str = "おはよう
 
     if len(events) == 1:
         if first.all_day:
-            body = f"本日のご予定は、終日の「{first.summary}」1件です。"
+            body = f"今日の予定は、終日の「{first.summary}」1件です。"
         else:
             body = (
-                f"本日のご予定は、{_jp_time(first.start)}からの"
+                f"今日の予定は、{_jp_time(first.start)}からの"
                 f"「{first.summary}」1件です。"
             )
     elif len(events) >= 4:
-        body = f"本日のご予定は{len(events)}件、少し立て込んでおります。{detail}"
+        body = f"今日の予定は{len(events)}件、少し立て込んでいます。{detail}"
     else:
-        body = f"本日のご予定は{len(events)}件です。{detail}"
+        body = f"今日の予定は{len(events)}件です。{detail}"
     return head + "\n" + body
 
 
@@ -379,16 +391,16 @@ def format_day(
     lines = []
     if greeting:
         lines += [morning_lead(target, schedule, greeting), ""]
-    lines.append(f"[info][title]{owner}さん 本日のご予定　{heading}[/title]")
+    lines.append(f"[info][title]{owner}さん 今日の予定　{heading}[/title]")
     if not schedule.events:
-        lines.append("ご予定は入っておりません。")
+        lines.append("予定は入っていません。")
     for event in schedule.events:
         lines.append(_line(event, mark_source, mark_note))
     if schedule.failed_sources:
         lines.append("")
         lines.append(
             "※" + "、".join(schedule.failed_sources) + "を読み取れませんでした。"
-            "抜けているご予定があるかもしれません。"
+            "抜けている予定があるかもしれません。"
         )
     lines.append("[/info]")
     return "\n".join(lines)
