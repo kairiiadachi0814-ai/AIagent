@@ -463,7 +463,8 @@ class TestReviewRegressions:
             (pathlib.Path(REPO_TEMPLATES) / "fax_destinations.json").read_text(encoding="utf-8")
         )
         openpyxl = pytest.importorskip("openpyxl")
-        assert openpyxl.load_workbook(io.BytesIO(raw)).sheetnames == ["汎用"]
+        # 残すのは白紙の「汎用」と、発信者ドロップダウンの参照先だけ
+        assert openpyxl.load_workbook(io.BytesIO(raw)).sheetnames == ["プルダウンリスト", "汎用"]
         for entry in directory:
             for key in ("company", "person", "fax"):
                 if entry.get(key):
@@ -660,3 +661,52 @@ class TestSenderStaff:
         runner = DocBuildRunner(make_config(tmp_path), client=client)
         _, meta, _ = runner.run("担当は坂田で送付状を作って", requester_name="足立 海里")
         assert "担当： 経理財務部　坂田" in "".join(docx_texts(meta["artifact"][1]))
+
+
+class TestStaffRoster:
+    """FAX送付状ひな形のプルダウンから作った社内名簿。"""
+
+    def test_dropdown_sheet_is_kept_so_references_are_not_dangling(self):
+        # 発信者の会社名・担当者のドロップダウンが参照するシートを消すと、
+        # Excelで参照先を失う
+        import pathlib
+        import re
+
+        z = zipfile.ZipFile(pathlib.Path(REPO_TEMPLATES) / "FAX送付状.xlsx")
+        openpyxl = pytest.importorskip("openpyxl")
+        names = openpyxl.load_workbook(io.BytesIO(z.read("xl/worksheets/sheet3.xml")) if False
+                                       else pathlib.Path(REPO_TEMPLATES) / "FAX送付状.xlsx").sheetnames
+        sheet = z.read("xl/worksheets/sheet3.xml").decode("utf-8")
+        for formula in re.findall(r"<xm:f>(.*?)</xm:f>", sheet):
+            referenced = formula.split("!")[0].strip("'")
+            assert referenced in names
+
+    def test_roster_is_bundled(self):
+        import json
+        import pathlib
+
+        roster = json.loads(
+            (pathlib.Path(REPO_TEMPLATES) / "staff_roster.json").read_text(encoding="utf-8")
+        )
+        assert "足立" in roster["staff"] and "坂田" in roster["staff"]
+        assert "株式会社ライズクリエイション" in roster["companies"]
+
+    def test_roster_splits_names_without_a_separator(self, tmp_path):
+        from raizuinu.docbuild import surname
+
+        roster = ("足立", "坂田", "進地")
+        assert surname("足立海里", roster) == "足立"  # 区切りが無くても名簿で切れる
+        assert surname("進地花子", roster) == "進地"
+        assert surname("山田太郎", roster) == "山田太郎"  # 名簿に無ければ切らない
+
+    def test_runner_uses_the_bundled_roster(self, tmp_path):
+        client = fake_client(
+            {
+                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "to_lines": ["株式会社A"], "staff": "", "items": [{"name": "契約書", "qty": "1部"}],
+                "missing": [], "opening": "作成しました。",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        _, meta, _ = runner.run("株式会社Aあての送付状を作って", requester_name="足立海里")
+        assert "担当： 経理財務部　足立" in "".join(docx_texts(meta["artifact"][1]))

@@ -232,13 +232,19 @@ FAX_CELLS = {
 }
 
 
-def strip_to_general_sheet(data: bytes, keep: str = "汎用") -> bytes:
-    """FAX送付状ひな形から「汎用」以外のシートを取り除く。
+FAX_KEEP_SHEETS = ("プルダウンリスト", "汎用")
+
+
+def strip_to_general_sheet(data: bytes, keep: tuple[str, ...] = FAX_KEEP_SHEETS) -> bytes:
+    """FAX送付状ひな形から取引先別のシートを取り除く。
 
     原本には取引先別のシートが15枚あり、他社の担当者名・FAX番号・過去の
     送信本文が入っている。そのまま同梱すると、1社あてに作った下書きの中に
-    他14社の連絡先が付いてくるため、白紙の「汎用」1枚だけにする。
+    他14社の連絡先が付いてくるため、取引先別シートを落とす。
     連絡先は fax_destinations.json に切り出してあるので機能は落ちない。
+
+    「プルダウンリスト」は残す。発信者の会社名・担当者名のドロップダウンが
+    このシートを参照しており、消すと参照先を失うため。
 
     openpyxlで開き直すとチェックボックス・プルダウン・印刷設定が消えるため、
     zipの中身を直接編集する。
@@ -255,8 +261,9 @@ def strip_to_general_sheet(data: bytes, keep: str = "汎用") -> bytes:
     sheets = re.findall(
         r'<sheet name="([^"]+)" sheetId="(\d+)"[^>]*r:id="(rId\d+)"[^>]*/>', workbook
     )
-    if not any(name == keep for name, _, _ in sheets):
-        raise SystemExit(f"{FAX_SRC}: 「{keep}」シートが見つかりません")
+    missing = [name for name in keep if not any(name == s for s, _, _ in sheets)]
+    if missing:
+        raise SystemExit(f"{FAX_SRC}: シートが見つかりません: {missing}")
 
     def part_path(target: str) -> str:
         target = target.lstrip("/")
@@ -274,11 +281,9 @@ def strip_to_general_sheet(data: bytes, keep: str = "汎用") -> bytes:
 
     # 1) 残すシートの共有文字列をインライン文字列へ移し、共有文字列表を空にする
     #    （表を残すと、シートを消しても他社名がファイル内に残ってしまう）
-    keep_path = part_path(targets[next(r for n, _, r in sheets if n == keep)])
     shared = re.findall(
         r"<si>(.*?)</si>", parts["xl/sharedStrings.xml"].decode("utf-8"), re.S
     )
-    sheet_xml = parts[keep_path].decode("utf-8")
 
     def inline(match: re.Match[str]) -> str:
         attrs = match.group("attrs").replace(' t="s"', "")
@@ -287,14 +292,19 @@ def strip_to_general_sheet(data: bytes, keep: str = "汎用") -> bytes:
         text = "".join(re.findall(r"<t[^>]*>(.*?)</t>", si, re.S))
         return f'<c{attrs} t="inlineStr"><is><t xml:space="preserve">{text}</t></is></c>'
 
-    sheet_xml = re.sub(
-        r'<c(?P<attrs>[^>]*\st="s"[^>]*)><v>(?P<idx>\d+)</v></c>', inline, sheet_xml
-    )
-    # 発信者の担当者名（O12）は依頼者ごとに変わるので、ひな形からは外す
-    sheet_xml = re.sub(
-        r'<c r="O12"([^>]*?)(?:/>|>.*?</c>)', r'<c r="O12"\1/>', sheet_xml, count=1
-    )
-    parts[keep_path] = sheet_xml.encode("utf-8")
+    for sheet_name in keep:
+        path = part_path(targets[next(r for n, _, r in sheets if n == sheet_name)])
+        sheet_xml = re.sub(
+            r'<c(?P<attrs>[^>]*\st="s"[^>]*)><v>(?P<idx>\d+)</v></c>',
+            inline,
+            parts[path].decode("utf-8"),
+        )
+        if sheet_name == "汎用":
+            # 発信者の担当者名（O12）は依頼者ごとに変わるので、ひな形からは外す
+            sheet_xml = re.sub(
+                r'<c r="O12"([^>]*?)(?:/>|>.*?</c>)', r'<c r="O12"\1/>', sheet_xml, count=1
+            )
+        parts[path] = sheet_xml.encode("utf-8")
     parts["xl/sharedStrings.xml"] = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
         '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
@@ -304,15 +314,19 @@ def strip_to_general_sheet(data: bytes, keep: str = "汎用") -> bytes:
     # 2) 残すシート以外と、それが抱えている部品を消す
     removed: set[str] = set()
     for name, _sheet_id, rid in sheets:
-        if name == keep:
+        if name in keep:
             continue
         path = part_path(targets[rid])
         removed.update([path, *related(path)])
         workbook = re.sub(rf'<sheet name="{re.escape(name)}"[^>]*/>', "", workbook)
         rels = re.sub(rf'<Relationship Id="{rid}"[^>]*/>', "", rels)
-    keep_sheet_id = next(sid for n, sid, _ in sheets if n == keep)
+    keep_ids = {sid for n, sid, _ in sheets if n in keep}
     chain = parts.get("xl/calcChain.xml", b"").decode("utf-8")
-    chain = re.sub(r'<c r="[^"]+" i="(?!' + keep_sheet_id + r'")\d+"[^>]*/>', "", chain)
+    chain = re.sub(
+        r'<c r="[^"]+" i="(\d+)"[^>]*/>',
+        lambda m: m.group(0) if m.group(1) in keep_ids else "",
+        chain,
+    )
     parts["xl/calcChain.xml"] = chain.encode("utf-8")
 
     for path in removed:
@@ -377,6 +391,28 @@ def build_fax() -> None:
         if entry.get("company"):
             directory.append(entry)
 
+    # 発信者のドロップダウン（プルダウンリスト）は、そのまま社内の名簿として使える。
+    # Chatworkの表示名から苗字を切り出すときの照合に使う
+    pull = wb["プルダウンリスト"]
+    roster = {
+        "companies": [
+            str(pull[f"A{row}"].value).strip()
+            for row in range(1, 20)
+            if isinstance(pull[f"A{row}"].value, str) and pull[f"A{row}"].value.strip()
+        ],
+        "staff": [
+            str(pull[f"B{row}"].value).strip()
+            for row in range(1, 30)
+            if isinstance(pull[f"B{row}"].value, str) and pull[f"B{row}"].value.strip()
+        ],
+    }
+    roster_path = OUT_DIR / "staff_roster.json"
+    roster_path.write_text(
+        json.dumps(roster, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    print(f"{roster_path.name}: 会社{len(roster['companies'])}件 / 担当者{len(roster['staff'])}件")
+    print("    " + "、".join(roster["staff"]))
+
     path = OUT_DIR / "fax_destinations.json"
     path.write_text(
         json.dumps(directory, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -384,7 +420,7 @@ def build_fax() -> None:
     leaked = [e["company"] for e in directory if e["company"] in out.read_bytes().decode("latin-1", "ignore")]
     wb_out = load_workbook(out)
     print(f"{out.name}: シート{wb_out.sheetnames} / {out.stat().st_size:,}バイト")
-    if leaked or wb_out.sheetnames != ["汎用"]:
+    if leaked or wb_out.sheetnames != list(FAX_KEEP_SHEETS):
         raise SystemExit(f"{FAX_SRC}: 取引先データが残っています: {leaked or wb_out.sheetnames}")
     print(f"{path.name}: 宛先{len(directory)}件")
     for entry in directory:

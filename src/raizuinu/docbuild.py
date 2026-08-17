@@ -269,7 +269,7 @@ class DocBuildRunner:
         _normalize(fields)  # 空白だけの宛先・品名を捨ててから不足判定にかける
         # 差出人の担当者は、依頼文に指定がなければ依頼者の苗字にする。
         # モデルがフルネームを返した場合もここで苗字へ落とす
-        fields["staff"] = surname(fields.get("staff") or requester_name)
+        fields["staff"] = surname(fields.get("staff") or requester_name, self._roster())
         meta["fields"] = {k: v for k, v in fields.items() if k != "opening"}
 
         template_id = str(fields.get("template_id") or "")
@@ -333,7 +333,7 @@ class DocBuildRunner:
         ]
         if requester_name:
             parts.append(
-                f"依頼者の姓: {surname(requester_name)}"
+                f"依頼者の姓: {surname(requester_name, self._roster())}"
                 "（差出人の担当者名は、依頼文に別の指定がなければこの姓にする。"
                 "staffには姓だけを入れ、フルネームや敬称は付けない）"
             )
@@ -375,6 +375,16 @@ class DocBuildRunner:
         if not fields.get("date"):
             fields["date"] = today
         return fields, usage
+
+    def _roster(self) -> tuple[str, ...]:
+        """社内の担当者名簿（FAX送付状ひな形のプルダウンから作ったもの）。"""
+        path = self._templates_dir() / "staff_roster.json"
+        if not path.exists():
+            return ()
+        try:
+            return tuple(json.loads(path.read_text(encoding="utf-8")).get("staff") or [])
+        except (OSError, json.JSONDecodeError):
+            return ()
 
     def _fax_directory(self) -> str:
         path = self._templates_dir() / "fax_destinations.json"
@@ -513,17 +523,21 @@ _NAME_SUFFIX_RE = re.compile(r"(さん|様|氏|くん|ちゃん)$")
 _ORG_WORD_RE = re.compile(r"..(部|課|係|室|支店|チーム|グループ)$|(株式会社|有限会社|合同会社)")
 
 
-def surname(display_name: str) -> str:
+def surname(display_name: str, roster: tuple[str, ...] = ()) -> str:
     """Chatworkの表示名から苗字を取り出す。
 
     表示名には勤務状況などが書き足されていることがあるため、装飾を落として
-    から先頭の語を取る。区切りが無い場合（「足立海里」等）は、誤って途中で
-    切るより名前全体を残すほうが安全なのでそのまま返す。
+    から先頭の語を取る。名簿（roster）があれば、まずそこと突き合わせる。
+    区切りが無い表示名（「足立海里」等）は名簿がないと切りようがないため、
+    誤った位置で切るより名前全体を残す。
     """
     name = unicodedata.normalize("NFKC", str(display_name or ""))
     name = _NAME_NOISE_RE.sub("", name).strip()
     if not name:
         return ""
+    for member in roster:  # 名簿にある姓で始まっていればそれが苗字
+        if member and name.startswith(member):
+            return member
     parts = [p for p in re.split(r"[\s,、･・]+", name) if p]
     if not parts:
         return ""
