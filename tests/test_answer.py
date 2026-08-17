@@ -628,6 +628,61 @@ class TestAnswerGenerator:
         assert fake_url not in answer.text
         assert "（URL省略）" in answer.text
 
+    def test_reference_url_recovered_from_body_when_field_empty(self, tmp_path):
+        # 実測の不具合: 参考URLをreference_urlに入れず本文にだけ書くと
+        # ページ取得が飛ばされ、記憶に頼った薄い回答になっていた
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["web_fetch_enabled"] = True
+        config.data["web_fetch_allowed_domains"] = ["mirasapo-plus.go.jp"]
+        stage1 = {
+            "intent": "general_knowledge",
+            "reference_url": "",  # フィールドは空
+            "has_answer": True,
+            "answer": f"補助率は公募回で変わります。参考: {MIRASAPO_URL}\n※一般的な制度知識としての説明です。",
+            "sources": [],
+            "suggested_file": "",
+            "reported_manuals": [],
+        }
+        summary = "補助率は1/2〜2/3、上限4,000万円です。※ミラサポplus（経済産業省 中小企業庁）の掲載情報に基づきます。"
+        client = FakeClient([fake_response(stage1), self._stage2_response(summary)])
+        gen = AnswerGenerator(config, client=client)
+        answer = gen.generate("ものづくり補助金の補助率と上限額は？", handbook)
+        assert client.calls == 2  # 本文のURLを拾って2段目を実行する
+        assert "4,000万円" in answer.text
+        assert answer.stage2 == "ok"
+        assert answer.reference_url == MIRASAPO_URL
+
+    def test_body_url_recovery_ignores_unfetchable_urls(self, tmp_path):
+        # ハンドブックに無いURLや許可外ドメインは拾わない（捏造URLでの取得防止）
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["web_fetch_enabled"] = True
+        config.data["web_fetch_allowed_domains"] = ["mirasapo-plus.go.jp"]
+        stage1 = {
+            "intent": "general_knowledge",
+            "reference_url": "",
+            "has_answer": True,
+            # ハンドブック未記載のミラサポURLと、許可外ドメインの実在URL
+            "answer": f"参考: https://mirasapo-plus.go.jp/subsidy/not-real/ と {REAL_URL}\n※一般的な制度知識としての説明です。",
+            "sources": [],
+            "suggested_file": "",
+            "reported_manuals": [],
+        }
+        client = FakeClient([fake_response(stage1)])
+        gen = AnswerGenerator(config, client=client)
+        answer = gen.generate("補助金について", handbook)
+        assert client.calls == 1  # 2段目に進まない
+        assert answer.stage2 == ""
+
+    def test_junk_tool_keywords_rejected(self):
+        from raizuinu.answer import _is_placeholder_value
+
+        for junk in ("no-op", "不要", "なし", "テスト", "placeholder", "サンプル"):
+            assert _is_placeholder_value(junk), junk
+        for real in ("下請代金 支払期日", "労働基準法", "印紙税"):
+            assert not _is_placeholder_value(real), real
+
     def test_general_knowledge_fetch_failure_falls_back_to_link(self, tmp_path):
         handbook = make_handbook(tmp_path)
         config = Config.load(tmp_path / "no-config.json")
@@ -850,10 +905,28 @@ class TestAnswerGenerator:
         config.data["web_fetch_allowed_domains"] = ["www.freee.co.jp"]
         payload = self._general_knowledge_stage1()
         payload["reference_url"] = REAL_URL  # ハンドブックには実在するがfreee外ドメイン
+        payload["answer"] = "社内ハンドブックには記載がありません。"  # 本文にも取得可URLなし
         client = FakeClient(fake_response(payload))
         gen = AnswerGenerator(config, client=client)
         gen.generate("質問", handbook)
         assert client.calls == 1  # 取得できないドメインへの2段目は呼ばない
+
+    def test_wrong_domain_reference_recovers_from_body_url(self, tmp_path):
+        # reference_urlが取得できないドメインでも、本文に正しい記事URLがあれば拾う
+        handbook = make_handbook(tmp_path)
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["web_fetch_enabled"] = True
+        config.data["web_fetch_allowed_domains"] = ["www.freee.co.jp"]
+        payload = self._general_knowledge_stage1()
+        payload["reference_url"] = REAL_URL  # 取得できないドメイン
+        client = FakeClient(
+            [fake_response(payload), self._stage2_response("限度額は年800万円です。※")]
+        )
+        gen = AnswerGenerator(config, client=client)
+        answer = gen.generate("質問", handbook)
+        assert client.calls == 2
+        assert answer.reference_url == FREEE_URL  # 本文にあったfreee記事へ差し替わる
+        assert FREEE_URL in client.kwargs["messages"][0]["content"]
 
     def test_general_knowledge_guidance_survives_downgrade(self, tmp_path):
         handbook = make_handbook(tmp_path)
