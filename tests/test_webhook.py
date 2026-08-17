@@ -26,7 +26,7 @@ def mention_payload(**overrides) -> bytes:
         "to_account_id": 999,
         "room_id": 12345,
         "message_id": "100001",
-        "body": "[To:999]らいずいぬさん\n銀行明細の取得手順を教えて",
+        "body": "[To:999]経理財務アシスタントさん\n銀行明細の取得手順を教えて",
         "send_time": 1700000000,
         "update_time": 0,
     }
@@ -76,7 +76,7 @@ class TestParseMention:
 
     def test_strips_chatwork_tags_from_question(self):
         event = parse_mention(mention_payload())
-        assert event.question == "らいずいぬさん\n銀行明細の取得手順を教えて"
+        assert event.question == "経理財務アシスタントさん\n銀行明細の取得手順を教えて"
         assert "[To:" not in event.question
 
     def test_strips_reply_tags(self):

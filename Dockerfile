@@ -1,4 +1,4 @@
-# らいずいぬ Phase 1 — Cloud Run用コンテナ
+# 経理財務アシスタント Phase 1 — Cloud Run用コンテナ
 FROM python:3.12-slim
 
 WORKDIR /app

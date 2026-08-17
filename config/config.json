@@ -1,5 +1,5 @@
 {
-  "agent_name": "らいずいぬ",
+  "agent_name": "経理財務アシスタント",
   "model": "claude-sonnet-5",
   "effort": "medium",
   "max_tokens": 16000,

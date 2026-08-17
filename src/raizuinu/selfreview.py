@@ -166,7 +166,7 @@ def build_proposals(
         "実在するハンドブックファイル名": handbook_names,
     }
     system = (
-        "あなたは社内AIエージェント「らいずいぬ」の自己改善分析の担当です。"
+        f"あなたは社内AIエージェント「{config.agent_name}」の自己改善分析の担当です。"
         "与えられた1週間の利用実績から、管理者向けの改善提案を日本語で書いてください。"
         "構成: (1)答えられなかった質問の傾向と、どのマニュアルに何を追記すべきかの提案"
         "（追記先は実在するハンドブックファイル名から選ぶ。適切なものが無ければ新規ファイル名を提案）"
@@ -205,10 +205,14 @@ def build_proposals(
 
 
 def render_report(
-    stats: dict, proposals: str, limit_note: str = "", broken_links: list[str] | None = None
+    stats: dict,
+    proposals: str,
+    limit_note: str = "",
+    broken_links: list[str] | None = None,
+    agent_name: str = "経理財務アシスタント",
 ) -> str:
     lines = [
-        "[info][title]らいずいぬ 週次自己分析レポート[/title]",
+        f"[info][title]{agent_name} 週次自己分析レポート[/title]",
         f"対象期間: 直近{ANALYSIS_DAYS}日間",
         "",
         "■利用状況",
@@ -282,7 +286,9 @@ def main() -> None:
     except Exception:
         broken_links = []  # ヘルスチェック失敗でレポート全体を落とさない
 
-    report = render_report(stats, proposals, limit_note, broken_links)
+    report = render_report(
+        stats, proposals, limit_note, broken_links, agent_name=config.agent_name
+    )
 
     # レポートを記録として保存（反映作業時にClaude Codeが参照する）
     reports_dir = state_dir / "reports"

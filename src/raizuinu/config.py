@@ -17,7 +17,7 @@ from typing import Any
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "config.json"
 
 _DEFAULTS: dict[str, Any] = {
-    "agent_name": "らいずいぬ",
+    "agent_name": "経理財務アシスタント",
     "model": "claude-opus-5",
     "effort": "medium",
     # claude-opus-5は思考がデフォルトONで、max_tokensは思考+本文の合計上限。

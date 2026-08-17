@@ -117,8 +117,8 @@ class TestFirstRun:
 class TestFiltering:
     def test_bot_own_and_mention_and_short_messages_excluded(self, tmp_path):
         messages = [
-            message(101, BOT_ID, "らいずいぬ", "私はボットです。長い発言をしています。"),
-            message(102, 111, "坂田", f"[To:{BOT_ID}] らいずいぬさん教えて（これはQ&Aフロー）"),
+            message(101, BOT_ID, "経理財務アシスタント", "私はボットです。長い発言をしています。"),
+            message(102, 111, "坂田", f"[To:{BOT_ID}] 経理財務アシスタントさん教えて（これはQ&Aフロー）"),
             message(103, 222, "田中", "了解です"),  # 短文
         ]
         watcher, chatwork, generator, screen = make_watcher(

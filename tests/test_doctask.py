@@ -432,7 +432,7 @@ class TestHandlerIntegration:
         # 見つからないときは「機能がない」ではなく、依頼の仕方を案内する（API消費なし）
         handler, chatwork, generator, audit, token = self._make(tmp_path, monkeypatch)
         chatwork.messages = [
-            {"message_id": "1", "account": {"account_id": 999, "name": "らいずいぬ"},
+            {"message_id": "1", "account": {"account_id": 999, "name": "経理財務アシスタント"},
              "body": "[download:42]ボットが上げたファイル.txt (1 KB)[/download]"},
         ]
         self._send(handler, token, "[To:999]さっきのファイルを議事録にして。")
