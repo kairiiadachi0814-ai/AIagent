@@ -27,42 +27,18 @@ from .templatefill import TemplateError, render_docx, render_xlsx
 
 JST = timezone(timedelta(hours=9))
 
-# ひな形の定義。追加するときはここに1件足せばよい（判定・生成は共通）
-TEMPLATES: dict[str, dict[str, Any]] = {
-    "書類送付状_ライズ": {
-        "label": "書類送付状（株式会社ライズクリエイション）",
-        "file": "書類送付状_ライズ.docx",
-        "kind": "docx",
-        "box_url": "https://app.box.com/file/1529686391255",
-        "sender": "株式会社ライズクリエイション",
-        "hint": "差出人が株式会社ライズクリエイションのとき。既定はこれ",
-    },
-    "書類送付状_ヤマトライジング": {
-        "label": "書類送付状（株式会社ヤマトライジング）",
-        "file": "書類送付状_ヤマトライジング.docx",
-        "kind": "docx",
-        "box_url": "https://app.box.com/file/2361204879735",
-        "sender": "株式会社ヤマトライジング",
-        "hint": "差出人がヤマトライジングのとき",
-    },
-    "書類送付状_楽天軒": {
-        "label": "書類送付状（ＲＡＫＵＴＥＮＫＥＮ株式会社）",
-        "file": "書類送付状_楽天軒.docx",
-        "kind": "docx",
-        "box_url": "https://app.box.com/file/1681180574076",
-        "sender": "ＲＡＫＵＴＥＮＫＥＮ株式会社",
-        "hint": "差出人が楽天軒（RAKUTENKEN）のとき",
-    },
-    "FAX送付状": {
-        "label": "FAX送付状",
-        "file": "FAX送付状.xlsx",
-        "kind": "xlsx",
-        "sheet": "汎用",
-        "box_url": "https://app.box.com/file/1529688805714",
-        "sender": "株式会社ライズクリエイション",
-        "hint": "郵送ではなくFAXで送るとき",
-    },
+# 書類の型。会社ごとではなく「書式の型」で持つ。差出人（会社名・住所・TEL・部署）は
+# templates/companies.json から差し込むので、グループ会社が増えても増やさない
+LAYOUTS: dict[str, str] = {
+    "標準": "送付状_標準.docx",
+    "楽天軒型": "送付状_楽天軒型.docx",
 }
+SOUFUJO_BOX_URL = "https://app.box.com/file/1529686391255"
+FAX_TEMPLATE = "FAX送付状.xlsx"
+FAX_SHEET = "汎用"
+FAX_BOX_URL = "https://app.box.com/file/1529688805714"
+# 返信でひな形名として見せる呼び方（Box上のファイル名に合わせる）
+DOC_LABELS = {"送付状": "書類送付状", "FAX送付状": "FAX送付状"}
 
 # FAX送付状「汎用」シートの差し込み先。敬称は会社名と別の欄（H10）にある
 FAX_CELLS = {
@@ -76,6 +52,13 @@ FAX_CELLS = {
     "sender_staff": "O12",
 }
 FAX_BODY_ROWS = ("B23", "B24", "B25", "B26", "B27")
+# FAX送付状の発信者欄。会社が変わればここも変わる（担当者名は O12）
+FAX_SENDER_CELLS = {
+    "company": "M10",
+    "dept": "M12",
+    "fax": "M14",
+    "tel": "M16",
+}
 _HONORIFIC_RE = re.compile(r"[\s　]*(御中|様|殿)$")
 
 # 契約書ひな形は生成しない（締結前のリーガルチェックが必須のため案内に倒す）
@@ -115,6 +98,13 @@ _ASKING_OPENING_RE = re.compile(
 )
 DEFAULT_OPENING = "承知しました。下書きを作成しました。"
 _CONTRACT_RE = re.compile(r"(契約書|覚書|念書|誓約書|NDA|秘密保持)")
+
+
+def _box_url(kind: str, company: dict[str, Any]) -> str:
+    """返信に載せる出典。送付状は会社ごとに原本が分かれているので台帳を優先する。"""
+    if kind == "送付状":
+        return str(company.get("box_url") or SOUFUJO_BOX_URL)
+    return FAX_BOX_URL
 
 
 def looks_like_document_build_request(question: str, body: str = "") -> bool:
@@ -185,10 +175,22 @@ SYSTEM_PROMPT = """あなたは株式会社ライズクリエイション経理�
 _FIELDS_SCHEMA = {
     "type": "object",
     "properties": {
-        "template_id": {
+        "kind": {
             "type": "string",
-            "enum": [*TEMPLATES.keys(), ""],
-            "description": "使うひな形。判断できないときは空文字",
+            "enum": ["送付状", "FAX送付状", ""],
+            "description": "郵送なら送付状、FAXならFAX送付状。判断できないときは空文字",
+        },
+        "company_id": {
+            "type": "string",
+            "description": "差出人の会社ID（渡した一覧から選ぶ）。判断できないときは空文字",
+        },
+        "sender_hint": {
+            "type": "string",
+            "description": (
+                "依頼文で差出人として名指しされた会社名をそのまま写す"
+                "（例:「ヤマトライジング名で」→「ヤマトライジング」）。"
+                "差出人の指定がなければ空文字。宛先の会社名は入れない"
+            ),
         },
         "date": {"type": "string", "description": "書類の日付。例: 2026年8月17日"},
         "to_lines": {
@@ -232,7 +234,17 @@ _FIELDS_SCHEMA = {
             ),
         },
     },
-    "required": ["template_id", "date", "to_lines", "staff", "items", "missing", "opening"],
+    "required": [
+        "kind",
+        "company_id",
+        "sender_hint",
+        "date",
+        "to_lines",
+        "staff",
+        "items",
+        "missing",
+        "opening",
+    ],
     "additionalProperties": False,
 }
 
@@ -272,27 +284,34 @@ class DocBuildRunner:
         fields["staff"] = surname(fields.get("staff") or requester_name, self._roster())
         meta["fields"] = {k: v for k, v in fields.items() if k != "opening"}
 
-        template_id = str(fields.get("template_id") or "")
-        allowed = self._allowed_templates()
-        if template_id not in allowed:
+        kind = str(fields.get("kind") or "")
+        hint = str(fields.get("sender_hint") or "").strip()
+        company = self._find_company(str(fields.get("company_id") or ""), hint)
+        if company is None and not hint:
+            # 差出人の指定がない依頼は、既定の会社（ライズクリエイション）で作る
+            company = next((c for c in self._companies() if c.get("default")), None)
+        if company is None:
+            # 名指しされた会社を知らないまま既定の会社で作ると、差出人が別会社の
+            # 書類が出来上がってしまう。作らずに聞き返す
+            meta["error"] = "unknown_company"
+            return self._unknown_company(fields.get("opening", ""), hint), meta, usage
+        if kind not in ("送付状", "FAX送付状"):
             meta["error"] = "template_not_found"
             return (
-                self._choose_guidance(
-                    allowed, fields.get("opening", ""), fields.get("missing") or []
-                ),
+                self._choose_guidance(fields.get("opening", ""), fields.get("missing") or []),
                 meta,
                 usage,
             )
 
-        template = TEMPLATES[template_id]
-        meta["template"] = template_id
-        missing = self._missing(template, fields)
+        meta["template"] = f"{kind}（{company['name']}）"
+        meta["company"] = company["id"]
+        missing = self._missing(kind, fields)
         if missing:
             meta["error"] = "missing_fields"
             return self._ask_for(fields.get("opening", ""), missing), meta, usage
 
         try:
-            filename, data = self._render(template_id, template, fields)
+            filename, data = self._render(kind, company, fields)
         except TemplateError as exc:
             raise DocumentBuildError(
                 "すみません、ひな形への差し込みでつまずいてしまいました。"
@@ -301,13 +320,41 @@ class DocBuildRunner:
             ) from exc
         meta["artifact"] = (filename, data)
         meta["output_filename"] = filename
-        return self._reply(fields, template), meta, usage
+        return self._reply(fields, kind, company), meta, usage
 
     # --- 内部 ---
 
-    def _allowed_templates(self) -> list[str]:
-        configured = self._config.doc_build.get("allowed_templates") or []
-        return [t for t in configured if t in TEMPLATES]
+    def _companies(self) -> list[dict[str, Any]]:
+        """差出人になれるグループ会社の一覧（templates/companies.json）。"""
+        path = self._templates_dir() / "companies.json"
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        return [c for c in data.get("companies", []) if c.get("id") and c.get("name")]
+
+    def _find_company(self, company_id: str, hint: str) -> dict[str, Any] | None:
+        """IDで引き、無ければ名指しされた会社名・略称から探す。"""
+        companies = self._companies()
+        for company in companies:
+            if company_id and company_id == company["id"]:
+                return company
+        if not hint:
+            return None
+        for company in companies:
+            names = [company["name"], company["id"], *(company.get("aliases") or [])]
+            if any(n and (n in hint or hint in n) for n in names):
+                return company
+        return None
+
+    def _read_template(self, filename: str) -> bytes:
+        """ひな形を読む。無いときは黙って落ちずに、作成失敗として扱う。"""
+        try:
+            return (self._templates_dir() / filename).read_bytes()
+        except OSError as exc:
+            raise TemplateError(f"ひな形 {filename} を読み込めませんでした") from exc
 
     def _templates_dir(self) -> Path:
         return self._config.resolve_path(
@@ -323,13 +370,26 @@ class DocBuildRunner:
         now = datetime.now(JST)
         today = f"{now.year}年{now.month}月{now.day}日"
 
+        companies = self._companies()
         catalog = "\n".join(
-            f"- {tid}: {TEMPLATES[tid]['label']}（差出人 {TEMPLATES[tid]['sender']}。{TEMPLATES[tid]['hint']}）"
-            for tid in self._allowed_templates()
+            "- {id}: {name}{alias}{mark}".format(
+                id=c["id"],
+                name=c["name"],
+                alias=(
+                    "（略称: " + "・".join(c.get("aliases") or []) + "）"
+                    if c.get("aliases")
+                    else ""
+                ),
+                mark="　※指定がないときはこの会社" if c.get("default") else "",
+            )
+            for c in companies
         )
         parts = [
             f"今日の日付: {today}",
-            f"使えるひな形:\n{catalog}",
+            "書類の種類（kind）: 郵送に添えるなら「送付状」、FAXで送るなら「FAX送付状」",
+            "差出人になれる会社（company_id はこの一覧のIDから選ぶ。"
+            "依頼文に「○○名義で」「○○として」とあればその会社。"
+            "宛先の会社名と取り違えないこと）:\n" + catalog,
         ]
         if requester_name:
             parts.append(
@@ -404,13 +464,13 @@ class DocBuildRunner:
         return "\n".join(lines)
 
     @staticmethod
-    def _missing(template: dict[str, Any], fields: dict[str, Any]) -> list[str]:
+    def _missing(kind: str, fields: dict[str, Any]) -> list[str]:
         missing = [str(m) for m in fields.get("missing") or []]
         if not fields.get("to_lines"):
             missing.append("宛先")
-        if template["kind"] == "docx" and not fields.get("items"):
+        if kind == "送付状" and not fields.get("items"):
             missing.append("送付する書類")
-        if template["kind"] == "xlsx" and not str(fields.get("subject") or "").strip():
+        if kind == "FAX送付状" and not str(fields.get("subject") or "").strip():
             missing.append("件名")
         seen: dict[str, None] = {}
         for item in missing:
@@ -418,18 +478,29 @@ class DocBuildRunner:
         return [m for m in seen if m]
 
     def _render(
-        self, template_id: str, template: dict[str, Any], fields: dict[str, Any]
+        self, kind: str, company: dict[str, Any], fields: dict[str, Any]
     ) -> tuple[str, bytes]:
-        data = (self._templates_dir() / template["file"]).read_bytes()
         to_lines = [str(line) for line in fields.get("to_lines") or [] if str(line).strip()]
         date = str(fields.get("date") or "")
 
-        if template["kind"] == "docx":
+        if kind == "送付状":
+            layout = str(company.get("layout") or "標準")
+            if layout not in LAYOUTS:
+                raise TemplateError(f"未対応の書式です（{layout}）")
+            data = self._read_template(LAYOUTS[layout])
             max_items = int(self._config.doc_build.get("max_items", 20))
             items = (fields.get("items") or [])[:max_items]
             out = render_docx(
                 data,
-                {"date": date, "staff": str(fields.get("staff") or "")},
+                {
+                    "date": date,
+                    "staff": str(fields.get("staff") or ""),
+                    "sender_company": str(company.get("name") or ""),
+                    "sender_address1": str(company.get("address1") or ""),
+                    "sender_address2": str(company.get("address2") or ""),
+                    "sender_tel": str(company.get("tel") or ""),
+                    "sender_dept": str(company.get("dept") or ""),
+                },
                 {
                     "to_line": [{"to_line": line} for line in to_lines],
                     "item_name": [
@@ -442,17 +513,23 @@ class DocBuildRunner:
                 },
             )
         else:
+            data = self._read_template(FAX_TEMPLATE)
             # 「汎用」シートは会社名と敬称が別の欄。敬称込みで会社名を入れると
             # 「○○ 御中 御中」になるため、末尾の敬称を切り離す
-            company, honorific = _split_honorific(to_lines[0] if to_lines else "")
+            to_company, honorific = _split_honorific(to_lines[0] if to_lines else "")
             cells: dict[str, Any] = {
-                FAX_CELLS["to_company"]: company,
+                FAX_CELLS["to_company"]: to_company,
                 FAX_CELLS["honorific"]: honorific,
                 FAX_CELLS["to_person"]: "　".join(to_lines[1:]),
                 FAX_CELLS["to_fax"]: str(fields.get("to_fax") or ""),
                 FAX_CELLS["to_tel"]: str(fields.get("to_tel") or ""),
                 FAX_CELLS["subject"]: str(fields.get("subject") or ""),
                 FAX_CELLS["sender_staff"]: str(fields.get("staff") or ""),
+                # 発信者欄は差出人の会社ごとに入れ替える（部署名の末尾空白は落とす）
+                FAX_SENDER_CELLS["company"]: str(company.get("name") or ""),
+                FAX_SENDER_CELLS["dept"]: str(company.get("dept") or "").strip("　 "),
+                FAX_SENDER_CELLS["fax"]: str(company.get("fax") or ""),
+                FAX_SENDER_CELLS["tel"]: str(company.get("tel") or ""),
             }
             pages = fields.get("pages")
             if isinstance(pages, int) and pages > 0:
@@ -463,15 +540,14 @@ class DocBuildRunner:
                 # 今日以外の日付を指定されたときだけ =TODAY() を上書きする
                 # （「2026/8/17」のような表記ゆれで無用に潰さないよう年月日で比べる）
                 cells["E6"] = date
-            out = render_xlsx(data, template["sheet"], cells)
+            out = render_xlsx(data, FAX_SHEET, cells)
 
-        suffix = ".docx" if template["kind"] == "docx" else ".xlsx"
-        stem = template_id if template["kind"] == "xlsx" else template_id.split("_")[0]
+        suffix = ".docx" if kind == "送付状" else ".xlsx"
         label = _split_honorific(to_lines[0])[0] if to_lines else "宛先未定"
-        name = f"{stem}_{_safe_name(label)}_{_ymd(date)}{suffix}"
+        name = f"{DOC_LABELS[kind]}_{_safe_name(label)}_{_ymd(date)}{suffix}"
         return name, out
 
-    def _reply(self, fields: dict[str, Any], template: dict[str, Any]) -> str:
+    def _reply(self, fields: dict[str, Any], kind: str, company: dict[str, Any]) -> str:
         opening = _delivering_opening(fields.get("opening"))
         assumed = [
             item["name"] for item in fields.get("items") or [] if not item.get("qty")
@@ -483,8 +559,9 @@ class DocBuildRunner:
         return (
             f"{opening}\n\n"
             f"{note}"
-            f"ひな形: {template['label']}\n"
-            f"出典: {template['box_url']}\n"
+            f"差出人: {company['name']}\n"
+            f"ひな形: {DOC_LABELS[kind]}\n"
+            f"出典: {_box_url(kind, company)}\n"
             "※下書きです。日付・宛名・部数をご確認のうえ、印刷や送付はお手元でお願いします。"
         )
 
@@ -499,13 +576,11 @@ class DocBuildRunner:
         )
 
     @staticmethod
-    def _choose_guidance(allowed: list[str], opening: str, missing: list[str]) -> str:
+    def _choose_guidance(opening: str, missing: list[str]) -> str:
         lead = _asking_opening(opening, "送付状ですね、お作りします。")
-        names = "\n".join(f"・{TEMPLATES[t]['label']}" for t in allowed)
         text = (
             f"{lead}\n\n"
-            "どのひな形で作るか決めきれませんでした。次のどれかを指定していただけますか。\n"
-            f"{names}"
+            "郵送に添える送付状と、FAX送付状のどちらでしょうか。教えていただければ作ります。"
         )
         others = [str(m) for m in missing if str(m).strip()]
         if others:
@@ -513,6 +588,19 @@ class DocBuildRunner:
                 f"・{m}" for m in others
             )
         return text
+
+    def _unknown_company(self, opening: str, hint: str) -> str:
+        lead = _asking_opening(opening, "送付状ですね、お作りします。")
+        names = "\n".join(f"・{c['name']}" for c in self._companies())
+        return (
+            f"{lead}\n\n"
+            f"ただ、差出人の「{hint}」は住所・電話番号を登録していないので、"
+            "そのままだと差出人欄を埋められません。\n"
+            "いま差出人に使えるのはこの会社です。\n"
+            f"{names}\n\n"
+            f"「{hint}」でお作りするなら、会社名（正式名称）・住所・電話番号・FAX番号を"
+            "教えてください。登録すれば次回からは会社名を言うだけで作れます。"
+        )
 
 
 # 表示名に書き足されがちな装飾（「足立 海里　資料作成集中（急ぎ案件のみ対応可）※土日休」）

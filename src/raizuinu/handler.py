@@ -637,7 +637,7 @@ class RaizuinuHandler:
             return
 
         status = self._add_usage_safely(usage)
-        if meta.get("error") in ("missing_fields", "template_not_found"):
+        if meta.get("error") in ("missing_fields", "template_not_found", "unknown_company"):
             # 足りない項目を答えてもらったら、元の依頼に足して作り直す
             self._save_pending(event, "doc_build", question)
 

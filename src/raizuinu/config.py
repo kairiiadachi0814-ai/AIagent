@@ -80,14 +80,10 @@ _DEFAULTS: dict[str, Any] = {
     # ひな形からの書類作成（送付状・FAX送付状）。ひな形の実体は templates/ に同梱
     "doc_build": {
         "enabled": False,
+        # 作れる書類は 送付状 / FAX送付状 の2種類。差出人の会社は
+        # templates/companies.json で管理する（契約書は作らない。
+        # 締結前のリーガルチェックが必須のため）
         "templates_dir": "templates",
-        # 契約書ひな形はここに入れない（締結前のリーガルチェックが必須のため）
-        "allowed_templates": [
-            "書類送付状_ライズ",
-            "書類送付状_ヤマトライジング",
-            "書類送付状_楽天軒",
-            "FAX送付状",
-        ],
         "max_items": 20,
         "attach_to_chatwork": True,
     },

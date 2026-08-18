@@ -33,10 +33,18 @@ PH_TO = "{{to_line}}"  # 宛先。1行につき1段落へ複製する
 PH_STAFF = "{{staff}}"
 PH_ITEM = "{{item_name}}"  # 送付書類。1件につき1段落へ複製する
 PH_QTY = "{{item_qty}}"
+# 差出人ブロック。会社ごとにひな形を作らず、companies.json の値を差し込む
+PH_COMPANY = "{{sender_company}}"
+PH_ADDR1 = "{{sender_address1}}"
+PH_ADDR2 = "{{sender_address2}}"
+PH_TEL = "{{sender_tel}}"
+PH_DEPT = "{{sender_dept}}"
 
 SPECS = [
     {
-        "out": "書類送付状_ライズ.docx",
+        # 標準の型（■で送付書類を並べる）。差出人は companies.json から差し込むため、
+        # グループ会社が増えてもひな形は増やさない
+        "out": "送付状_標準.docx",
         "src": "書類送付状_ライズ.docx",
         # 2026年5月11日付 南都銀行あての1通（末尾から2通目。標準の書式が崩れていない）
         "paras": (657, 694),
@@ -46,25 +54,17 @@ SPECS = [
             658: PH_TO,
             659: None,  # 宛先2行目・3行目は削除し、1行目を必要な数だけ複製する
             660: None,
-            668: f"担当： 経理財務部　{PH_STAFF}",
+            664: PH_COMPANY,
+            665: PH_ADDR1,
+            666: PH_ADDR2,
+            667: f"TEL：{PH_TEL}",
+            668: f"担当： {PH_DEPT}{PH_STAFF}",
             684: f"■{PH_ITEM}\t{PH_QTY}",
         },
     },
     {
-        "out": "書類送付状_ヤマトライジング.docx",
-        "src": "書類送付状_ヤマトライジング.docx",
-        "paras": (0, 38),
-        "expect": {0: "2026年7月22日", 9: "株式会社ヤマトライジング", 16: "書類送付のご案内", 38: "以上"},
-        "edits": {
-            0: PH_DATE,
-            2: PH_TO,
-            3: None,
-            13: f"担当： 経理財務部　{PH_STAFF}",
-            29: f"■{PH_ITEM}\t{PH_QTY}",
-        },
-    },
-    {
-        "out": "書類送付状_楽天軒.docx",
+        # 楽天軒の型（「＜添付書類＞」の見出しがあり、・で並べる）
+        "out": "送付状_楽天軒型.docx",
         "src": "書類送付状_楽天軒.docx",
         # 2025年5月28日付 百五銀行あての1通（末尾の1通）
         "paras": (39, 77),
@@ -73,7 +73,11 @@ SPECS = [
             39: PH_DATE,
             41: PH_TO,
             42: None,
-            48: f"担当： {PH_STAFF}",
+            44: PH_COMPANY,
+            45: PH_ADDR1,
+            46: PH_ADDR2,
+            47: f"TEL：{PH_TEL}",
+            48: f"担当： {PH_DEPT}{PH_STAFF}",
             68: f"・{PH_ITEM}\t{PH_QTY}",
         },
     },
@@ -316,10 +320,22 @@ def strip_to_general_sheet(data: bytes, keep: tuple[str, ...] = FAX_KEEP_SHEETS)
             parts[path].decode("utf-8"),
         )
         if sheet_name == "汎用":
-            # 発信者の担当者名（O12）は依頼者ごとに変わるので、ひな形からは外す
-            sheet_xml = re.sub(
-                r'<c r="O12"([^>]*?)(?:/>|>.*?</c>)', r'<c r="O12"\1/>', sheet_xml, count=1
-            )
+            # 発信者欄は依頼ごとに変わる。会社名・部署・FAX・TEL（M10/M12/M14/M16）は
+            # グループ会社ごとに companies.json から差し込み、担当者名（O12）は
+            # 依頼者の姓を入れる。ひな形に特定の会社の情報を残すと、
+            # 差し込みを取りこぼしたときに別会社の連絡先が載ったまま出てしまう
+            def blank(match: re.Match[str]) -> str:
+                # 値の型（t属性）は中身と一緒に落とす。書式（s属性）は残す
+                attrs = re.sub(r'\s+t="[^"]*"', "", match.group("attrs"))
+                return f'<c r="{match.group("ref")}"{attrs}/>'
+
+            for ref in ("M10", "M12", "M14", "M16", "O12"):
+                sheet_xml = re.sub(
+                    rf'<c r="(?P<ref>{ref})"(?P<attrs>[^>]*?)(?:/>|>.*?</c>)',
+                    blank,
+                    sheet_xml,
+                    count=1,
+                )
         parts[path] = sheet_xml.encode("utf-8")
     parts["xl/sharedStrings.xml"] = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'

@@ -56,12 +56,6 @@ def make_config(tmp_path):
     config.data["doc_build"] = {
         "enabled": True,
         "templates_dir": REPO_TEMPLATES,
-        "allowed_templates": [
-            "書類送付状_ライズ",
-            "書類送付状_ヤマトライジング",
-            "書類送付状_楽天軒",
-            "FAX送付状",
-        ],
         "max_items": 20,
         "attach_to_chatwork": True,
     }
@@ -100,7 +94,7 @@ class TestSoufujo:
     def test_docx_is_built_and_attached(self, tmp_path):
         client = fake_client(
             {
-                "template_id": "書類送付状_ライズ",
+                "kind": "送付状", "company_id": "ライズクリエイション",
                 "date": "2026年8月17日",
                 "to_lines": ["株式会社大塚商会", "販売２課　濵野 康一　様"],
                 "staff": "足立",
@@ -132,7 +126,7 @@ class TestSoufujo:
     def test_missing_recipient_asks_instead_of_building(self, tmp_path):
         client = fake_client(
             {
-                "template_id": "書類送付状_ライズ",
+                "kind": "送付状", "company_id": "ライズクリエイション",
                 "date": "2026年8月17日",
                 "to_lines": [],
                 "staff": "",
@@ -155,12 +149,13 @@ class TestSoufujo:
         assert client.kwargs is None  # API呼び出しなし
         assert "LegalForce" in reply
 
-    def test_template_outside_allowlist_is_refused(self, tmp_path):
-        config = make_config(tmp_path)
-        config.data["doc_build"]["allowed_templates"] = ["FAX送付状"]
+    def test_unknown_sender_company_is_asked_back_not_substituted(self, tmp_path):
+        # 未登録の会社名で頼まれたとき、既定の会社で黙って作ると
+        # 差出人が別会社の書類が出来上がる。作らずに聞き返す
         client = fake_client(
             {
-                "template_id": "書類送付状_ライズ",
+                "kind": "送付状", "company_id": "",
+                "sender_hint": "株式会社イノベイト",
                 "date": "2026年8月17日",
                 "to_lines": ["株式会社A"],
                 "staff": "",
@@ -169,17 +164,43 @@ class TestSoufujo:
                 "opening": "",
             }
         )
-        runner = DocBuildRunner(config, client=client)
-        reply, meta, _ = runner.run("送付状を作って")
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        reply, meta, _ = runner.run("イノベイト名義で株式会社Aあての送付状を作って")
         assert "artifact" not in meta
-        assert "FAX送付状" in reply
+        assert meta["error"] == "unknown_company"
+        assert "株式会社イノベイト" in reply
+        assert "株式会社ライズクリエイション" in reply  # 使える会社を示す
+
+    def test_sender_company_switches_the_letterhead(self, tmp_path):
+        client = fake_client(
+            {
+                "kind": "送付状", "company_id": "RAKUTENKEN",
+                "sender_hint": "楽天軒",
+                "date": "2026年8月17日",
+                "to_lines": ["株式会社A 御中"],
+                "staff": "足立",
+                "items": [{"name": "契約書", "qty": "1部"}],
+                "missing": [],
+                "opening": "",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        reply, meta, _ = runner.run("楽天軒名義で株式会社Aあての送付状を作って")
+        joined = "".join(docx_texts(meta["artifact"][1]))
+        assert "ＲＡＫＵＴＥＮＫＥＮ株式会社" in joined
+        assert "0742-81-4930" in joined  # 会社ごとのTEL
+        assert "株式会社ライズクリエイション" not in joined
+        assert "{{" not in joined
+        assert "ＲＡＫＵＴＥＮＫＥＮ株式会社" in reply  # どの会社名義かを返信に書く
+        # 出典は会社ごとのBox原本を指す（ライズの原本を指すと突き合わせできない）
+        assert "https://app.box.com/file/1681180574076" in reply
 
 
 class TestFaxSoufujo:
     def test_xlsx_is_built_with_directory_lookup(self, tmp_path):
         client = fake_client(
             {
-                "template_id": "FAX送付状",
+                "kind": "FAX送付状", "company_id": "ライズクリエイション",
                 "date": "",
                 "to_lines": ["三十三銀行　奈良支店", "ロクガワ様"],
                 "staff": "足立",
@@ -206,13 +227,33 @@ class TestFaxSoufujo:
         assert ws["D14"].value == "0742-36-1555"
         assert ws["E19"].value == "海外送金添付資料の件"
         assert ws["N6"].value == 3
-        assert ws["M10"].value == "株式会社ライズクリエイション"  # 自社側は原本のまま
+        assert ws["M10"].value == "株式会社ライズクリエイション"  # 発信者欄
+        assert ws["M12"].value == "経理財務部"
+        assert ws["M14"].value == "0742-90-1051"
+        assert ws["M16"].value == "0742-81-9671"
         assert "https://app.box.com/file/1529688805714" in reply
+
+    def test_sender_company_switches_the_fax_header(self, tmp_path):
+        client = fake_client(
+            {
+                "kind": "FAX送付状", "company_id": "RAKUTENKEN", "sender_hint": "楽天軒",
+                "date": "", "to_lines": ["株式会社A 御中"], "staff": "足立",
+                "items": [], "subject": "件名", "missing": [], "opening": "",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        _, meta, _ = runner.run("楽天軒名義で株式会社AあてのFAX送付状を作って")
+        openpyxl = pytest.importorskip("openpyxl")
+        ws = openpyxl.load_workbook(io.BytesIO(meta["artifact"][1]))["汎用"]
+        assert ws["M10"].value == "ＲＡＫＵＴＥＮＫＥＮ株式会社"
+        assert ws["M14"].value == "0742-81-4931"  # 会社ごとのFAX番号
+        assert ws["M16"].value == "0742-81-4930"
+        assert ws["M12"].value in (None, "")  # 部署名を持たない会社は空欄
 
     def test_fax_directory_is_given_to_the_model(self, tmp_path):
         client = fake_client(
             {
-                "template_id": "FAX送付状", "date": "", "to_lines": ["三十三銀行"],
+                "kind": "FAX送付状", "company_id": "ライズクリエイション", "date": "", "to_lines": ["三十三銀行"],
                 "staff": "", "items": [], "subject": "件名", "missing": [], "opening": "",
             }
         )
@@ -227,7 +268,7 @@ class TestTemplateFill:
     def test_leftover_placeholder_is_an_error(self, tmp_path):
         import pathlib
 
-        data = (pathlib.Path(REPO_TEMPLATES) / "書類送付状_ライズ.docx").read_bytes()
+        data = (pathlib.Path(REPO_TEMPLATES) / "送付状_標準.docx").read_bytes()
         with pytest.raises(TemplateError):
             render_docx(data, {"date": "2026年8月17日"}, {"to_line": [], "item_name": []})
 
@@ -413,7 +454,7 @@ class TestReviewRegressions:
         # 「汎用」シートは会社名(D10)と敬称(H10)が別欄。敬称込みで入れると二重になる
         client = fake_client(
             {
-                "template_id": "FAX送付状", "date": "", "to_lines": ["株式会社大塚商会 御中"],
+                "kind": "FAX送付状", "company_id": "ライズクリエイション", "date": "", "to_lines": ["株式会社大塚商会 御中"],
                 "staff": "坂田", "items": [], "subject": "請求書送付の件",
                 "missing": [], "opening": "",
             }
@@ -429,7 +470,7 @@ class TestReviewRegressions:
     def test_person_recipient_gets_sama(self, tmp_path):
         client = fake_client(
             {
-                "template_id": "FAX送付状", "date": "", "to_lines": ["濵野 康一 様"],
+                "kind": "FAX送付状", "company_id": "ライズクリエイション", "date": "", "to_lines": ["濵野 康一 様"],
                 "staff": "坂田", "items": [], "subject": "件名", "missing": [], "opening": "",
             }
         )
@@ -442,7 +483,7 @@ class TestReviewRegressions:
     def test_sender_staff_is_written_not_left_as_template_default(self, tmp_path):
         client = fake_client(
             {
-                "template_id": "FAX送付状", "date": "", "to_lines": ["株式会社A"],
+                "kind": "FAX送付状", "company_id": "ライズクリエイション", "date": "", "to_lines": ["株式会社A"],
                 "staff": "山田", "items": [], "subject": "件名", "missing": [], "opening": "",
             }
         )
@@ -470,11 +511,31 @@ class TestReviewRegressions:
                 if entry.get(key):
                     assert entry[key] not in blob
 
+    def test_templates_ship_without_any_sender_company_baked_in(self):
+        # 差出人はグループ会社ごとに差し替える。ひな形に特定の会社を焼き付けたままだと、
+        # 差し込みを取りこぼしたときに別会社名義の書類が出来上がってしまう
+        import json
+        import pathlib
+
+        companies = json.loads(
+            (pathlib.Path(REPO_TEMPLATES) / "companies.json").read_text(encoding="utf-8")
+        )["companies"]
+        openpyxl = pytest.importorskip("openpyxl")
+        ws = openpyxl.load_workbook(pathlib.Path(REPO_TEMPLATES) / "FAX送付状.xlsx")["汎用"]
+        for ref in ("M10", "M12", "M14", "M16", "O12"):
+            assert ws[ref].value in (None, "")
+        for name in ("送付状_標準.docx", "送付状_楽天軒型.docx"):
+            joined = "".join(docx_texts((pathlib.Path(REPO_TEMPLATES) / name).read_bytes()))
+            for company in companies:
+                for key in ("name", "address1", "tel", "fax"):
+                    if company.get(key):
+                        assert company[key] not in joined
+
     def test_blank_recipient_lines_are_asked_for(self, tmp_path):
         # 空白だけの宛先を「あり」と数えると、宛先のない書類が出来てしまう
         client = fake_client(
             {
-                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
                 "to_lines": ["", "  ", "　"], "staff": "足立",
                 "items": [{"name": "", "qty": ""}], "missing": [], "opening": "",
             }
@@ -487,7 +548,7 @@ class TestReviewRegressions:
     def test_assumed_quantity_is_stated_in_the_reply(self, tmp_path):
         client = fake_client(
             {
-                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
                 "to_lines": ["株式会社A"], "staff": "足立",
                 "items": [{"name": "請求書", "qty": ""}, {"name": "契約書", "qty": "2部"}],
                 "missing": [], "opening": "承知しました。",
@@ -503,13 +564,18 @@ class TestReviewRegressions:
 
         client = fake_client(
             {
-                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
                 "to_lines": ["株式会社A"], "staff": "", "items": [{"name": "契約書", "qty": "1部"}],
                 "missing": [], "opening": "",
             }
         )
+        import pathlib
+        import shutil
+
         config = make_config(tmp_path)
-        config.data["doc_build"]["templates_dir"] = str(tmp_path)  # ひな形が無い状態にする
+        # 会社台帳はあるがWordのひな形が無い状態にする
+        shutil.copy(pathlib.Path(REPO_TEMPLATES) / "companies.json", tmp_path / "companies.json")
+        config.data["doc_build"]["templates_dir"] = str(tmp_path)
         runner = DocBuildRunner(config, client=client)
         with pytest.raises((DocumentBuildError, OSError)) as exc:
             runner.run("株式会社Aあての送付状を作って")
@@ -558,7 +624,7 @@ class TestReplyOpening:
     def test_asking_style_opening_is_replaced(self, tmp_path, opening):
         client = fake_client(
             {
-                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
                 "to_lines": ["エムズステップ　南様"], "staff": "足立",
                 "items": [{"name": "倉庫寄託契約書", "qty": "1通"}],
                 "missing": [], "opening": opening,
@@ -573,7 +639,7 @@ class TestReplyOpening:
     def test_delivering_opening_is_kept(self, tmp_path):
         client = fake_client(
             {
-                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
                 "to_lines": ["エムズステップ　南様"], "staff": "足立",
                 "items": [{"name": "倉庫寄託契約書", "qty": "1通"}],
                 "missing": [],
@@ -587,7 +653,7 @@ class TestReplyOpening:
     def test_ask_back_opening_is_also_guarded(self, tmp_path):
         client = fake_client(
             {
-                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
                 "to_lines": [], "staff": "", "items": [],
                 "missing": [], "opening": "よろしくお願いいたします。",
             }
@@ -624,7 +690,7 @@ class TestSenderStaff:
     def test_requester_surname_fills_the_staff_field(self, tmp_path):
         client = fake_client(
             {
-                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
                 "to_lines": ["株式会社A"], "staff": "", "items": [{"name": "契約書", "qty": "1部"}],
                 "missing": [], "opening": "作成しました。",
             }
@@ -638,7 +704,7 @@ class TestSenderStaff:
     def test_full_name_from_the_model_is_reduced_to_surname(self, tmp_path):
         client = fake_client(
             {
-                "template_id": "FAX送付状", "date": "", "to_lines": ["株式会社A"],
+                "kind": "FAX送付状", "company_id": "ライズクリエイション", "date": "", "to_lines": ["株式会社A"],
                 "staff": "足立 海里", "items": [], "subject": "件名",
                 "missing": [], "opening": "作成しました。",
             }
@@ -652,7 +718,7 @@ class TestSenderStaff:
     def test_explicit_staff_in_the_request_wins(self, tmp_path):
         client = fake_client(
             {
-                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
                 "to_lines": ["株式会社A"], "staff": "坂田",
                 "items": [{"name": "契約書", "qty": "1部"}],
                 "missing": [], "opening": "作成しました。",
@@ -702,7 +768,7 @@ class TestStaffRoster:
     def test_runner_uses_the_bundled_roster(self, tmp_path):
         client = fake_client(
             {
-                "template_id": "書類送付状_ライズ", "date": "2026年8月17日",
+                "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
                 "to_lines": ["株式会社A"], "staff": "", "items": [{"name": "契約書", "qty": "1部"}],
                 "missing": [], "opening": "作成しました。",
             }
@@ -856,7 +922,7 @@ class TestAskBackWording:
     def test_completion_claims_are_replaced(self, tmp_path, opening):
         client = fake_client(
             {
-                "template_id": "書類送付状_ヤマトライジング", "date": "2026年8月18日",
+                "kind": "送付状", "company_id": "ヤマトライジング", "date": "2026年8月18日",
                 "to_lines": [], "staff": "足立",
                 "items": [{"name": "債権差押通知書", "qty": "一式"}],
                 "missing": [], "opening": opening,
