@@ -118,6 +118,11 @@ class RaizuinuHandler:
             from .scheduletask import ScheduleRunner
 
             self._schedule = ScheduleRunner(cfg)
+        self._guest = overrides.get("guest")
+        if self._guest is None and cfg.member_account_ids:
+            from .guest import GuestResponder
+
+            self._guest = GuestResponder(cfg)
         self._dedupe_lock = threading.Lock()
         self._processed_ids: dict[str, None] = {}  # 挿入順を保つLRU代替
         self._dedupe_path = cfg.resolve_path(cfg.state_dir) / "processed_messages.json"
@@ -245,6 +250,12 @@ class RaizuinuHandler:
         if not question:
             return
 
+        # 経理財務部メンバー以外には、社内の手順・ナレッジを返さない。
+        # ハンドブックを渡さない軽量フローへ回す（構造的に答えようがない）
+        if self._guest is not None and not self._is_member(event):
+            self._process_guest(event, question)
+            return
+
         # 同一ルームの直近会話を文脈として付与（FR-01）
         context = ""
         messages: list = []
@@ -332,6 +343,7 @@ class RaizuinuHandler:
                 if document is None:
                     # 文書依頼と分かっているものをQ&Aへ流すと「機能がない」等の
                     # 誤った回答になるため、ここで案内文を返して終える
+                    self._mark_asked_back(event)
                     self._reply_and_audit(
                         event, question, NO_DOCUMENT_GUIDANCE, "doc_task_not_found"
                     )
@@ -424,6 +436,71 @@ class RaizuinuHandler:
             }
         )
 
+    # --- メンバー判定 ---
+
+    def _followup_path(self) -> Path:
+        return self._config.resolve_path(self._config.state_dir) / "awaiting_reply.json"
+
+    def _is_member(self, event: MentionEvent) -> bool:
+        """通常のフローで応対してよい相手か。
+
+        経理財務部メンバーはそのまま。メンバー以外でも、アシスタントが直前に
+        聞き返した相手なら、その返信だけは通常どおり扱う（会話を途中で
+        打ち切らないため）。
+        """
+        members = {int(i) for i in self._config.member_account_ids}
+        if not members:
+            return True  # 未設定なら制限しない（設定漏れで全員を遮断しないため）
+        if int(event.account_id) in members:
+            return True
+        key = f"{event.room_id}:{event.account_id}"
+        pending = _read_json(self._followup_path())
+        asked_at = pending.get(key)
+        if not asked_at:
+            return False
+        minutes = int(self._config.guest_followup_minutes)
+        if int(event.send_time) - int(asked_at) > minutes * 60:
+            return False
+        pending.pop(key, None)  # 1往復だけ許す
+        _write_json(self._followup_path(), pending)
+        return True
+
+    def _mark_asked_back(self, event: MentionEvent) -> None:
+        """聞き返したことを覚えておく（次の返信を通常フローで受けるため）。"""
+        pending = _read_json(self._followup_path())
+        pending[f"{event.room_id}:{event.account_id}"] = int(event.send_time)
+        _write_json(self._followup_path(), pending)
+
+    def _process_guest(self, event: MentionEvent, question: str) -> None:
+        """部外の方へ、ハンドブックを使わずに短く応対する。"""
+        status = self._cost.status()
+        if status.over_limit:
+            self._chatwork.send_message(event.room_id, _reply_tag(event) + STOPPED_MESSAGE)
+            return
+
+        reply, usage = self._guest.reply(question)
+        cost_status = self._add_usage_safely(usage)
+        self._chatwork.send_message(event.room_id, _reply_tag(event) + reply)
+        try:
+            self._audit_safely(
+                {
+                    "type": "guest",
+                    "room_id": event.room_id,
+                    "account_id": event.account_id,
+                    "message_id": event.message_id,
+                    "question": question,
+                    "answer": reply,
+                    "model": self._config.model,
+                    "usage": usage,
+                    "cost_jpy": round(self._cost.estimate_cost_jpy(usage), 3) if usage else 0.0,
+                    "monthly_total_jpy": (
+                        round(cost_status.total_jpy, 2) if cost_status else None
+                    ),
+                }
+            )
+        except Exception:
+            print("[warn] 部外応対の監査に失敗: " + traceback.format_exc(), flush=True)
+
     def _process_schedule(self, event: MentionEvent, question: str) -> None:
         """予定の照会・登録・取り消しを処理して返信する。"""
         from .answer import sanitize_for_chatwork
@@ -453,6 +530,8 @@ class RaizuinuHandler:
             kind = "schedule_answer"
 
         cost_status = self._add_usage_safely(usage)
+        if meta.get("error") == "missing_fields":
+            self._mark_asked_back(event)  # 続きの返信を通常フローで受ける
         self._chatwork.send_message(
             event.room_id, _reply_tag(event) + sanitize_for_chatwork(reply)
         )
@@ -511,6 +590,8 @@ class RaizuinuHandler:
             return
 
         status = self._add_usage_safely(usage)
+        if meta.get("error") in ("missing_fields", "template_not_found"):
+            self._mark_asked_back(event)  # 続きの返信を通常フローで受ける
 
         body = _reply_tag(event) + sanitize_for_chatwork(reply_text)
         artifact = meta.pop("artifact", None)
