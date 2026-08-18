@@ -118,6 +118,11 @@ class RaizuinuHandler:
             from .scheduletask import ScheduleRunner
 
             self._schedule = ScheduleRunner(cfg)
+        self._letterpack = overrides.get("letterpack")
+        if self._letterpack is None and cfg.letterpack.get("enabled"):
+            from .letterpack import LetterpackRunner
+
+            self._letterpack = LetterpackRunner(cfg, self._chatwork)
         self._guest = overrides.get("guest")
         if self._guest is None and cfg.member_account_ids:
             from .guest import GuestResponder
@@ -290,6 +295,27 @@ class RaizuinuHandler:
                 return
             if pending["flow"] == "schedule" and self._schedule is not None:
                 self._process_schedule(event, merged)
+                return
+
+        # レターパック手配のやり取りの続き（要否の返事・文面の確認・総務への回答）。
+        # 「2枚で」「送信」のような短い返事はQ&Aへ落ちてしまうため、先に見る。
+        # 進行中のやり取りが無ければ None が返り、通常の振り分けへ進む
+        if self._letterpack is not None:
+            from .letterpack import LetterpackError
+
+            try:
+                handled = self._letterpack.handle(
+                    event.room_id,
+                    event.account_id,
+                    int(event.send_time),
+                    question,
+                    display_name=_display_name(messages, event.account_id),
+                )
+            except LetterpackError as exc:
+                self._reply_and_audit(event, question, str(exc), "letterpack_failed")
+                return
+            if handled is not None:
+                self._reply_and_audit(event, question, handled, "letterpack")
                 return
 
         # 予定の照会・登録・取り消し → 専用フロー。
@@ -641,8 +667,23 @@ class RaizuinuHandler:
             # 足りない項目を答えてもらったら、元の依頼に足して作り直す
             self._save_pending(event, "doc_build", question)
 
-        body = _reply_tag(event) + sanitize_for_chatwork(reply_text)
         artifact = meta.pop("artifact", None)
+        # 送付状を作ったということは郵送する見込みが高い。レターパックの手配を
+        # 総務へ取り次ぐか、その場で確認する（FAX送付状は郵送しないので出さない）
+        if artifact and self._letterpack is not None and meta.get("fields", {}).get("kind") == "送付状":
+            reply_text += "\n\n" + self._letterpack.offer_text
+            self._letterpack.offer(
+                event.room_id,
+                event.account_id,
+                int(event.send_time),
+                {
+                    "company": (meta.get("company_name") or ""),
+                    "to_lines": meta.get("fields", {}).get("to_lines") or [],
+                    "items": meta.get("fields", {}).get("items") or [],
+                    "staff": meta.get("fields", {}).get("staff") or "",
+                },
+            )
+        body = _reply_tag(event) + sanitize_for_chatwork(reply_text)
         record = {
             "type": "doc_build" if artifact else "doc_build_not_ready",
             "room_id": event.room_id,

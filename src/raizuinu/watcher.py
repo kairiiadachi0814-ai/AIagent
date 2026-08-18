@@ -344,7 +344,16 @@ class DiscussionWatcher:
 
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
-    DiscussionWatcher().run_once()
+    config = Config.load()
+    # レターパックの取次ぎも同じタイマーに相乗りする（タイマーを増やさない）。
+    # 片方が落ちてももう片方は動かす
+    try:
+        from .letterpack import LetterpackFollower
+
+        LetterpackFollower(config).run_once()
+    except Exception:
+        print("[error] レターパックの追跡に失敗: " + traceback.format_exc(), flush=True)
+    DiscussionWatcher(config).run_once()
 
 
 if __name__ == "__main__":

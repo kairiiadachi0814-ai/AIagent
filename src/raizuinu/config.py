@@ -103,6 +103,21 @@ _DEFAULTS: dict[str, Any] = {
         "register_note": "",
         "greeting": "おはようございます。",
     },
+    # レターパックの手配依頼。送付状を作ったら総務へ取り次ぐ。
+    # supplies_room_id は許可ルーム（Q&Aの対象）に入れない。投稿と巡回だけに使い、
+    # 他部署のルームへ社内ナレッジが流れる経路を作らないため
+    "letterpack": {
+        "enabled": False,
+        "supplies_room_id": 0,
+        "staff_account_id": 0,
+        "staff_name": "",
+        # 総務の返信を巡回で拾う（備品ルームはwebhookの対象外のため）
+        "follow_up": True,
+        # 「2枚で」「送信」といった短い返事を、いつまで続きとみなすか
+        "reply_window_minutes": 120,
+        # 返信が来ないまま放置されたやり取りを閉じるまでの日数
+        "max_open_days": 7,
+    },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {
         "enabled": False,

@@ -324,6 +324,7 @@ class DocBuildRunner:
 
         meta["template"] = f"{kind}（{company['name']}）"
         meta["company"] = company["id"]
+        meta["company_name"] = company["name"]
         missing = self._missing(kind, fields)
         if missing:
             meta["error"] = "missing_fields"

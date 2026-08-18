@@ -69,6 +69,15 @@
     "max_items": 20,
     "attach_to_chatwork": true
   },
+  "letterpack": {
+    "enabled": true,
+    "supplies_room_id": 345854487,
+    "staff_account_id": 1160869,
+    "staff_name": "坂口 美代子",
+    "follow_up": true,
+    "reply_window_minutes": 120,
+    "max_open_days": 7
+  },
   "webhook_async": true,
   "webhook_max_concurrency": 2,
   "webhook_max_queue": 10,
