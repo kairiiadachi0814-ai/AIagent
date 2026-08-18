@@ -345,18 +345,23 @@ class DocBuildRunner:
         return [c for c in data.get("companies", []) if c.get("id") and c.get("name")]
 
     def _find_company(self, company_id: str, hint: str) -> dict[str, Any] | None:
-        """IDで引き、無ければ名指しされた会社名・略称から探す。
+        """差出人として名指しされた社名から会社を引く。
+
+        依頼文に書かれていた社名（hint）を先に見る。company_id はモデルの
+        解釈であり、「ライズ名義で」をライズホールディングスと取り違えても
+        こちらからは分からないため、依頼文に根拠がある側を優先する。
 
         「ライズ」が「ライズホールディングス」にも含まれるように、社名は互いに
-        food-chain のように重なる。先に見つかったものではなく、いちばん強く
-        一致したものを採る（完全一致 > 長く一致したほう）。
+        重なる。先に見つかったものではなく、いちばん強く一致したものを採る
+        （完全一致 > 長く一致したほう）。
         """
         companies = self._companies()
-        for company in companies:
-            if company_id and company_id == company["id"]:
-                return company
         target = _fold(hint)
         if not target:
+            # 差出人の名指しがない依頼。文脈から拾った company_id があれば使う
+            for company in companies:
+                if company_id and company_id == company["id"]:
+                    return company
             return None
         best: dict[str, Any] | None = None
         best_score = 0
@@ -400,7 +405,7 @@ class DocBuildRunner:
 
         companies = self._companies()
         catalog = "\n".join(
-            "- {id}: {name}{alias}{mark}".format(
+            "- {id}: {name}{alias}{mark}{note}".format(
                 id=c["id"],
                 name=c["name"],
                 alias=(
@@ -409,6 +414,7 @@ class DocBuildRunner:
                     else ""
                 ),
                 mark="　※指定がないときはこの会社" if c.get("default") else "",
+                note=f"　※{c['note']}" if c.get("note") else "",
             )
             for c in companies
         )

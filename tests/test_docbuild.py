@@ -245,6 +245,25 @@ class TestCompanyDirectory:
         runner = DocBuildRunner(make_config(tmp_path), client=fake_client({}))
         assert runner._find_company("", "株式会社大塚商会") is None
 
+    def test_the_named_company_wins_over_the_models_guess(self, tmp_path):
+        # 「ライズ」はライズクリエイションを指す。モデルが持株会社と取り違えても、
+        # 依頼文に書かれていた社名のほうを採る
+        runner = DocBuildRunner(make_config(tmp_path), client=fake_client({}))
+        found = runner._find_company("ライズホールディングス", "ライズ")
+        assert found["name"] == "株式会社ライズクリエイション"
+
+    def test_naming_rule_is_given_to_the_model(self, tmp_path):
+        client = fake_client(
+            {
+                "kind": "送付状", "company_id": "ライズクリエイション", "sender_hint": "",
+                "date": "", "to_lines": [], "staff": "", "items": [],
+                "missing": [], "opening": "",
+            }
+        )
+        DocBuildRunner(make_config(tmp_path), client=client).run("送付状を作って")
+        prompt = client.kwargs["messages"][0]["content"]
+        assert "「ライズ」とだけ書かれていればこの会社" in prompt
+
 
 class TestFaxSoufujo:
     def test_xlsx_is_built_with_directory_lookup(self, tmp_path):
