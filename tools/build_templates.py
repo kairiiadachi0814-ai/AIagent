@@ -39,6 +39,10 @@ PH_ADDR1 = "{{sender_address1}}"
 PH_ADDR2 = "{{sender_address2}}"
 PH_TEL = "{{sender_tel}}"
 PH_DEPT = "{{sender_dept}}"
+# 明細と「以上」の間の余白。原本は空段落を手で並べてあり、宛先や明細が増えると
+# そのぶん下へ押し出されて2枚目に溢れる。1段落だけ目印にして、必要な数を
+# 差し込む側で決める（送付状.py の LAYOUT_FILLER）
+PH_FILLER = "{{filler}}"
 
 SPECS = [
     {
@@ -62,6 +66,8 @@ SPECS = [
             # 部数は右端で揃えず左詰め。区切りの空白は差し込む側が持つ
             # （「一式」のように部数を付けない行で末尾に空白を残さないため）
             684: f"■{PH_ITEM}{PH_QTY}",
+            685: PH_FILLER,  # 以降の空段落は目印1つにまとめる
+            **{i: None for i in range(686, 694)},
         },
     },
     {
@@ -82,6 +88,8 @@ SPECS = [
             48: f"担当： {PH_DEPT}{PH_STAFF}",
             67: None,  # 「＜添付書類＞」の見出しは使わない（記から2行空けて本文）
             68: f"・{PH_ITEM}{PH_QTY}",
+            69: PH_FILLER,  # 以降の空段落は目印1つにまとめる
+            **{i: None for i in range(70, 77)},
         },
     },
 ]
@@ -104,6 +112,11 @@ def set_para_text(p: ET.Element, text: str) -> None:
         if found is not None:
             rpr = copy.deepcopy(found)
             break
+    if rpr is None:
+        # 空段落にはrunが無い。段落記号の書式を引き継がないと行の高さが変わる
+        mark = p.find(W + "pPr/" + W + "rPr")
+        if mark is not None:
+            rpr = copy.deepcopy(mark)
     for child in list(p):
         if child.tag in (W + "r", W + "hyperlink", W + "bookmarkStart", W + "bookmarkEnd"):
             p.remove(child)

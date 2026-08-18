@@ -362,6 +362,57 @@ class TestItemLines:
         assert "契約書一式" not in reply  # 仮置きしていないので断らない
 
 
+class TestPageFit:
+    """改行が理由で2枚目に溢れないこと（明細が多くて溢れるのは想定どおり）。"""
+
+    # ひな形そのものの段落数。原本はこの行数で1枚に収まっていた
+    BASE = {"ライズクリエイション": 36, "RAKUTENKEN": 37}
+
+    def paragraphs(self, tmp_path, company_id, to_parts, item_count):
+        client = fake_client(
+            {
+                "kind": "送付状", "company_id": company_id, "sender_hint": "",
+                "date": "2026年8月18日",
+                "items": [{"name": f"書類{i + 1}", "qty": "1部"} for i in range(item_count)],
+                "missing": [], "opening": "", **to_parts,
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        _, meta, _ = runner.run("送付状を作って", requester_name="足立 海里")
+        return docx_paragraphs(meta["artifact"][1])
+
+    @pytest.mark.parametrize("company_id", ["ライズクリエイション", "RAKUTENKEN"])
+    @pytest.mark.parametrize("item_count", [1, 3, 5, 7])
+    def test_a_two_line_recipient_does_not_push_the_page(
+        self, tmp_path, company_id, item_count
+    ):
+        # 宛先が2行になり明細が増えても、下の余白を削って行数を保つ
+        two_line = {"to_company": "株式会社A", "to_branch": "大阪支店", "to_person": "木村"}
+        assert len(self.paragraphs(tmp_path, company_id, two_line, item_count)) == self.BASE[
+            company_id
+        ]
+
+    @pytest.mark.parametrize("company_id", ["ライズクリエイション", "RAKUTENKEN"])
+    def test_many_items_are_allowed_to_overflow(self, tmp_path, company_id):
+        one_line = {"to_company": "株式会社A"}
+        assert len(self.paragraphs(tmp_path, company_id, one_line, 20)) > self.BASE[company_id]
+
+    def test_a_blank_line_is_kept_before_ijou(self, tmp_path):
+        # 余白を削り切っても「以上」が明細に貼り付かないこと
+        paragraphs = self.paragraphs(
+            tmp_path, "ライズクリエイション", {"to_company": "株式会社A"}, 20
+        )
+        assert paragraphs[paragraphs.index("以上") - 1] == ""
+
+    def test_the_filler_shrinks_by_the_lines_that_were_added(self):
+        from raizuinu.docbuild import LAYOUT_FILLER, filler_lines
+
+        assert filler_lines("標準", ["A"], [1]) == LAYOUT_FILLER["標準"]
+        assert filler_lines("標準", ["A", "B"], [1]) == LAYOUT_FILLER["標準"] - 1
+        assert filler_lines("標準", ["A", "B"], [1, 2, 3]) == LAYOUT_FILLER["標準"] - 3
+        assert filler_lines("標準", ["A", "B"], list(range(50))) == 1  # 下限で止まる
+
+
 class TestCompanyDirectory:
     def build(self, tmp_path, company_id, hint=""):
         client = fake_client(

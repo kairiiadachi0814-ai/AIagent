@@ -33,6 +33,11 @@ LAYOUTS: dict[str, str] = {
     "標準": "送付状_標準.docx",
     "楽天軒型": "送付状_楽天軒型.docx",
 }
+# 明細と「以上」の間に入れる空行の数（宛先1行・明細1件のとき）。
+# 原本がこの行数で1枚に収まっていた。宛先や明細が増えた分だけここを削り、
+# 改行が理由で2枚目に溢れないようにする（明細そのものが多い場合は溢れてよい）
+LAYOUT_FILLER: dict[str, int] = {"標準": 9, "楽天軒型": 8}
+MIN_FILLER = 1  # 「以上」が最終行に貼り付かないよう1行だけは残す
 SOUFUJO_BOX_URL = "https://app.box.com/file/1529686391255"
 FAX_TEMPLATE = "FAX送付状.xlsx"
 FAX_SHEET = "汎用"
@@ -590,6 +595,7 @@ class DocBuildRunner:
                     # （空欄のまま残すと「TEL：」だけの行が印字されてしまう）
                     "sender_address2": [{"sender_address2": address2}] if address2 else [],
                     "sender_tel": [{"sender_tel": tel}] if tel else [],
+                    "filler": [{"filler": ""}] * filler_lines(layout, to_lines, items),
                 },
             )
         else:
@@ -822,6 +828,19 @@ def expand_legal_form(name: str) -> str:
         text = text.replace(ligature, full)
     text = _ABBREV_RE.sub(lambda m: _LEGAL_FORMS[m.group(1)], text)
     return re.sub(r"[\s　]+", " ", text).strip()
+
+
+def filler_lines(layout: str, to_lines: list[str], items: list[Any]) -> int:
+    """明細と「以上」の間に入れる空行の数。
+
+    原本は空段落を手で並べて「以上」を紙の下へ寄せてある。宛先が2行になったり
+    明細が増えたりすると、その空段落ごと押し下げられて2枚目に溢れる。
+    増えた行数だけ空行を削り、改行が理由で紙が増えないようにする。
+    明細そのものが多くて溢れるのは想定どおりなので、下限で止める。
+    """
+    base = LAYOUT_FILLER.get(layout, LAYOUT_FILLER["標準"])
+    grew = max(0, len(to_lines) - 1) + max(0, len(items) - 1)
+    return max(MIN_FILLER, base - grew)
 
 
 # 「一式」で数える書類。個数を足すと「一式 1部」になってしまう
