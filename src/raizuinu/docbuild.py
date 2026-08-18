@@ -286,16 +286,25 @@ class DocBuildRunner:
 
         fields, usage = self._extract(instruction, context, requester_name)
         _normalize(fields)  # 空白だけの宛先・品名を捨ててから不足判定にかける
-        # 書類の担当者は、依頼してきた人の苗字。依頼文から拾わせるとモデルが
-        # 宛先側の担当者名を差出人欄へ回すことがあるため、コードで確定させる。
-        # 表示名が拾えなかったとき（会話履歴の取得に失敗した等）だけ、聞き返した
-        # 答えを依頼文から拾う
+        # 書類の担当者は、原則として依頼してきた人の苗字。代理で作るときのために
+        # 「担当は岩永で」のような名指しがあればそちらを使う。名指しの判定は
+        # コードで行う（モデルに拾わせると宛先側の担当者名が差出人欄へ回るため）
         roster = self._roster()
-        fields["staff"] = surname(requester_name, roster) or _staff_from_text(instruction, roster)
+        mine = surname(requester_name, roster)
+        named = _staff_from_text(instruction, roster)
+        if named and any(named in str(line) for line in fields.get("to_lines") or []):
+            named = ""  # 宛先に出てくる名前は先方の担当者。差出人にはしない
+        fields["staff"] = named or mine
+        # 依頼者本人以外の名前で作るときは、黙って通さず返信で伝える
+        meta["staff_override"] = named if named and named != mine else ""
         meta["fields"] = {k: v for k, v in fields.items() if k != "opening"}
 
         kind = str(fields.get("kind") or "")
         hint = str(fields.get("sender_hint") or "").strip()
+        if any(_fold(hint) == _fold(member) for member in roster):
+            # 「岩永名義で」は担当者の名指し。会社の名指しと同じ言い方になるため、
+            # 社名として扱うと未登録の会社を聞き返してしまう
+            hint = ""
         company = self._find_company(str(fields.get("company_id") or ""), hint)
         if company is None and not hint:
             # 差出人の指定がない依頼は、既定の会社（ライズクリエイション）で作る
@@ -330,7 +339,8 @@ class DocBuildRunner:
             ) from exc
         meta["artifact"] = (filename, data)
         meta["output_filename"] = filename
-        return self._reply(fields, kind, company), meta, usage
+        reply = self._reply(fields, kind, company, meta.get("staff_override", ""))
+        return reply, meta, usage
 
     # --- 内部 ---
 
@@ -588,15 +598,24 @@ class DocBuildRunner:
         name = f"{DOC_LABELS[kind]}_{_safe_name(label)}_{_ymd(date)}{suffix}"
         return name, out
 
-    def _reply(self, fields: dict[str, Any], kind: str, company: dict[str, Any]) -> str:
+    def _reply(
+        self,
+        fields: dict[str, Any],
+        kind: str,
+        company: dict[str, Any],
+        staff_override: str = "",
+    ) -> str:
         opening = _delivering_opening(fields.get("opening"))
         assumed = [
             item["name"] for item in fields.get("items") or [] if not item.get("qty")
         ]
         note = ""
+        if staff_override:
+            # 依頼者本人以外の名前で作った箇所は、黙って通さず必ず伝える
+            note = f"担当者は「{staff_override}」で作成しています。\n"
         if assumed:
             # 推測で埋めた箇所は黙って通さず、必ず伝える
-            note = "部数の指定がなかった「" + "」「".join(assumed) + "」は1部としています。\n"
+            note += "部数の指定がなかった「" + "」「".join(assumed) + "」は1部としています。\n"
         return (
             f"{opening}\n\n"
             f"{note}"
@@ -680,6 +699,11 @@ def surname(display_name: str, roster: tuple[str, ...] = ()) -> str:
 _STAFF_MARKER_RE = re.compile(r"(担当(?:者)?(?:名)?|差出人|発信者|私)[はをのが：:\s]*$")
 # 「足立です」「足立さん」のような、名前だけの返事に付く言い回し
 _POLITE_TAIL_RE = re.compile(r"(?:さん|様|氏|くん|ちゃん)?(?:です|でお願いします|でお願いします)?[。．.]?$")
+# 名前のすぐ後ろの敬称。自社の担当者名には付かないので、先方の担当者の目印になる
+_HONORIFIC_AFTER_RE = re.compile(r"[\s　]*(?:様|さま|サマ|殿|どの|さん)")
+# 「岩永名義で」のように、名前の後ろに付く名指しの言い方。会社にも同じ言い方を
+# 使う（「ヤマトライジング名義で」）が、こちらは名簿にある人だけを見るので混ざらない
+_STAFF_SUFFIX_RE = re.compile(r"^(?:さん|氏)?[\s　]*(?:名義|名で|の名前|の名義)")
 
 
 def _staff_from_text(instruction: str, roster: tuple[str, ...]) -> str:
@@ -696,8 +720,14 @@ def _staff_from_text(instruction: str, roster: tuple[str, ...]) -> str:
             return member  # 聞き返しへの「足立」「足立です」という答え
     for member in roster:
         for match in re.finditer(re.escape(member), text):
-            if _STAFF_MARKER_RE.search(text[: match.start()]):
-                return member
+            tail = text[match.end() :]
+            if _STAFF_SUFFIX_RE.match(tail):
+                return member  # 「岩永名義で」「岩永さん名義で」
+            if not _STAFF_MARKER_RE.search(text[: match.start()]):
+                continue
+            if _HONORIFIC_AFTER_RE.match(tail):
+                continue  # 「担当は伊藤様」は先方の担当者。自社の担当者に敬称は付かない
+            return member
     return ""
 
 

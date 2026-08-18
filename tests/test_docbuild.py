@@ -809,6 +809,69 @@ class TestSenderStaff:
         assert "担当： 経理財務部　足立" in joined
         assert "担当： 経理財務部　坂田" not in joined
 
+    @pytest.mark.parametrize(
+        "instruction",
+        [
+            "担当は岩永で株式会社Aあての送付状を作って",
+            "岩永名義で株式会社Aあての送付状を作って",
+            "岩永さん名義で株式会社Aあての送付状を作って",
+            "担当者：岩永　で株式会社Aあての送付状を作って",
+            "弊社担当は岩永、株式会社Aあての送付状を作って",
+        ],
+    )
+    def test_named_staff_is_used_when_making_it_on_someone_elses_behalf(
+        self, tmp_path, instruction
+    ):
+        # 代理で作る場面（足立が岩永名義の送付状を用意する）
+        client = fake_client(
+            {
+                "kind": "送付状", "company_id": "ライズクリエイション", "sender_hint": "",
+                "date": "2026年8月17日", "to_lines": ["株式会社A 御中"],
+                "items": [{"name": "契約書", "qty": "1部"}], "missing": [], "opening": "",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        reply, meta, _ = runner.run(instruction, requester_name="足立 海里")
+        assert "担当： 経理財務部　岩永" in "".join(docx_texts(meta["artifact"][1]))
+        assert "担当者は「岩永」で作成しています" in reply  # 本人以外の名前は黙って通さない
+
+    def test_a_name_only_hint_is_not_mistaken_for_an_unregistered_company(self, tmp_path):
+        # 「岩永名義で」は担当者の名指し。会社の名指しと同じ言い方になるため、
+        # 社名として扱うと未登録の会社を聞き返してしまう
+        client = fake_client(
+            {
+                "kind": "送付状", "company_id": "", "sender_hint": "岩永",
+                "date": "2026年8月17日", "to_lines": ["株式会社A 御中"],
+                "items": [{"name": "契約書", "qty": "1部"}], "missing": [], "opening": "",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        _, meta, _ = runner.run("岩永名義で株式会社Aあての送付状を作って", requester_name="足立 海里")
+        joined = "".join(docx_texts(meta["artifact"][1]))
+        assert "株式会社ライズクリエイション" in joined  # 会社は既定のまま
+        assert "担当： 経理財務部　岩永" in joined
+
+    @pytest.mark.parametrize(
+        "instruction",
+        [
+            "株式会社Aの担当は伊藤様です。送付状を作って",
+            "株式会社Aの担当は伊藤さん宛てで送付状を作って",
+        ],
+    )
+    def test_the_recipients_contact_is_not_taken_as_our_staff(self, tmp_path, instruction):
+        # 敬称が付いていれば先方の担当者。自社の担当者名に敬称は付かない
+        client = fake_client(
+            {
+                "kind": "送付状", "company_id": "ライズクリエイション", "sender_hint": "",
+                "date": "2026年8月17日", "to_lines": ["株式会社A", "伊藤 様"],
+                "items": [{"name": "契約書", "qty": "1部"}], "missing": [], "opening": "",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        reply, meta, _ = runner.run(instruction, requester_name="足立 海里")
+        assert "担当： 経理財務部　足立" in "".join(docx_texts(meta["artifact"][1]))
+        assert "担当者は「" not in reply  # 依頼者本人なので断り書きは出さない
+
     def test_blank_requester_name_is_asked_for_instead_of_shipping_a_blank_field(
         self, tmp_path
     ):
