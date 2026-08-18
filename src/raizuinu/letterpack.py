@@ -110,8 +110,8 @@ def build_request_text(detail: dict[str, Any], count: int, kind: str) -> str:
     requester = str(detail.get("staff") or "").strip()
     on_behalf = f"経理財務部の{requester}さんの依頼です。" if requester else ""
     return (
-        f"お疲れさまです。{on_behalf}"
-        f"レターパックの手配をお願いできますでしょうか。\n"
+        f"お疲れさまです。\n"
+        f"{on_behalf}レターパックの手配をお願いできますでしょうか。\n"
         f"\n"
         f"・使用会社名: {detail.get('company') or ''}\n"
         f"・宛先と使用内容: {summarize_use(detail)}\n"
