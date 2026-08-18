@@ -131,8 +131,10 @@ class TestFollowup:
         # アシスタントが聞き返した状態を作る
         from raizuinu.webhook import MentionEvent
 
-        handler._mark_asked_back(
-            MentionEvent(room_id=ROOM, message_id="9", account_id=GUEST, body="", send_time=1700000000)
+        handler._save_pending(
+            MentionEvent(room_id=ROOM, message_id="9", account_id=GUEST, body="", send_time=1700000000),
+            "doc_task",
+            "書類送付状を作って",
         )
         raw = payload(GUEST, body="[To:999] 株式会社Aです", message_id="10", send_time=1700000600)
         handler.handle_webhook(raw, sign(raw))
@@ -144,8 +146,10 @@ class TestFollowup:
         handler, chatwork, generator, _ = make_handler(tmp_path, monkeypatch, guest=guest)
         from raizuinu.webhook import MentionEvent
 
-        handler._mark_asked_back(
-            MentionEvent(room_id=ROOM, message_id="9", account_id=GUEST, body="", send_time=1700000000)
+        handler._save_pending(
+            MentionEvent(room_id=ROOM, message_id="9", account_id=GUEST, body="", send_time=1700000000),
+            "doc_task",
+            "書類送付状を作って",
         )
         for mid, t in (("10", 1700000600), ("11", 1700000700)):
             raw = payload(GUEST, body="[To:999] 手順を教えて", message_id=mid, send_time=t)
@@ -159,8 +163,10 @@ class TestFollowup:
         handler._config.data["guest_followup_minutes"] = 30
         from raizuinu.webhook import MentionEvent
 
-        handler._mark_asked_back(
-            MentionEvent(room_id=ROOM, message_id="9", account_id=GUEST, body="", send_time=1700000000)
+        handler._save_pending(
+            MentionEvent(room_id=ROOM, message_id="9", account_id=GUEST, body="", send_time=1700000000),
+            "doc_task",
+            "書類送付状を作って",
         )
         # 31分後の返信は続きとみなさない
         raw = payload(GUEST, body="[To:999] 手順を教えて", message_id="10", send_time=1700000000 + 31 * 60)

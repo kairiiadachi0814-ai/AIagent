@@ -746,3 +746,125 @@ class TestRosterMaintenance:
         from raizuinu.docbuild import surname
 
         assert surname("岩永太郎", tuple(self._roster())) == "岩永"
+
+
+class TestAskBackContinuation:
+    """聞き返しへの答えを、元の依頼に足して同じフローへ戻す。
+
+    実地で「宛先は『大阪市梅田市税事務所』…」という返信が書類作成へ戻らず、
+    Q&Aに落ちてファイルが作られない事故が起きた。書類名を含まない返信でも
+    続きとして扱えるようにする。
+    """
+
+    def build(self, tmp_path, monkeypatch, doc_build):
+        from tests.test_guest import FakeChatwork, make_handler as _unused  # noqa: F401
+        from raizuinu.answer import Answer
+        from raizuinu.handbook import HandbookLoader
+        from raizuinu.handler import RaizuinuHandler
+        from tests.test_handler import TOKEN, FakeAudit, FakeGenerator
+
+        monkeypatch.setenv("CHATWORK_WEBHOOK_TOKEN", TOKEN)
+        (tmp_path / "銀行明細取得.md").write_text("# 手順\n", encoding="utf-8")
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["allowed_room_ids"] = [12345]
+        config.data["webhook_async"] = False
+        config.data["state_dir"] = str(tmp_path / "state")
+        config.data["audit_log_dir"] = str(tmp_path / "logs")
+        config.base_dir = tmp_path
+        chatwork = FakeChatworkWithUpload()
+        generator = FakeGenerator(Answer(has_answer=True, text="回答", sources=[], usage={}))
+        handler = RaizuinuHandler(
+            config, chatwork=chatwork, generator=generator, audit=FakeAudit(),
+            handbook_loader=HandbookLoader([tmp_path], ["*.md"], [], 300),
+            doc_build=doc_build,
+        )
+        return handler, chatwork, generator
+
+    def send(self, handler, body, message_id, send_time):
+        from tests.test_handler import sign
+
+        raw = json.dumps(
+            {
+                "webhook_event_type": "mention_to_me",
+                "webhook_event": {
+                    "from_account_id": 111, "to_account_id": 999, "room_id": 12345,
+                    "message_id": message_id, "body": body, "send_time": send_time,
+                },
+            }
+        ).encode()
+        return handler.handle_webhook(raw, sign(raw))
+
+    def test_followup_without_the_document_name_still_builds(self, tmp_path, monkeypatch):
+        class TwoStep:
+            def __init__(self):
+                self.seen = []
+
+            def run(self, instruction, context="", requester_name=""):
+                self.seen.append(instruction)
+                if "梅田市税事務所" not in instruction:
+                    return "宛先を教えてください", {"error": "missing_fields"}, {}
+                return (
+                    "作成しました。",
+                    {"template": "書類送付状_ヤマトライジング",
+                     "output_filename": "書類送付状.docx",
+                     "artifact": ("書類送付状.docx", b"WORD")},
+                    {},
+                )
+
+        runner = TwoStep()
+        handler, chatwork, generator = self.build(tmp_path, monkeypatch, runner)
+
+        self.send(handler, "[To:999] ヤマトライジング名で書類送付状を作成してほしい。", "1", 1700000000)
+        assert not chatwork.uploads  # 1通目は聞き返し
+
+        # 「送付状」を含まない返信でも、続きとして書類作成へ戻る
+        self.send(handler, "[To:999] 宛先は「大阪市梅田市税事務所」で担当は「納税担当」。", "2", 1700000180)
+        assert chatwork.uploads, "続きの返信で書類が作られていない"
+        assert not generator.calls, "Q&Aへ落ちてはいけない"
+        assert "梅田市税事務所" in runner.seen[1]
+        assert "書類送付状を作成してほしい" in runner.seen[1]  # 元の依頼が保たれている
+
+    def test_unrelated_question_after_an_ask_back_is_not_merged(self, tmp_path, monkeypatch):
+        class AlwaysAsks:
+            def __init__(self):
+                self.seen = []
+
+            def run(self, instruction, context="", requester_name=""):
+                self.seen.append(instruction)
+                return "宛先を教えてください", {"error": "missing_fields"}, {}
+
+        runner = AlwaysAsks()
+        handler, chatwork, generator = self.build(tmp_path, monkeypatch, runner)
+        self.send(handler, "[To:999] 送付状を作って", "1", 1700000000)
+        # 予定の話は別件。書類作成に足さない
+        self.send(handler, "[To:999] 足立さんの今日の予定教えて", "2", 1700000060)
+        assert len(runner.seen) == 1
+
+
+class TestAskBackWording:
+    """聞き返しの時点では何も作っていない。作った体で書かない。"""
+
+    @pytest.mark.parametrize(
+        "opening",
+        [
+            "承知しました。ヤマトライジング名の書類送付状で作成しましたが、宛先が不足しているため空欄にしています。",
+            "作りました。",
+            "よろしくお願いいたします。",
+            "",
+        ],
+    )
+    def test_completion_claims_are_replaced(self, tmp_path, opening):
+        client = fake_client(
+            {
+                "template_id": "書類送付状_ヤマトライジング", "date": "2026年8月18日",
+                "to_lines": [], "staff": "足立",
+                "items": [{"name": "債権差押通知書", "qty": "一式"}],
+                "missing": [], "opening": opening,
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        reply, meta, _ = runner.run("ヤマトライジング名で書類送付状を作って")
+        assert meta["error"] == "missing_fields"
+        assert reply.startswith("書類の下書き、お作りしますね。")
+        assert "作成しました" not in reply
+        assert "空欄" not in reply

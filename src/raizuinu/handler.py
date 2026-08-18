@@ -250,9 +250,15 @@ class RaizuinuHandler:
         if not question:
             return
 
+        # 聞き返し中の依頼は1往復ぶんだけ有効。読んだ時点で消し、
+        # 再度聞き返すときに改めて保存する
+        pending = self._load_pending(event)
+        if pending:
+            self._clear_pending(event)
+
         # 経理財務部メンバー以外には、社内の手順・ナレッジを返さない。
         # ハンドブックを渡さない軽量フローへ回す（構造的に答えようがない）
-        if self._guest is not None and not self._is_member(event):
+        if self._guest is not None and not self._is_member(event, pending):
             self._process_guest(event, question)
             return
 
@@ -274,6 +280,17 @@ class RaizuinuHandler:
             raise RuntimeError(
                 "ハンドブックが1件も読み込めません。handbook.roots の設定を確認してください"
             )
+
+        # 聞き返しへの答えは、元の依頼に足して同じフローへ戻す。
+        # 「宛先は◯◯です」だけでは書類作成の依頼と分からず、Q&Aへ落ちてしまうため
+        if pending and self._continues_pending(pending, question, event.body):
+            merged = f"{pending['instruction']}\n{question}"
+            if pending["flow"] == "doc_build" and self._doc_build is not None:
+                self._process_doc_build(event, merged, context, messages)
+                return
+            if pending["flow"] == "schedule" and self._schedule is not None:
+                self._process_schedule(event, merged)
+                return
 
         # 予定の照会・登録・取り消し → 専用フロー。
         # 登録は管理者アカウントからの依頼だけ受け付ける（ルーム制限とは別に効かせる）
@@ -343,7 +360,9 @@ class RaizuinuHandler:
                 if document is None:
                     # 文書依頼と分かっているものをQ&Aへ流すと「機能がない」等の
                     # 誤った回答になるため、ここで案内文を返して終える
-                    self._mark_asked_back(event)
+                    # 添付し直してもらう案内。文面を足しても解決しないので
+                    # フローは覚えず、部外判定の猶予だけ与える
+                    self._save_pending(event, "doc_task", question)
                     self._reply_and_audit(
                         event, question, NO_DOCUMENT_GUIDANCE, "doc_task_not_found"
                     )
@@ -438,10 +457,53 @@ class RaizuinuHandler:
 
     # --- メンバー判定 ---
 
-    def _followup_path(self) -> Path:
-        return self._config.resolve_path(self._config.state_dir) / "awaiting_reply.json"
+    def _pending_path(self) -> Path:
+        return self._config.resolve_path(self._config.state_dir) / "pending_request.json"
 
-    def _is_member(self, event: MentionEvent) -> bool:
+    def _load_pending(self, event: MentionEvent) -> dict | None:
+        """聞き返し中の依頼（期限切れなら無効）。"""
+        entry = _read_json(self._pending_path()).get(f"{event.room_id}:{event.account_id}")
+        if not entry:
+            return None
+        minutes = int(self._config.guest_followup_minutes)
+        if int(event.send_time) - int(entry.get("ts", 0)) > minutes * 60:
+            return None
+        return entry
+
+    def _save_pending(self, event: MentionEvent, flow: str, instruction: str) -> None:
+        """聞き返した依頼を覚えておく（返ってきた答えを元の依頼に足すため）。"""
+        data = _read_json(self._pending_path())
+        data[f"{event.room_id}:{event.account_id}"] = {
+            "flow": flow,
+            "instruction": instruction,
+            "ts": int(event.send_time),
+        }
+        _write_json(self._pending_path(), data)
+
+    @staticmethod
+    def _continues_pending(pending: dict, question: str, body: str) -> bool:
+        """聞き返しへの答えとみなしてよいか（別件の依頼なら足さない）。"""
+        if pending.get("flow") not in ("doc_build", "schedule"):
+            return False
+        from .docbuild import looks_like_document_build_request
+        from .doctask import _FILE_TAG_RE
+        from .scheduletask import looks_like_schedule_request
+
+        # 添付つき、または新しい依頼と読める文なら、聞き返しの答えではない
+        if _FILE_TAG_RE.search(body or ""):
+            return False
+        if pending["flow"] == "doc_build" and looks_like_schedule_request(question):
+            return False
+        if pending["flow"] == "schedule" and looks_like_document_build_request(question):
+            return False
+        return True
+
+    def _clear_pending(self, event: MentionEvent) -> None:
+        data = _read_json(self._pending_path())
+        if data.pop(f"{event.room_id}:{event.account_id}", None) is not None:
+            _write_json(self._pending_path(), data)
+
+    def _is_member(self, event: MentionEvent, pending: dict | None = None) -> bool:
         """通常のフローで応対してよい相手か。
 
         経理財務部メンバーはそのまま。メンバー以外でも、アシスタントが直前に
@@ -453,23 +515,8 @@ class RaizuinuHandler:
             return True  # 未設定なら制限しない（設定漏れで全員を遮断しないため）
         if int(event.account_id) in members:
             return True
-        key = f"{event.room_id}:{event.account_id}"
-        pending = _read_json(self._followup_path())
-        asked_at = pending.get(key)
-        if not asked_at:
-            return False
-        minutes = int(self._config.guest_followup_minutes)
-        if int(event.send_time) - int(asked_at) > minutes * 60:
-            return False
-        pending.pop(key, None)  # 1往復だけ許す
-        _write_json(self._followup_path(), pending)
-        return True
-
-    def _mark_asked_back(self, event: MentionEvent) -> None:
-        """聞き返したことを覚えておく（次の返信を通常フローで受けるため）。"""
-        pending = _read_json(self._followup_path())
-        pending[f"{event.room_id}:{event.account_id}"] = int(event.send_time)
-        _write_json(self._followup_path(), pending)
+        # 部外の方でも、聞き返した直後の返信は通常フローで受ける
+        return pending is not None
 
     def _process_guest(self, event: MentionEvent, question: str) -> None:
         """部外の方へ、ハンドブックを使わずに短く応対する。"""
@@ -531,7 +578,7 @@ class RaizuinuHandler:
 
         cost_status = self._add_usage_safely(usage)
         if meta.get("error") == "missing_fields":
-            self._mark_asked_back(event)  # 続きの返信を通常フローで受ける
+            self._save_pending(event, "schedule", question)
         self._chatwork.send_message(
             event.room_id, _reply_tag(event) + sanitize_for_chatwork(reply)
         )
@@ -591,7 +638,8 @@ class RaizuinuHandler:
 
         status = self._add_usage_safely(usage)
         if meta.get("error") in ("missing_fields", "template_not_found"):
-            self._mark_asked_back(event)  # 続きの返信を通常フローで受ける
+            # 足りない項目を答えてもらったら、元の依頼に足して作り直す
+            self._save_pending(event, "doc_build", question)
 
         body = _reply_tag(event) + sanitize_for_chatwork(reply_text)
         artifact = meta.pop("artifact", None)

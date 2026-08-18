@@ -490,7 +490,7 @@ class DocBuildRunner:
 
     @staticmethod
     def _ask_for(opening: str, missing: list[str]) -> str:
-        lead = _delivering_opening(opening, "書類の下書き、お作りしますね。")
+        lead = _asking_opening(opening, "書類の下書き、お作りしますね。")
         items = "\n".join(f"・{m}" for m in missing)
         return (
             f"{lead}\n\n"
@@ -500,7 +500,7 @@ class DocBuildRunner:
 
     @staticmethod
     def _choose_guidance(allowed: list[str], opening: str, missing: list[str]) -> str:
-        lead = _delivering_opening(opening, "送付状ですね、お作りします。")
+        lead = _asking_opening(opening, "送付状ですね、お作りします。")
         names = "\n".join(f"・{TEMPLATES[t]['label']}" for t in allowed)
         text = (
             f"{lead}\n\n"
@@ -555,6 +555,19 @@ def _delivering_opening(text: Any, default: str = DEFAULT_OPENING) -> str:
     """
     opening = str(text or "").strip()
     if not opening or _ASKING_OPENING_RE.match(opening):
+        return default
+    return opening
+
+
+# 聞き返しの時点では何も作っていない。「作成しました」「空欄にしています」と
+# 書かれるとファイルが出来たと誤解されるため、作った旨の文面は使わせない
+_MADE_IT_RE = re.compile(r"(作成しました|作りました|できました|空欄|用意しました|仕上げました)")
+
+
+def _asking_opening(text: Any, default: str) -> str:
+    """まだ作っていない段階の書き出し。完成したと読める文面は使わない。"""
+    opening = str(text or "").strip()
+    if not opening or _MADE_IT_RE.search(opening) or _ASKING_OPENING_RE.match(opening):
         return default
     return opening
 
