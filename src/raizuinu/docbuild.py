@@ -580,7 +580,9 @@ class DocBuildRunner:
                     "item_name": [
                         {
                             "item_name": str(item.get("name", "")),
-                            "item_qty": str(item.get("qty", "") or "1部"),
+                            # 区切りの空白はここで付ける。部数を書かない行
+                            # （「一式」等）で末尾に空白が残らないようにする
+                            "item_qty": (f"　{quantity_of(item)}" if quantity_of(item) else ""),
                         }
                         for item in items
                     ],
@@ -633,8 +635,11 @@ class DocBuildRunner:
         staff_override: str = "",
     ) -> str:
         opening = _delivering_opening(fields.get("opening"))
+        # 「1部」を仮置きした行だけを伝える（「一式」は仮置きしていない）
         assumed = [
-            item["name"] for item in fields.get("items") or [] if not item.get("qty")
+            item["name"]
+            for item in fields.get("items") or []
+            if not item.get("qty") and quantity_of(item) == "1部"
         ]
         note = ""
         if staff_override:
@@ -817,6 +822,25 @@ def expand_legal_form(name: str) -> str:
         text = text.replace(ligature, full)
     text = _ABBREV_RE.sub(lambda m: _LEGAL_FORMS[m.group(1)], text)
     return re.sub(r"[\s　]+", " ", text).strip()
+
+
+# 「一式」で数える書類。個数を足すと「一式 1部」になってしまう
+_SET_QTY_RE = re.compile(r"(一式|1式|１式|ひと[そさ]ろえ)")
+
+
+def quantity_of(item: dict[str, Any]) -> str:
+    """明細に書く部数。指定が無ければ「1部」を仮置きする。
+
+    ただし「一式」は数量そのものなので、後ろに「1部」を付け足さない。
+    品名の側に「一式」が入っている場合も同じ扱いにする。
+    """
+    qty = str((item or {}).get("qty", "") or "").strip()
+    name = str((item or {}).get("name", "") or "")
+    if _SET_QTY_RE.search(qty):
+        return qty
+    if _SET_QTY_RE.search(name):
+        return qty  # 品名が「契約書一式」なら、指定が無い限り部数は付けない
+    return qty or "1部"
 
 
 def build_recipient(parts: dict[str, str]) -> list[str]:

@@ -82,6 +82,23 @@ def fake_client(fields):
     return client
 
 
+def docx_paragraphs(data: bytes) -> list[str]:
+    """段落ごとの本文（空段落も1件として数える）。行間の確認に使う。
+
+    空段落は <w:p/> と自己終了で書かれることがあり、正規表現では取りこぼす。
+    """
+    from xml.etree import ElementTree as ET
+
+    from raizuinu.templatefill import W
+
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        root = ET.fromstring(z.read("word/document.xml"))
+    return [
+        "".join(t.text or "" for t in p.iter(W + "t"))
+        for p in root.find(W + "body").iter(W + "p")
+    ]
+
+
 def docx_texts(data: bytes) -> list[str]:
     import re
 
@@ -281,6 +298,68 @@ class TestRecipientLayout:
         texts = docx_texts(meta["artifact"][1])
         assert "株式会社大塚商会　御中" in texts
         assert not any(t.startswith("　") and "様" in t for t in texts)
+
+
+class TestItemLines:
+    """送付書類は「記」から2行空けて左詰め。部数は空白で区切る。"""
+
+    def build(self, tmp_path, items):
+        client = fake_client(
+            {
+                "kind": "送付状", "company_id": "ライズクリエイション", "sender_hint": "",
+                "date": "2026年8月18日", "to_company": "株式会社A",
+                "items": items, "missing": [], "opening": "",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        reply, meta, _ = runner.run("株式会社Aあての送付状を作って", requester_name="足立 海里")
+        return docx_texts(meta["artifact"][1]), reply
+
+    def test_quantity_is_separated_by_a_space_not_a_tab(self, tmp_path):
+        texts, _ = self.build(tmp_path, [{"name": "業務委託基本契約書", "qty": "2部"}])
+        assert "■業務委託基本契約書　2部" in texts
+        assert not any("\t" in t for t in texts)  # 右揃えタブは使わない
+
+    def test_two_blank_lines_between_ki_and_the_items(self, tmp_path):
+        client = fake_client(
+            {
+                "kind": "送付状", "company_id": "ライズクリエイション", "sender_hint": "",
+                "date": "2026年8月18日", "to_company": "株式会社A",
+                "items": [{"name": "契約書", "qty": "1部"}], "missing": [], "opening": "",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        _, meta, _ = runner.run("送付状を作って", requester_name="足立 海里")
+        paragraphs = docx_paragraphs(meta["artifact"][1])
+        head = paragraphs.index("記")
+        assert paragraphs[head + 1 : head + 3] == ["", ""]
+        assert paragraphs[head + 3] == "■契約書　1部"
+
+    def test_no_attachment_heading(self, tmp_path):
+        texts, _ = self.build(tmp_path, [{"name": "契約書", "qty": "1部"}])
+        assert "＜添付書類＞" not in texts
+
+    @pytest.mark.parametrize(
+        "item,expected",
+        [
+            ({"name": "契約書一式", "qty": ""}, "■契約書一式"),
+            ({"name": "契約書", "qty": "一式"}, "■契約書　一式"),
+            ({"name": "見積書", "qty": ""}, "■見積書　1部"),
+            ({"name": "請求書", "qty": "3通"}, "■請求書　3通"),
+        ],
+    )
+    def test_isshiki_does_not_get_a_count_appended(self, tmp_path, item, expected):
+        texts, _ = self.build(tmp_path, [item])
+        assert expected in texts
+        assert "一式　1部" not in "".join(texts)
+        assert "一式 1部" not in "".join(texts)
+
+    def test_only_a_guessed_count_is_reported_in_the_reply(self, tmp_path):
+        _, reply = self.build(
+            tmp_path, [{"name": "契約書一式", "qty": ""}, {"name": "見積書", "qty": ""}]
+        )
+        assert "「見積書」は1部としています" in reply
+        assert "契約書一式" not in reply  # 仮置きしていないので断らない
 
 
 class TestCompanyDirectory:

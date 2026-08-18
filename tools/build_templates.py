@@ -59,11 +59,13 @@ SPECS = [
             666: PH_ADDR2,
             667: f"TEL：{PH_TEL}",
             668: f"担当： {PH_DEPT}{PH_STAFF}",
-            684: f"■{PH_ITEM}\t{PH_QTY}",
+            # 部数は右端で揃えず左詰め。区切りの空白は差し込む側が持つ
+            # （「一式」のように部数を付けない行で末尾に空白を残さないため）
+            684: f"■{PH_ITEM}{PH_QTY}",
         },
     },
     {
-        # 楽天軒の型（「＜添付書類＞」の見出しがあり、・で並べる）
+        # 楽天軒の型（・で並べる）
         "out": "送付状_楽天軒型.docx",
         "src": "書類送付状_楽天軒.docx",
         # 2025年5月28日付 百五銀行あての1通（末尾の1通）
@@ -78,7 +80,8 @@ SPECS = [
             46: PH_ADDR2,
             47: f"TEL：{PH_TEL}",
             48: f"担当： {PH_DEPT}{PH_STAFF}",
-            68: f"・{PH_ITEM}\t{PH_QTY}",
+            67: None,  # 「＜添付書類＞」の見出しは使わない（記から2行空けて本文）
+            68: f"・{PH_ITEM}{PH_QTY}",
         },
     },
 ]
@@ -118,26 +121,6 @@ def set_para_text(p: ET.Element, text: str) -> None:
         t = ET.SubElement(run, W + "t")
         t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
         t.text = chunk
-
-
-def set_right_tab_stop(p: ET.Element, pos_twips: int = 8500) -> None:
-    """段落に右揃えのタブ位置を1つ定義する。
-
-    原本の明細行は品名の長さに合わせてタブや全角空白の数を手で調整しており、
-    品名を差し替えると部数の位置がずれる。右揃えタブを1つ置けば、品名の
-    長さによらず部数が同じ位置で揃う。
-    """
-    ppr = p.find(W + "pPr")
-    if ppr is None:
-        ppr = ET.Element(W + "pPr")
-        p.insert(0, ppr)
-    for existing in ppr.findall(W + "tabs"):
-        ppr.remove(existing)
-    tabs = ET.Element(W + "tabs")
-    tab = ET.SubElement(tabs, W + "tab")
-    tab.set(W + "val", "right")
-    tab.set(W + "pos", str(pos_twips))
-    ppr.insert(0, tabs)  # <w:tabs>は<w:pPr>の先頭側に置く
 
 
 def strip_page_breaks(p: ET.Element) -> None:
@@ -192,8 +175,6 @@ def build(spec: dict) -> Path:
         if new_text is None:
             continue
         set_para_text(paras[index], new_text)
-        if PH_QTY in new_text:  # 部数を右端で揃える
-            set_right_tab_stop(paras[index])
     for p in paras[start : end + 1]:
         strip_page_breaks(p)
 
