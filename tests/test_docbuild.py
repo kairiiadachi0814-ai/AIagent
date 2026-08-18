@@ -155,7 +155,7 @@ class TestSoufujo:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "",
-                "sender_hint": "株式会社イノベイト",
+                "sender_hint": "株式会社まだ登録していない商事",
                 "date": "2026年8月17日",
                 "to_lines": ["株式会社A"],
                 "staff": "",
@@ -194,6 +194,56 @@ class TestSoufujo:
         assert "ＲＡＫＵＴＥＮＫＥＮ株式会社" in reply  # どの会社名義かを返信に書く
         # 出典は会社ごとのBox原本を指す（ライズの原本を指すと突き合わせできない）
         assert "https://app.box.com/file/1681180574076" in reply
+
+
+class TestCompanyDirectory:
+    def build(self, tmp_path, company_id, hint=""):
+        client = fake_client(
+            {
+                "kind": "送付状", "company_id": company_id, "sender_hint": hint,
+                "date": "2026年8月18日", "to_lines": ["株式会社A 御中"], "staff": "足立",
+                "items": [{"name": "契約書", "qty": "1部"}], "missing": [], "opening": "",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        _, meta, _ = runner.run(f"{hint or company_id}名義で送付状を作って")
+        return docx_texts(meta["artifact"][1])
+
+    def test_company_without_a_phone_number_loses_the_tel_line(self, tmp_path):
+        # 空欄のまま残すと「TEL：」だけの行が印字された送付状になる
+        texts = self.build(tmp_path, "ライズホールディングス")
+        assert "株式会社ライズホールディングス" in texts
+        assert not any(t.startswith("TEL：") for t in texts)
+        assert "コトモール2階" in texts
+
+    def test_single_line_address_loses_the_second_line(self, tmp_path):
+        texts = self.build(tmp_path, "イノベイト")
+        assert "奈良市大安寺西３丁目８番地１４号" in texts
+        assert "TEL：0742-81-3395" in texts
+        assert "コトモール2階" not in texts  # ライズの住所2行目を引きずらない
+
+    @pytest.mark.parametrize(
+        "hint,expected",
+        [
+            ("ライズ", "株式会社ライズクリエイション"),
+            ("ライズホールディングス", "株式会社ライズホールディングス"),
+            ("ライズHD", "株式会社ライズホールディングス"),
+            ("ヤマト", "株式会社ヤマトライジング"),
+            ("楽天軒", "ＲＡＫＵＴＥＮＫＥＮ株式会社"),
+            ("rakutenken", "ＲＡＫＵＴＥＮＫＥＮ株式会社"),  # 全角/半角・大小のゆれ
+            ("OHIROME", "合同会社ohirome"),
+            ("株式会社イノベイト", "株式会社イノベイト"),
+        ],
+    )
+    def test_similar_company_names_are_not_confused(self, tmp_path, hint, expected):
+        # 「ライズ」は「ライズホールディングス」にも含まれる。先に見つかったほうを
+        # 採ると、持株会社あての依頼が事業会社名義で出来上がってしまう
+        runner = DocBuildRunner(make_config(tmp_path), client=fake_client({}))
+        assert runner._find_company("", hint)["name"] == expected
+
+    def test_unregistered_company_stays_unmatched(self, tmp_path):
+        runner = DocBuildRunner(make_config(tmp_path), client=fake_client({}))
+        assert runner._find_company("", "株式会社大塚商会") is None
 
 
 class TestFaxSoufujo:

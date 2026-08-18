@@ -100,6 +100,15 @@ DEFAULT_OPENING = "承知しました。下書きを作成しました。"
 _CONTRACT_RE = re.compile(r"(契約書|覚書|念書|誓約書|NDA|秘密保持)")
 
 
+def _fold(text: str) -> str:
+    """社名を突き合わせるための正規化（全角/半角・大小文字・空白のゆれを吸収）。
+
+    「ＲＡＫＵＴＥＮＫＥＮ」と「RAKUTENKEN」、「ohirome」と「OHIROME」を
+    同じものとして扱う。
+    """
+    return unicodedata.normalize("NFKC", text).casefold().replace(" ", "").replace("　", "")
+
+
 def _box_url(kind: str, company: dict[str, Any]) -> str:
     """返信に載せる出典。送付状は会社ごとに原本が分かれているので台帳を優先する。"""
     if kind == "送付状":
@@ -336,18 +345,37 @@ class DocBuildRunner:
         return [c for c in data.get("companies", []) if c.get("id") and c.get("name")]
 
     def _find_company(self, company_id: str, hint: str) -> dict[str, Any] | None:
-        """IDで引き、無ければ名指しされた会社名・略称から探す。"""
+        """IDで引き、無ければ名指しされた会社名・略称から探す。
+
+        「ライズ」が「ライズホールディングス」にも含まれるように、社名は互いに
+        food-chain のように重なる。先に見つかったものではなく、いちばん強く
+        一致したものを採る（完全一致 > 長く一致したほう）。
+        """
         companies = self._companies()
         for company in companies:
             if company_id and company_id == company["id"]:
                 return company
-        if not hint:
+        target = _fold(hint)
+        if not target:
             return None
+        best: dict[str, Any] | None = None
+        best_score = 0
         for company in companies:
-            names = [company["name"], company["id"], *(company.get("aliases") or [])]
-            if any(n and (n in hint or hint in n) for n in names):
-                return company
-        return None
+            for name in (company["name"], company["id"], *(company.get("aliases") or [])):
+                folded = _fold(str(name))
+                if not folded:
+                    continue
+                if folded == target:
+                    score = 1000 + len(folded)
+                elif folded in target:
+                    score = len(folded)  # 依頼文のうち社名で説明できた長さ
+                elif target in folded:
+                    score = len(target)
+                else:
+                    continue
+                if score > best_score:
+                    best, best_score = company, score
+        return best
 
     def _read_template(self, filename: str) -> bytes:
         """ひな形を読む。無いときは黙って落ちずに、作成失敗として扱う。"""
@@ -490,6 +518,8 @@ class DocBuildRunner:
             data = self._read_template(LAYOUTS[layout])
             max_items = int(self._config.doc_build.get("max_items", 20))
             items = (fields.get("items") or [])[:max_items]
+            address2 = str(company.get("address2") or "")
+            tel = str(company.get("tel") or "")
             out = render_docx(
                 data,
                 {
@@ -497,8 +527,6 @@ class DocBuildRunner:
                     "staff": str(fields.get("staff") or ""),
                     "sender_company": str(company.get("name") or ""),
                     "sender_address1": str(company.get("address1") or ""),
-                    "sender_address2": str(company.get("address2") or ""),
-                    "sender_tel": str(company.get("tel") or ""),
                     "sender_dept": str(company.get("dept") or ""),
                 },
                 {
@@ -510,6 +538,10 @@ class DocBuildRunner:
                         }
                         for item in items
                     ],
+                    # 住所が1行で足りる会社・電話番号を持たない会社では、その行ごと消す
+                    # （空欄のまま残すと「TEL：」だけの行が印字されてしまう）
+                    "sender_address2": [{"sender_address2": address2}] if address2 else [],
+                    "sender_tel": [{"sender_tel": tel}] if tel else [],
                 },
             )
         else:
