@@ -207,7 +207,6 @@ _FIELDS_SCHEMA = {
             "items": {"type": "string"},
             "description": "宛先。会社名・部署・担当者を1行ずつ",
         },
-        "staff": {"type": "string", "description": "差出人の担当者名（姓のみ）。不明なら空"},
         "items": {
             "type": "array",
             "items": {
@@ -249,7 +248,6 @@ _FIELDS_SCHEMA = {
         "sender_hint",
         "date",
         "to_lines",
-        "staff",
         "items",
         "missing",
         "opening",
@@ -288,9 +286,12 @@ class DocBuildRunner:
 
         fields, usage = self._extract(instruction, context, requester_name)
         _normalize(fields)  # 空白だけの宛先・品名を捨ててから不足判定にかける
-        # 差出人の担当者は、依頼文に指定がなければ依頼者の苗字にする。
-        # モデルがフルネームを返した場合もここで苗字へ落とす
-        fields["staff"] = surname(fields.get("staff") or requester_name, self._roster())
+        # 書類の担当者は、依頼してきた人の苗字。依頼文から拾わせるとモデルが
+        # 宛先側の担当者名を差出人欄へ回すことがあるため、コードで確定させる。
+        # 表示名が拾えなかったとき（会話履歴の取得に失敗した等）だけ、聞き返した
+        # 答えを依頼文から拾う
+        roster = self._roster()
+        fields["staff"] = surname(requester_name, roster) or _staff_from_text(instruction, roster)
         meta["fields"] = {k: v for k, v in fields.items() if k != "opening"}
 
         kind = str(fields.get("kind") or "")
@@ -426,11 +427,9 @@ class DocBuildRunner:
             "宛先の会社名と取り違えないこと）:\n" + catalog,
         ]
         if requester_name:
-            parts.append(
-                f"依頼者の姓: {surname(requester_name, self._roster())}"
-                "（差出人の担当者名は、依頼文に別の指定がなければこの姓にする。"
-                "staffには姓だけを入れ、フルネームや敬称は付けない）"
-            )
+            # 担当者名はこちらで確定させるので抜き出させない。ただし依頼文の
+            # 読み取り（「私あてに」等）に効くので、誰からの依頼かは伝える
+            parts.append(f"依頼者の姓: {surname(requester_name, self._roster())}")
         directory = self._fax_directory()
         if directory:
             parts.append(
@@ -502,6 +501,10 @@ class DocBuildRunner:
         missing = [str(m) for m in fields.get("missing") or []]
         if not fields.get("to_lines"):
             missing.append("宛先")
+        if not str(fields.get("staff") or "").strip():
+            # 依頼者の表示名が拾えなかったとき。担当者欄が空の書類を黙って
+            # 出さずに聞き返す（Chatworkの会話履歴の取得に失敗した場合など）
+            missing.append("差出人の担当者名（依頼者の苗字）")
         if kind == "送付状" and not fields.get("items"):
             missing.append("送付する書類")
         if kind == "FAX送付状" and not str(fields.get("subject") or "").strip():
@@ -671,6 +674,31 @@ def surname(display_name: str, roster: tuple[str, ...] = ()) -> str:
     if len(parts) > 1 and _ORG_WORD_RE.search(head):
         head = parts[1]
     return _NAME_SUFFIX_RE.sub("", head)
+
+
+# 「担当は足立です」のように、担当者を名指ししている書き方
+_STAFF_MARKER_RE = re.compile(r"(担当(?:者)?(?:名)?|差出人|発信者|私)[はをのが：:\s]*$")
+# 「足立です」「足立さん」のような、名前だけの返事に付く言い回し
+_POLITE_TAIL_RE = re.compile(r"(?:さん|様|氏|くん|ちゃん)?(?:です|でお願いします|でお願いします)?[。．.]?$")
+
+
+def _staff_from_text(instruction: str, roster: tuple[str, ...]) -> str:
+    """依頼文から社内の担当者名を拾う（表示名が取れなかったときの受け皿）。
+
+    宛先の会社名に名簿と同じ字が入っていることがあるため（「坂田商事」等）、
+    担当者を名指ししている箇所か、名前だけを答えた返事のときだけ採る。
+    """
+    text = unicodedata.normalize("NFKC", str(instruction or "")).strip()
+    if not text:
+        return ""
+    for member in roster:
+        if text == member or _POLITE_TAIL_RE.sub("", text, count=1) == member:
+            return member  # 聞き返しへの「足立」「足立です」という答え
+    for member in roster:
+        for match in re.finditer(re.escape(member), text):
+            if _STAFF_MARKER_RE.search(text[: match.start()]):
+                return member
+    return ""
 
 
 def _delivering_opening(text: Any, default: str = DEFAULT_OPENING) -> str:

@@ -107,7 +107,7 @@ class TestSoufujo:
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        reply, meta, usage = runner.run("大塚商会あての送付状を作って")
+        reply, meta, usage = runner.run("大塚商会あての送付状を作って", requester_name="足立 海里")
 
         filename, data = meta["artifact"]
         assert filename == "書類送付状_株式会社大塚商会_20260817.docx"
@@ -136,14 +136,14 @@ class TestSoufujo:
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        reply, meta, _ = runner.run("送付状を作って")
+        reply, meta, _ = runner.run("送付状を作って", requester_name="足立 海里")
         assert "artifact" not in meta  # 宛先を推測で埋めない
         assert "宛先" in reply
 
     def test_contract_request_returns_guidance_without_api(self, tmp_path):
         client = fake_client({})
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        reply, meta, usage = runner.run("秘密保持契約書を作って")
+        reply, meta, usage = runner.run("秘密保持契約書を作って", requester_name="足立 海里")
         assert reply == CONTRACT_GUIDANCE
         assert usage == {}
         assert client.kwargs is None  # API呼び出しなし
@@ -165,7 +165,7 @@ class TestSoufujo:
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        reply, meta, _ = runner.run("イノベイト名義で株式会社Aあての送付状を作って")
+        reply, meta, _ = runner.run("イノベイト名義で株式会社Aあての送付状を作って", requester_name="足立 海里")
         assert "artifact" not in meta
         assert meta["error"] == "unknown_company"
         assert "株式会社イノベイト" in reply
@@ -185,7 +185,7 @@ class TestSoufujo:
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        reply, meta, _ = runner.run("楽天軒名義で株式会社Aあての送付状を作って")
+        reply, meta, _ = runner.run("楽天軒名義で株式会社Aあての送付状を作って", requester_name="足立 海里")
         joined = "".join(docx_texts(meta["artifact"][1]))
         assert "ＲＡＫＵＴＥＮＫＥＮ株式会社" in joined
         assert "0742-81-4930" in joined  # 会社ごとのTEL
@@ -206,7 +206,7 @@ class TestCompanyDirectory:
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        _, meta, _ = runner.run(f"{hint or company_id}名義で送付状を作って")
+        _, meta, _ = runner.run(f"{hint or company_id}名義で送付状を作って", requester_name="足立 海里")
         return docx_texts(meta["artifact"][1])
 
     def test_company_without_a_phone_number_loses_the_tel_line(self, tmp_path):
@@ -260,7 +260,7 @@ class TestCompanyDirectory:
                 "missing": [], "opening": "",
             }
         )
-        DocBuildRunner(make_config(tmp_path), client=client).run("送付状を作って")
+        DocBuildRunner(make_config(tmp_path), client=client).run("送付状を作って", requester_name="足立 海里")
         prompt = client.kwargs["messages"][0]["content"]
         assert "「ライズ」とだけ書かれていればこの会社" in prompt
 
@@ -284,7 +284,7 @@ class TestFaxSoufujo:
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        reply, meta, _ = runner.run("三十三銀行あてのFAX送付状を作って")
+        reply, meta, _ = runner.run("三十三銀行あてのFAX送付状を作って", requester_name="足立 海里")
 
         filename, data = meta["artifact"]
         assert filename.startswith("FAX送付状_三十三銀行奈良支店_")
@@ -311,7 +311,7 @@ class TestFaxSoufujo:
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        _, meta, _ = runner.run("楽天軒名義で株式会社AあてのFAX送付状を作って")
+        _, meta, _ = runner.run("楽天軒名義で株式会社AあてのFAX送付状を作って", requester_name="足立 海里")
         openpyxl = pytest.importorskip("openpyxl")
         ws = openpyxl.load_workbook(io.BytesIO(meta["artifact"][1]))["汎用"]
         assert ws["M10"].value == "ＲＡＫＵＴＥＮＫＥＮ株式会社"
@@ -327,7 +327,7 @@ class TestFaxSoufujo:
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        runner.run("三十三銀行あてのFAX送付状を作って")
+        runner.run("三十三銀行あてのFAX送付状を作って", requester_name="足立 海里")
         prompt = client.kwargs["messages"][0]["content"]
         assert "0742-36-1555" in prompt  # 台帳のFAX番号を渡している
         assert "推測で作らない" in client.kwargs["system"]
@@ -529,7 +529,7 @@ class TestReviewRegressions:
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        _, meta, _ = runner.run("大塚商会あてのFAX送付状を作って")
+        _, meta, _ = runner.run("大塚商会あてのFAX送付状を作って", requester_name="足立 海里")
         openpyxl = pytest.importorskip("openpyxl")
         ws = openpyxl.load_workbook(io.BytesIO(meta["artifact"][1]))["汎用"]
         assert ws["D10"].value == "株式会社大塚商会"
@@ -544,23 +544,29 @@ class TestReviewRegressions:
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        _, meta, _ = runner.run("濵野様あてのFAX送付状を作って")
+        _, meta, _ = runner.run("濵野様あてのFAX送付状を作って", requester_name="足立 海里")
         openpyxl = pytest.importorskip("openpyxl")
         ws = openpyxl.load_workbook(io.BytesIO(meta["artifact"][1]))["汎用"]
         assert (ws["D10"].value, ws["H10"].value) == ("濵野 康一", "様")
 
-    def test_sender_staff_is_written_not_left_as_template_default(self, tmp_path):
+    @pytest.mark.parametrize(
+        "requester,expected", [("足立 海里", "足立"), ("篠田", "篠田"), ("岩永　※9月入社", "岩永")]
+    )
+    def test_sender_staff_follows_the_requester_not_a_fixed_name(
+        self, tmp_path, requester, expected
+    ):
+        # 誰が依頼しても同じ名前が入る（ひな形の既定名のまま出る）事故を防ぐ
         client = fake_client(
             {
                 "kind": "FAX送付状", "company_id": "ライズクリエイション", "date": "", "to_lines": ["株式会社A"],
-                "staff": "山田", "items": [], "subject": "件名", "missing": [], "opening": "",
+                "items": [], "subject": "件名", "missing": [], "opening": "",
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        _, meta, _ = runner.run("株式会社AあてのFAX送付状を作って")
+        _, meta, _ = runner.run("株式会社AあてのFAX送付状を作って", requester_name=requester)
         openpyxl = pytest.importorskip("openpyxl")
         ws = openpyxl.load_workbook(io.BytesIO(meta["artifact"][1]))["汎用"]
-        assert ws["O12"].value == "山田"  # 依頼者名が入る（誰が作っても固定名にしない）
+        assert ws["O12"].value == expected
 
     def test_template_carries_no_other_companies(self):
         # 1社あての下書きに他社の連絡先が付いてこないこと
@@ -610,7 +616,7 @@ class TestReviewRegressions:
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        reply, meta, _ = runner.run("送付状を作って")
+        reply, meta, _ = runner.run("送付状を作って", requester_name="足立 海里")
         assert "artifact" not in meta
         assert "宛先" in reply and "送付する書類" in reply
 
@@ -624,7 +630,7 @@ class TestReviewRegressions:
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        reply, meta, _ = runner.run("株式会社Aあての送付状を作って")
+        reply, meta, _ = runner.run("株式会社Aあての送付状を作って", requester_name="足立 海里")
         assert "「請求書」は1部としています" in reply  # 仮置きを黙って通さない
         assert "契約書" not in reply.split("ひな形:")[0].replace("承知しました。", "")
 
@@ -647,7 +653,7 @@ class TestReviewRegressions:
         config.data["doc_build"]["templates_dir"] = str(tmp_path)
         runner = DocBuildRunner(config, client=client)
         with pytest.raises((DocumentBuildError, OSError)) as exc:
-            runner.run("株式会社Aあての送付状を作って")
+            runner.run("株式会社Aあての送付状を作って", requester_name="足立 海里")
         if isinstance(exc.value, DocumentBuildError):
             assert exc.value.usage["input_tokens"] == 1200  # 消費済みトークンを捨てない
 
@@ -700,7 +706,7 @@ class TestReplyOpening:
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        reply, _, _ = runner.run("エムズステップ南様あての送付状を作って")
+        reply, _, _ = runner.run("エムズステップ南様あての送付状を作って", requester_name="足立 海里")
         head = reply.split("\n")[0]
         assert "お願い" not in head  # 依頼を受けた側の返事として噛み合わせる
         assert head == "承知しました。下書きを作成しました。"
@@ -716,7 +722,7 @@ class TestReplyOpening:
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        reply, _, _ = runner.run("エムズステップ南様あての送付状を作って")
+        reply, _, _ = runner.run("エムズステップ南様あての送付状を作って", requester_name="足立 海里")
         assert reply.startswith("エムズステップ　南様あての送付状ですね。")
 
     def test_ask_back_opening_is_also_guarded(self, tmp_path):
@@ -728,7 +734,7 @@ class TestReplyOpening:
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        reply, _, _ = runner.run("送付状を作って")
+        reply, _, _ = runner.run("送付状を作って", requester_name="足立 海里")
         assert not reply.startswith("よろしく")
 
 
@@ -784,18 +790,73 @@ class TestSenderStaff:
         ws = openpyxl.load_workbook(io.BytesIO(meta["artifact"][1]))["汎用"]
         assert ws["O12"].value == "足立"
 
-    def test_explicit_staff_in_the_request_wins(self, tmp_path):
+    def test_requester_surname_wins_over_any_name_the_model_returns(self, tmp_path):
+        # 担当者名は依頼した人の苗字。モデルが宛先側の担当者名を差出人欄へ
+        # 回してくることがあるため、依頼者の苗字で確定させる
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
-                "to_lines": ["株式会社A"], "staff": "坂田",
+                "to_lines": ["株式会社A", "経理部　坂田 様"], "staff": "坂田",
                 "items": [{"name": "契約書", "qty": "1部"}],
                 "missing": [], "opening": "作成しました。",
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        _, meta, _ = runner.run("担当は坂田で送付状を作って", requester_name="足立 海里")
-        assert "担当： 経理財務部　坂田" in "".join(docx_texts(meta["artifact"][1]))
+        _, meta, _ = runner.run(
+            "株式会社Aの坂田様あてに送付状を作って", requester_name="足立 海里"
+        )
+        joined = "".join(docx_texts(meta["artifact"][1]))
+        assert "担当： 経理財務部　足立" in joined
+        assert "担当： 経理財務部　坂田" not in joined
+
+    def test_blank_requester_name_is_asked_for_instead_of_shipping_a_blank_field(
+        self, tmp_path
+    ):
+        # 会話履歴の取得に失敗すると依頼者の表示名が拾えない。担当者欄が空の
+        # まま書類を出すと、そのまま送られてしまう
+        client = fake_client(
+            {
+                "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
+                "to_lines": ["株式会社A"], "items": [{"name": "契約書", "qty": "1部"}],
+                "missing": [], "opening": "",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        reply, meta, _ = runner.run("株式会社Aあての送付状を作って", requester_name="")
+        assert "artifact" not in meta
+        assert meta["error"] == "missing_fields"
+        assert "担当者名" in reply
+
+    def test_the_answer_to_that_question_is_picked_up(self, tmp_path):
+        # 聞き返しの答え（苗字だけ）が元の依頼に足されて戻ってくる
+        client = fake_client(
+            {
+                "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
+                "to_lines": ["株式会社A"], "items": [{"name": "契約書", "qty": "1部"}],
+                "missing": [], "opening": "作成しました。",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        _, meta, _ = runner.run(
+            "株式会社Aあての送付状を作って\n担当は篠田", requester_name=""
+        )
+        assert "担当： 経理財務部　篠田" in "".join(docx_texts(meta["artifact"][1]))
+
+    def test_a_recipient_name_matching_the_roster_is_not_taken_as_the_sender(
+        self, tmp_path
+    ):
+        # 「坂田商事」は宛先。名簿と字が重なるだけで差出人担当者にしない
+        client = fake_client(
+            {
+                "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
+                "to_lines": ["坂田商事株式会社"], "items": [{"name": "契約書", "qty": "1部"}],
+                "missing": [], "opening": "",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        reply, meta, _ = runner.run("坂田商事あての送付状を作って", requester_name="")
+        assert "artifact" not in meta
+        assert "担当者名" in reply
 
 
 class TestStaffRoster:
@@ -998,7 +1059,7 @@ class TestAskBackWording:
             }
         )
         runner = DocBuildRunner(make_config(tmp_path), client=client)
-        reply, meta, _ = runner.run("ヤマトライジング名で書類送付状を作って")
+        reply, meta, _ = runner.run("ヤマトライジング名で書類送付状を作って", requester_name="足立 海里")
         assert meta["error"] == "missing_fields"
         assert reply.startswith("書類の下書き、お作りしますね。")
         assert "作成しました" not in reply
