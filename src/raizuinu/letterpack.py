@@ -15,8 +15,7 @@
   他部署のルームへ社内ナレッジが流れる経路を作らないため
 - 依頼文は必ず依頼者に見せてから送る。他部署のルームへの投稿は取り消しが
   きかないため、読み取りを誤ったまま届くことを避ける
-- 誰の依頼で誰が投稿しているかを依頼文に明記する（総務側から見て、
-  アシスタントが代理で出していることが分かるようにする）
+- 誰の依頼かを依頼文に明記する（総務側が誰に確認すればよいか分かるように）
 - 枚数・種類の読み取りは正規表現で行う（モデルに数えさせない）
 """
 
@@ -106,14 +105,13 @@ def mention(account_id: int, name: str) -> str:
 def build_request_text(detail: dict[str, Any], count: int, kind: str) -> str:
     """総務あての依頼文（宛先タグを除く本文）。
 
-    誰の依頼で誰が出しているかを明記する。総務から見て、アシスタントが
-    代理で出していることが分かるようにするため。
+    誰の依頼かを明記する。名乗りは入れない（投稿元のアカウントで分かるため）。
     """
     requester = str(detail.get("staff") or "").strip()
-    on_behalf = f"経理財務部の{requester}さんの依頼で、" if requester else ""
+    on_behalf = f"経理財務部の{requester}さんの依頼です。" if requester else ""
     return (
-        f"お疲れさまです。経理財務アシスタントです。\n"
-        f"{on_behalf}レターパックの手配をお願いできますでしょうか。\n"
+        f"お疲れさまです。{on_behalf}"
+        f"レターパックの手配をお願いできますでしょうか。\n"
         f"\n"
         f"・使用会社名: {detail.get('company') or ''}\n"
         f"・宛先と使用内容: {summarize_use(detail)}\n"

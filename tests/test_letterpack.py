@@ -111,11 +111,15 @@ class TestRequestText:
         assert "・必要枚数: 2枚" in text
         assert "・種類: レターパックライト" in text
 
-    def test_it_says_who_it_is_for_and_who_is_posting(self):
-        # 総務から見て、アシスタントが足立さんの代理で出していると分かること
+    def test_it_says_whose_request_it_is_without_naming_itself(self):
+        # 総務から見て誰に確認すればよいか分かること。名乗りは入れない
         text = build_request_text(DETAIL, 1, "レターパックプラス")
-        assert "経理財務アシスタントです" in text
-        assert "経理財務部の足立さんの依頼で" in text
+        assert text.startswith("お疲れさまです。経理財務部の足立さんの依頼です。")
+        assert "アシスタント" not in text
+
+    def test_an_unknown_requester_leaves_no_dangling_phrase(self):
+        text = build_request_text({**DETAIL, "staff": ""}, 1, "レターパックプラス")
+        assert text.startswith("お疲れさまです。レターパックの手配をお願いできますでしょうか。")
 
     def test_missing_recipient_is_marked_not_invented(self):
         assert "（宛先未確認）" in summarize_use({"to_lines": [], "items": []})
