@@ -96,7 +96,7 @@ class TestSoufujo:
             {
                 "kind": "送付状", "company_id": "ライズクリエイション",
                 "date": "2026年8月17日",
-                "to_lines": ["株式会社大塚商会", "販売２課　濵野 康一　様"],
+                "to_company": "株式会社大塚商会", "to_department": "販売２課", "to_person": "濵野 康一",
                 "staff": "足立",
                 "items": [
                     {"name": "業務委託基本契約書", "qty": "2部"},
@@ -113,8 +113,8 @@ class TestSoufujo:
         assert filename == "書類送付状_株式会社大塚商会_20260817.docx"
         texts = docx_texts(data)
         joined = "".join(texts)
-        assert "株式会社大塚商会" in texts
-        assert "販売２課　濵野 康一　様" in texts  # 宛先は行数ぶん複製される
+        # 1行目に会社名、2行目に部署と担当者（1字下げ）
+        assert texts.index("株式会社大塚商会") + 1 == texts.index("　販売２課　濵野 康一様")
         assert "■業務委託基本契約書" in joined and "■返信用封筒" in joined
         assert joined.count("■") == 2  # 明細は依頼された件数ぶんだけ
         assert "担当： 経理財務部　足立" in joined
@@ -128,7 +128,7 @@ class TestSoufujo:
             {
                 "kind": "送付状", "company_id": "ライズクリエイション",
                 "date": "2026年8月17日",
-                "to_lines": [],
+                "to_company": "",
                 "staff": "",
                 "items": [{"name": "契約書", "qty": "1部"}],
                 "missing": [],
@@ -157,7 +157,7 @@ class TestSoufujo:
                 "kind": "送付状", "company_id": "",
                 "sender_hint": "株式会社まだ登録していない商事",
                 "date": "2026年8月17日",
-                "to_lines": ["株式会社A"],
+                "to_company": "株式会社A",
                 "staff": "",
                 "items": [{"name": "契約書", "qty": "1部"}],
                 "missing": [],
@@ -177,7 +177,7 @@ class TestSoufujo:
                 "kind": "送付状", "company_id": "RAKUTENKEN",
                 "sender_hint": "楽天軒",
                 "date": "2026年8月17日",
-                "to_lines": ["株式会社A 御中"],
+                "to_company": "株式会社A",
                 "staff": "足立",
                 "items": [{"name": "契約書", "qty": "1部"}],
                 "missing": [],
@@ -196,12 +196,99 @@ class TestSoufujo:
         assert "https://app.box.com/file/1681180574076" in reply
 
 
+class TestRecipientLayout:
+    """宛先は1行目に会社名（正式名称）、2行目に支店・部署・担当者。"""
+
+    @pytest.mark.parametrize(
+        "parts,expected",
+        [
+            (
+                {"company": "南都銀行", "branch": "奈良支店"},
+                ["南都銀行", "奈良支店　ご担当者様"],
+            ),
+            (
+                {"company": "南都銀行", "branch": "奈良支店", "department": "営業課", "person": "田中"},
+                ["南都銀行", "奈良支店　営業課　田中様"],
+            ),
+            (
+                {"company": "株式会社ライズ", "branch": "大阪支店", "department": "営業第一課", "person": "木村"},
+                ["株式会社ライズ", "大阪支店　営業第一課　木村様"],
+            ),
+            # 支店も部署も担当者も無ければ、会社名に御中を付けた1行だけ
+            ({"company": "株式会社大塚商会"}, ["株式会社大塚商会　御中"]),
+            # 個人あて（会社名なし）
+            ({"person": "濵野 康一"}, ["濵野 康一様"]),
+            ({}, []),
+        ],
+    )
+    def test_two_line_layout(self, parts, expected):
+        from raizuinu.docbuild import build_recipient
+
+        assert build_recipient(parts) == expected
+
+    def test_honorific_in_the_request_is_not_doubled(self):
+        from raizuinu.docbuild import build_recipient
+
+        assert build_recipient({"company": "株式会社A", "person": "田中 様"}) == [
+            "株式会社A",
+            "田中様",
+        ]
+
+    @pytest.mark.parametrize(
+        "written,expected",
+        [
+            ("㈱ライズクリエイション", "株式会社ライズクリエイション"),
+            ("ライズクリエイション㈱", "ライズクリエイション株式会社"),
+            ("(株)大塚商会", "株式会社大塚商会"),
+            ("（株）大塚商会", "株式会社大塚商会"),
+            ("㈲山田商店", "有限会社山田商店"),
+            ("（有）山田商店", "有限会社山田商店"),
+            ("合同会社ohirome", "合同会社ohirome"),  # 正式名称はそのまま
+            ("南都銀行", "南都銀行"),  # 法人格が書かれていなければ足さない
+        ],
+    )
+    def test_abbreviated_legal_forms_are_spelled_out(self, written, expected):
+        from raizuinu.docbuild import expand_legal_form
+
+        assert expand_legal_form(written) == expected
+
+    def test_the_document_puts_the_company_on_its_own_line(self, tmp_path):
+        client = fake_client(
+            {
+                "kind": "送付状", "company_id": "ライズクリエイション", "sender_hint": "",
+                "date": "2026年8月18日",
+                "to_company": "㈱大塚商会", "to_branch": "大阪南支店",
+                "to_department": "販売２課", "to_person": "木村",
+                "items": [{"name": "契約書", "qty": "1部"}], "missing": [], "opening": "",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        _, meta, _ = runner.run("大塚商会あての送付状を作って", requester_name="足立 海里")
+        texts = docx_texts(meta["artifact"][1])
+        head = texts.index("株式会社大塚商会")  # ㈱ は正式名称に直る
+        assert texts[head + 1] == "　大阪南支店　販売２課　木村様"
+
+    def test_a_company_with_no_contact_gets_onchu_on_one_line(self, tmp_path):
+        client = fake_client(
+            {
+                "kind": "送付状", "company_id": "ライズクリエイション", "sender_hint": "",
+                "date": "2026年8月18日", "to_company": "株式会社大塚商会",
+                "items": [{"name": "契約書", "qty": "1部"}], "missing": [], "opening": "",
+            }
+        )
+        runner = DocBuildRunner(make_config(tmp_path), client=client)
+        _, meta, _ = runner.run("大塚商会あての送付状を作って", requester_name="足立 海里")
+        texts = docx_texts(meta["artifact"][1])
+        assert "株式会社大塚商会　御中" in texts
+        assert not any(t.startswith("　") and "様" in t for t in texts)
+
+
 class TestCompanyDirectory:
     def build(self, tmp_path, company_id, hint=""):
         client = fake_client(
             {
                 "kind": "送付状", "company_id": company_id, "sender_hint": hint,
-                "date": "2026年8月18日", "to_lines": ["株式会社A 御中"], "staff": "足立",
+                "date": "2026年8月18日", "to_company": "株式会社A", "staff": "足立",
                 "items": [{"name": "契約書", "qty": "1部"}], "missing": [], "opening": "",
             }
         )
@@ -256,7 +343,7 @@ class TestCompanyDirectory:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "ライズクリエイション", "sender_hint": "",
-                "date": "", "to_lines": [], "staff": "", "items": [],
+                "date": "", "to_company": "", "staff": "", "items": [],
                 "missing": [], "opening": "",
             }
         )
@@ -271,7 +358,7 @@ class TestFaxSoufujo:
             {
                 "kind": "FAX送付状", "company_id": "ライズクリエイション",
                 "date": "",
-                "to_lines": ["三十三銀行　奈良支店", "ロクガワ様"],
+                "to_company": "三十三銀行", "to_branch": "奈良支店", "to_person": "ロクガワ",
                 "staff": "足立",
                 "items": [],
                 "subject": "海外送金添付資料の件",
@@ -287,12 +374,12 @@ class TestFaxSoufujo:
         reply, meta, _ = runner.run("三十三銀行あてのFAX送付状を作って", requester_name="足立 海里")
 
         filename, data = meta["artifact"]
-        assert filename.startswith("FAX送付状_三十三銀行奈良支店_")
+        assert filename.startswith("FAX送付状_三十三銀行_")
         assert filename.endswith(".xlsx")
         openpyxl = pytest.importorskip("openpyxl")
         ws = openpyxl.load_workbook(io.BytesIO(data))["汎用"]
-        assert ws["D10"].value == "三十三銀行　奈良支店"
-        assert ws["D12"].value == "ロクガワ様"
+        assert ws["D10"].value == "三十三銀行"  # 会社名の欄には社名だけ
+        assert ws["D12"].value == "奈良支店　ロクガワ様"  # 支店・担当者は担当者欄へ
         assert ws["D14"].value == "0742-36-1555"
         assert ws["E19"].value == "海外送金添付資料の件"
         assert ws["N6"].value == 3
@@ -306,7 +393,7 @@ class TestFaxSoufujo:
         client = fake_client(
             {
                 "kind": "FAX送付状", "company_id": "RAKUTENKEN", "sender_hint": "楽天軒",
-                "date": "", "to_lines": ["株式会社A 御中"], "staff": "足立",
+                "date": "", "to_company": "株式会社A", "staff": "足立",
                 "items": [], "subject": "件名", "missing": [], "opening": "",
             }
         )
@@ -322,7 +409,7 @@ class TestFaxSoufujo:
     def test_fax_directory_is_given_to_the_model(self, tmp_path):
         client = fake_client(
             {
-                "kind": "FAX送付状", "company_id": "ライズクリエイション", "date": "", "to_lines": ["三十三銀行"],
+                "kind": "FAX送付状", "company_id": "ライズクリエイション", "date": "", "to_company": "三十三銀行",
                 "staff": "", "items": [], "subject": "件名", "missing": [], "opening": "",
             }
         )
@@ -523,7 +610,7 @@ class TestReviewRegressions:
         # 「汎用」シートは会社名(D10)と敬称(H10)が別欄。敬称込みで入れると二重になる
         client = fake_client(
             {
-                "kind": "FAX送付状", "company_id": "ライズクリエイション", "date": "", "to_lines": ["株式会社大塚商会 御中"],
+                "kind": "FAX送付状", "company_id": "ライズクリエイション", "date": "", "to_company": "株式会社大塚商会",
                 "staff": "坂田", "items": [], "subject": "請求書送付の件",
                 "missing": [], "opening": "",
             }
@@ -539,7 +626,7 @@ class TestReviewRegressions:
     def test_person_recipient_gets_sama(self, tmp_path):
         client = fake_client(
             {
-                "kind": "FAX送付状", "company_id": "ライズクリエイション", "date": "", "to_lines": ["濵野 康一 様"],
+                "kind": "FAX送付状", "company_id": "ライズクリエイション", "date": "", "to_person": "濵野 康一",
                 "staff": "坂田", "items": [], "subject": "件名", "missing": [], "opening": "",
             }
         )
@@ -558,7 +645,7 @@ class TestReviewRegressions:
         # 誰が依頼しても同じ名前が入る（ひな形の既定名のまま出る）事故を防ぐ
         client = fake_client(
             {
-                "kind": "FAX送付状", "company_id": "ライズクリエイション", "date": "", "to_lines": ["株式会社A"],
+                "kind": "FAX送付状", "company_id": "ライズクリエイション", "date": "", "to_company": "株式会社A",
                 "items": [], "subject": "件名", "missing": [], "opening": "",
             }
         )
@@ -611,7 +698,7 @@ class TestReviewRegressions:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
-                "to_lines": ["", "  ", "　"], "staff": "足立",
+                "to_company": "  ", "staff": "足立",
                 "items": [{"name": "", "qty": ""}], "missing": [], "opening": "",
             }
         )
@@ -624,7 +711,7 @@ class TestReviewRegressions:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
-                "to_lines": ["株式会社A"], "staff": "足立",
+                "to_company": "株式会社A", "staff": "足立",
                 "items": [{"name": "請求書", "qty": ""}, {"name": "契約書", "qty": "2部"}],
                 "missing": [], "opening": "承知しました。",
             }
@@ -640,7 +727,7 @@ class TestReviewRegressions:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
-                "to_lines": ["株式会社A"], "staff": "", "items": [{"name": "契約書", "qty": "1部"}],
+                "to_company": "株式会社A", "staff": "", "items": [{"name": "契約書", "qty": "1部"}],
                 "missing": [], "opening": "",
             }
         )
@@ -700,7 +787,7 @@ class TestReplyOpening:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
-                "to_lines": ["エムズステップ　南様"], "staff": "足立",
+                "to_company": "エムズステップ", "to_person": "南", "staff": "足立",
                 "items": [{"name": "倉庫寄託契約書", "qty": "1通"}],
                 "missing": [], "opening": opening,
             }
@@ -715,7 +802,7 @@ class TestReplyOpening:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
-                "to_lines": ["エムズステップ　南様"], "staff": "足立",
+                "to_company": "エムズステップ", "to_person": "南", "staff": "足立",
                 "items": [{"name": "倉庫寄託契約書", "qty": "1通"}],
                 "missing": [],
                 "opening": "エムズステップ　南様あての送付状ですね。倉庫寄託契約書1通で作成しました。",
@@ -729,7 +816,7 @@ class TestReplyOpening:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
-                "to_lines": [], "staff": "", "items": [],
+                "to_company": "", "staff": "", "items": [],
                 "missing": [], "opening": "よろしくお願いいたします。",
             }
         )
@@ -766,7 +853,7 @@ class TestSenderStaff:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
-                "to_lines": ["株式会社A"], "staff": "", "items": [{"name": "契約書", "qty": "1部"}],
+                "to_company": "株式会社A", "staff": "", "items": [{"name": "契約書", "qty": "1部"}],
                 "missing": [], "opening": "作成しました。",
             }
         )
@@ -779,7 +866,7 @@ class TestSenderStaff:
     def test_full_name_from_the_model_is_reduced_to_surname(self, tmp_path):
         client = fake_client(
             {
-                "kind": "FAX送付状", "company_id": "ライズクリエイション", "date": "", "to_lines": ["株式会社A"],
+                "kind": "FAX送付状", "company_id": "ライズクリエイション", "date": "", "to_company": "株式会社A",
                 "staff": "足立 海里", "items": [], "subject": "件名",
                 "missing": [], "opening": "作成しました。",
             }
@@ -796,7 +883,7 @@ class TestSenderStaff:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
-                "to_lines": ["株式会社A", "経理部　坂田 様"], "staff": "坂田",
+                "to_company": "株式会社A", "to_department": "経理部", "to_person": "坂田", "staff": "坂田",
                 "items": [{"name": "契約書", "qty": "1部"}],
                 "missing": [], "opening": "作成しました。",
             }
@@ -826,7 +913,7 @@ class TestSenderStaff:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "ライズクリエイション", "sender_hint": "",
-                "date": "2026年8月17日", "to_lines": ["株式会社A 御中"],
+                "date": "2026年8月17日", "to_company": "株式会社A",
                 "items": [{"name": "契約書", "qty": "1部"}], "missing": [], "opening": "",
             }
         )
@@ -841,7 +928,7 @@ class TestSenderStaff:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "", "sender_hint": "岩永",
-                "date": "2026年8月17日", "to_lines": ["株式会社A 御中"],
+                "date": "2026年8月17日", "to_company": "株式会社A",
                 "items": [{"name": "契約書", "qty": "1部"}], "missing": [], "opening": "",
             }
         )
@@ -863,7 +950,7 @@ class TestSenderStaff:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "ライズクリエイション", "sender_hint": "",
-                "date": "2026年8月17日", "to_lines": ["株式会社A", "伊藤 様"],
+                "date": "2026年8月17日", "to_company": "株式会社A", "to_person": "伊藤",
                 "items": [{"name": "契約書", "qty": "1部"}], "missing": [], "opening": "",
             }
         )
@@ -880,7 +967,7 @@ class TestSenderStaff:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
-                "to_lines": ["株式会社A"], "items": [{"name": "契約書", "qty": "1部"}],
+                "to_company": "株式会社A", "items": [{"name": "契約書", "qty": "1部"}],
                 "missing": [], "opening": "",
             }
         )
@@ -895,7 +982,7 @@ class TestSenderStaff:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
-                "to_lines": ["株式会社A"], "items": [{"name": "契約書", "qty": "1部"}],
+                "to_company": "株式会社A", "items": [{"name": "契約書", "qty": "1部"}],
                 "missing": [], "opening": "作成しました。",
             }
         )
@@ -912,7 +999,7 @@ class TestSenderStaff:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
-                "to_lines": ["坂田商事株式会社"], "items": [{"name": "契約書", "qty": "1部"}],
+                "to_company": "坂田商事株式会社", "items": [{"name": "契約書", "qty": "1部"}],
                 "missing": [], "opening": "",
             }
         )
@@ -962,7 +1049,7 @@ class TestStaffRoster:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "ライズクリエイション", "date": "2026年8月17日",
-                "to_lines": ["株式会社A"], "staff": "", "items": [{"name": "契約書", "qty": "1部"}],
+                "to_company": "株式会社A", "staff": "", "items": [{"name": "契約書", "qty": "1部"}],
                 "missing": [], "opening": "作成しました。",
             }
         )
@@ -1116,7 +1203,7 @@ class TestAskBackWording:
         client = fake_client(
             {
                 "kind": "送付状", "company_id": "ヤマトライジング", "date": "2026年8月18日",
-                "to_lines": [], "staff": "足立",
+                "to_company": "", "staff": "足立",
                 "items": [{"name": "債権差押通知書", "qty": "一式"}],
                 "missing": [], "opening": opening,
             }

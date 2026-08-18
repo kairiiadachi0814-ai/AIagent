@@ -174,8 +174,12 @@ SYSTEM_PROMPT = """あなたは株式会社ライズクリエイション経理�
 ような、依頼する側・お願いする側の言い方で書き出してはならない**（依頼したのは相手であり、
 作ったのはこちらのため、会話として噛み合わなくなる）。
 
-宛先の書き方（to_lines）は1行ずつ配列にする。例:
-  ["株式会社大塚商会", "大阪南CADグループ", "販売２課　濵野 康一　様"]
+宛先は「会社名」「支店名」「部署名」「担当者名」に分けて抜き出す。
+組み立てはこちらで行うので、敬称（御中・様）は付けず、余計な語も足さないこと。例:
+  「大塚商会 大阪南支店 販売２課の濵野康一様あて」
+  → to_company="大塚商会" / to_branch="大阪南支店" / to_department="販売２課" / to_person="濵野 康一"
+会社名は㈱・㈲・(株)などの略記を正式名称（株式会社・有限会社）に直す。
+ただし依頼文に法人格が書かれていなければ足さない（推測で法人格を決めない）。
 
 送付書類（items）は依頼文にある物だけを並べる。部数の指定がない物は qty を空文字にする
 （こちらで「1部」と仮置きし、その旨を利用者に伝える）。
@@ -202,10 +206,25 @@ _FIELDS_SCHEMA = {
             ),
         },
         "date": {"type": "string", "description": "書類の日付。例: 2026年8月17日"},
-        "to_lines": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "宛先。会社名・部署・担当者を1行ずつ",
+        "to_company": {
+            "type": "string",
+            "description": (
+                "宛先の会社名（団体名）だけ。㈱・㈲・(株)などの略記は正式名称に直す。"
+                "依頼文に法人格が書かれていなければ足さない。支店名・部署名・敬称は含めない。"
+                "個人あてで会社名が無ければ空"
+            ),
+        },
+        "to_branch": {
+            "type": "string",
+            "description": "支店・営業所・工場・センター名。無ければ空",
+        },
+        "to_department": {
+            "type": "string",
+            "description": "部署名・課名。無ければ空",
+        },
+        "to_person": {
+            "type": "string",
+            "description": "担当者名。敬称（様・殿）は付けない。書かれていなければ空",
         },
         "items": {
             "type": "array",
@@ -247,7 +266,10 @@ _FIELDS_SCHEMA = {
         "company_id",
         "sender_hint",
         "date",
-        "to_lines",
+        "to_company",
+        "to_branch",
+        "to_department",
+        "to_person",
         "items",
         "missing",
         "opening",
@@ -550,7 +572,11 @@ class DocBuildRunner:
                     "sender_dept": str(company.get("dept") or ""),
                 },
                 {
-                    "to_line": [{"to_line": line} for line in to_lines],
+                    # 2行目（支店・部署・担当者）は1字下げて会社名にぶら下げる
+                    "to_line": [
+                        {"to_line": line if index == 0 else "　" + line}
+                        for index, line in enumerate(to_lines)
+                    ],
                     "item_name": [
                         {
                             "item_name": str(item.get("name", "")),
@@ -757,6 +783,72 @@ def _asking_opening(text: Any, default: str) -> str:
     return opening
 
 
+# 法人格の略記。㈱のような合字はNFKCで「(株)」になるため、両方を見る
+_LEGAL_FORMS = {
+    "株": "株式会社",
+    "有": "有限会社",
+    "合": "合同会社",
+    "同": "合同会社",
+    "資": "合資会社",
+    "名": "合名会社",
+    "社": "社団法人",
+    "財": "財団法人",
+    "医": "医療法人",
+    "学": "学校法人",
+    "税": "税理士法人",
+    "宗": "宗教法人",
+    "独": "独立行政法人",
+}
+_ABBREV_RE = re.compile(r"[（(]\s*(" + "|".join(_LEGAL_FORMS) + r")\s*[）)]")
+_LIGATURES = {
+    "㈱": "株式会社", "㈲": "有限会社", "㈳": "社団法人", "㈶": "財団法人",
+    "㈵": "企業組合", "㈻": "学校法人", "㈼": "監督", "㈺": "協同組合",
+}
+
+
+def expand_legal_form(name: str) -> str:
+    """「㈱ライズ」「(株)ライズ」→「株式会社ライズ」。
+
+    書類の宛名に略記は使わない。合字（㈱）と括弧書き（(株)）の両方を直す。
+    書かれていない法人格を足すことはしない（推測で決めない）。
+    """
+    text = str(name or "").strip()
+    for ligature, full in _LIGATURES.items():
+        text = text.replace(ligature, full)
+    text = _ABBREV_RE.sub(lambda m: _LEGAL_FORMS[m.group(1)], text)
+    return re.sub(r"[\s　]+", " ", text).strip()
+
+
+def build_recipient(parts: dict[str, str]) -> list[str]:
+    """宛先を2行に組む。
+
+    1行目に会社名（正式名称）、2行目に支店名・部署名・担当者名を置く。例:
+      ["南都銀行", "奈良支店　営業課　田中様"]
+      ["株式会社大塚商会", "大阪南支店　販売２課　ご担当者様"]
+    2行目に置くものが無ければ、会社名に御中を付けた1行だけにする。
+    会社名が無い個人あては、担当者の行だけを返す。
+    """
+    company = expand_legal_form(parts.get("company", ""))
+    tail = [
+        expand_legal_form(parts.get("branch", "")),
+        expand_legal_form(parts.get("department", "")),
+    ]
+    person = re.sub(r"[\s　]+", " ", str(parts.get("person") or "")).strip()
+    person = _HONORIFIC_RE.sub("", person).strip()  # 敬称はこちらで付け直す
+    if person:
+        tail.append(f"{person}様")
+    elif any(tail):
+        # 部署までしか分からないときは、個人名を作らずに「ご担当者様」とする
+        tail.append("ご担当者様")
+    tail = [t for t in tail if t]
+
+    if not company:
+        return ["　".join(tail)] if tail else []
+    if not tail:
+        return [f"{company}　御中"]
+    return [company, "　".join(tail)]
+
+
 def _split_honorific(line: str) -> tuple[str, str]:
     """「株式会社○○ 御中」→ ("株式会社○○", "御中")。敬称が無ければ既定の「御中」。"""
     text = str(line).strip()
@@ -772,9 +864,14 @@ def _normalize(fields: dict[str, Any]) -> None:
     不足判定（_missing）と差し込み（_render）で見え方が違うと、
     「宛先あり」と判定したのに宛先の無い書類ができてしまう。
     """
-    fields["to_lines"] = [
-        str(line).strip() for line in fields.get("to_lines") or [] if str(line).strip()
-    ]
+    fields["to_parts"] = {
+        "company": str(fields.get("to_company") or "").strip(),
+        "branch": str(fields.get("to_branch") or "").strip(),
+        "department": str(fields.get("to_department") or "").strip(),
+        "person": str(fields.get("to_person") or "").strip(),
+    }
+    # 差し込み・不足判定・ファイル名は組み上げた行を見る（見え方を1か所に揃える）
+    fields["to_lines"] = build_recipient(fields["to_parts"])
     items = []
     for item in fields.get("items") or []:
         name = str((item or {}).get("name", "")).strip()
