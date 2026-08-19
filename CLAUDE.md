@@ -33,6 +33,7 @@ Chatworkの許可ルームでメンションを受けたら、`handbook/` と `s
 
 - `src/raizuinu/` にコア実装（config／webhook／handbook／answer／chatwork／audit／cost／handler／app／lambda_function）。役割はパッケージdocstring参照
 - ひな形からの書類作成は `docbuild.py`（依頼→項目抽出→書式と差出人会社の決定）と `templatefill.py`（Word/Excelへの差し込み。標準ライブラリのみ）。ひな形の実体は `templates/`。Wordは書式ごとに1つだけ持ち（`送付状_標準.docx`／`送付状_楽天軒型.docx`）、差出人の会社情報は `templates/companies.json` から差し込む。**グループ会社が増えたときは companies.json に1件足すだけ**（ひな形は増やさない）。Boxの原本から白紙化して作り直すには `python tools/build_templates.py`（ローカルPC専用）
+- 添付文書の読み取りは `doctask.py`。一度読んだ文書は `DocumentMemory` がルーム単位で覚え、**その話題への返信か、ファイル名の名指しのときだけ**思い出す（会話の途中から入った人が添付し直さずに済む。無関係な質問に文書を持ち出さないよう条件を絞ってある）
 - レターパックの手配取次ぎは `letterpack.py`。`LetterpackRunner` が依頼者とのやり取り（要否→文面確認→投稿）、`LetterpackFollower` が総務からの返信の巡回（watcherのタイマーに相乗り）。投稿先の備品ルームは **`allowed_room_ids` に入れない**（Q&Aの対象外にして、他部署のルームへ社内ナレッジが流れる経路を作らない）
 - ハンドブック転記ファイル（63件）は現状リポジトリ直下のフラット構成。参照ルートは `config/config.json` の `handbook.roots` で管理し、将来 `handbook/`・`sops/` 階層へ移す場合も設定変更のみで追従する
 - 11章未決事項の推奨案（暫定採用）は `docs/phase1-requirements.md` 11章と `config/config.json` に記録

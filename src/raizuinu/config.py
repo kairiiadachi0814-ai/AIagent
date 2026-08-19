@@ -76,6 +76,9 @@ _DEFAULTS: dict[str, Any] = {
         "max_text_chars": 120000,
         # 「さっきのファイル」を探すときだけ、文脈用より広くメッセージを遡る
         "search_message_count": 60,
+        # 一度読んだ文書をルーム単位で覚えておく時間（分）。会話の途中から入った
+        # 人が添付し直さずに続きを聞けるようにする（既定24時間）
+        "remember_minutes": 1440,
     },
     # ひな形からの書類作成（送付状・FAX送付状）。ひな形の実体は templates/ に同梱
     "doc_build": {

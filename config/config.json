@@ -61,7 +61,8 @@
     "max_pdf_mb": 15,
     "max_pdf_pages": 50,
     "max_text_chars": 120000,
-    "search_message_count": 60
+    "search_message_count": 60,
+    "remember_minutes": 1440
   },
   "doc_build": {
     "enabled": true,

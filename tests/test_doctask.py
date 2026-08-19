@@ -693,3 +693,152 @@ class TestHandlerIntegration:
         }).encode()
         digest = hmac.new(base64.b64decode(token), body, hashlib.sha256).digest()
         return handler.handle_webhook(body, base64.b64encode(digest).decode())
+
+    def test_a_colleague_can_continue_without_re_attaching(self, tmp_path, monkeypatch):
+        """坂田さんが添付 → 足立さんが返信で続きを聞く、を通しで確認する。
+
+        2026-08-19の運用テストで、途中から入った質問に「ファイルが付いていない」と
+        返してしまった経路。添付し直さなくても同じ文書を読めること。
+        """
+        import base64, hashlib, hmac
+
+        handler, chatwork, generator, audit, token = self._make(tmp_path, monkeypatch)
+        chatwork.get_file_info = lambda room_id, file_id: {
+            "filename": "倉庫寄託契約書.pdf", "filesize": 100,
+            "download_url": "https://files.example/dl",
+        }
+        ids = iter(["9001", "9002"])
+        chatwork.send_message = lambda room_id, body: (
+            chatwork.sent.append((room_id, body)) or next(ids)
+        )
+
+        def post(account_id, message_id, body_text):
+            body = json.dumps({
+                "webhook_event_type": "mention_to_me",
+                "webhook_event": {
+                    "from_account_id": account_id, "to_account_id": 999,
+                    "room_id": 12345, "message_id": message_id,
+                    "body": body_text, "send_time": 1700000000,
+                },
+            }).encode()
+            digest = hmac.new(base64.b64decode(token), body, hashlib.sha256).digest()
+            return handler.handle_webhook(body, base64.b64encode(digest).decode())
+
+        # 坂田さんが添付して要約を依頼
+        post(222, "8001", "[To:999] 添付したファイルの文書を簡潔に要約してほしい。"
+                          "[download:5555]倉庫寄託契約書.pdf (1.04 MB)[/download]")
+        assert audit.records[-1]["type"] == "doc_task"
+
+        # 足立さんが、こちらの回答（9001）への返信で続きを聞く。添付は付けていない
+        post(111, "8002", "[rp aid=999 to=12345-9001] 料金体系ではなく、パレットの取扱についての方。")
+
+        assert audit.records[-1]["type"] == "doc_task"  # Q&Aや案内文へ落ちない
+        assert generator.calls == []
+        assert "倉庫寄託契約書" in chatwork.sent[-1][1]
+        assert "添付" not in chatwork.sent[-1][1].split("※")[0]
+
+
+class TestDocumentMemory:
+    """会話の途中から入っても、添付し直さずに続きを聞けること。
+
+    実例（2026-08-19 運用テスト）: 坂田さんが倉庫寄託契約書.pdf を添付して要約を依頼。
+    そのあと足立さんが会話に入り、条文について尋ねたが添付が見つからず答えられなかった。
+    """
+
+    ROOM = 384793683
+    UPLOAD_ID = "1000"
+    ANSWER_ID = "1001"
+
+    def memory(self, tmp_path, ttl_minutes=1440):
+        from raizuinu.doctask import DocumentMemory
+
+        return DocumentMemory(tmp_path / "room_documents.json", ttl_minutes=ttl_minutes)
+
+    def remembered(self, tmp_path, **kwargs):
+        memory = self.memory(tmp_path, **kwargs)
+        memory.remember(
+            self.ROOM,
+            {"kind": "chatwork_file", "files": [{"file_id": 5555, "filename": "倉庫寄託契約書.pdf"}]},
+            [self.UPLOAD_ID, "1002", self.ANSWER_ID],
+            1000,
+        )
+        return memory
+
+    def test_a_reply_to_the_answer_finds_the_same_file(self, tmp_path):
+        # 「料金体系ではなく、パレットの取扱についての方。」— 単独では文書依頼と読めないが、
+        # こちらの回答への返信なので同じ文書を見に行く
+        memory = self.remembered(tmp_path)
+        body = f"[rp aid=6945415 to={self.ROOM}-{self.ANSWER_ID}] 料金体系ではなく、パレットの取扱についての方。"
+        found = memory.recall(self.ROOM, "料金体系ではなく、パレットの取扱についての方。", body, 2000)
+        assert found["files"][0]["file_id"] == 5555
+        assert found["files"][0]["filename"] == "倉庫寄託契約書.pdf"
+
+    def test_a_reply_to_the_original_upload_finds_it_too(self, tmp_path):
+        memory = self.remembered(tmp_path)
+        body = f"[rp aid=6945415 to={self.ROOM}-{self.UPLOAD_ID}] ここの条文を教えて"
+        assert memory.recall(self.ROOM, "ここの条文を教えて", body, 2000)["files"][0]["file_id"] == 5555
+
+    def test_naming_the_document_finds_it(self, tmp_path):
+        # 返信ではなく通常のメンションでも、ファイル名を名指ししていれば拾う
+        memory = self.remembered(tmp_path)
+        question = "先程、坂田さんから依頼のあった、倉庫寄託契約書のまとめ内でパレットについての条文があったと思うが、内容教えて。"
+        assert memory.recall(self.ROOM, question, "[To:999] " + question, 2000)["files"][0]["file_id"] == 5555
+
+    def test_an_unrelated_question_does_not_drag_the_file_in(self, tmp_path):
+        # 同じルームの別件。文書を持ち出すと見当違いの回答になる
+        memory = self.remembered(tmp_path)
+        assert memory.recall(self.ROOM, "経費精算の締め日は？", "[To:999] 経費精算の締め日は？", 2000) is None
+
+    def test_another_room_never_sees_it(self, tmp_path):
+        memory = self.remembered(tmp_path)
+        body = f"[rp aid=6945415 to=444781726-{self.ANSWER_ID}] 続きを教えて"
+        assert memory.recall(444781726, "倉庫寄託契約書について", body, 2000) is None
+
+    def test_it_is_forgotten_after_the_window(self, tmp_path):
+        memory = self.remembered(tmp_path, ttl_minutes=60)
+        question = "倉庫寄託契約書のパレットの条文を教えて"
+        assert memory.recall(self.ROOM, question, "", 1000 + 59 * 60) is not None
+        assert memory.recall(self.ROOM, question, "", 1000 + 61 * 60) is None
+
+    def test_a_new_document_replaces_the_reply_chain(self, tmp_path):
+        # 別の文書に切り替わったら、前の会話への返信で古い文書を持ち出さない
+        memory = self.remembered(tmp_path)
+        memory.remember(
+            self.ROOM,
+            {"kind": "chatwork_file", "files": [{"file_id": 6666, "filename": "業務委託契約書.pdf"}]},
+            ["2000", "2001"],
+            1500,
+        )
+        stale = f"[rp aid=6945415 to={self.ROOM}-{self.ANSWER_ID}] 続き"
+        assert memory.recall(self.ROOM, "続き", stale, 2000) is None
+        fresh = f"[rp aid=6945415 to={self.ROOM}-2001] 続き"
+        assert memory.recall(self.ROOM, "続き", fresh, 2000)["files"][0]["file_id"] == 6666
+
+    def test_urls_are_not_remembered(self, tmp_path):
+        # Googleドキュメントは相手側で内容が変わりうる。読み直しの対象にしない
+        memory = self.memory(tmp_path)
+        memory.remember(self.ROOM, {"kind": "google", "url": GOOGLE_DOC_URL}, ["1"], 1000)
+        assert memory.recall(self.ROOM, "さっきの資料", "[rp aid=1 to=384793683-1]", 1100) is None
+
+    def test_a_corrupt_state_file_is_ignored(self, tmp_path):
+        path = tmp_path / "room_documents.json"
+        path.write_text("{壊れている", encoding="utf-8")
+        from raizuinu.doctask import DocumentMemory
+
+        assert DocumentMemory(path).recall(self.ROOM, "倉庫寄託契約書", "", 1000) is None
+
+
+class TestDocumentNouns:
+    def test_a_contract_summary_request_is_a_document_task(self):
+        # 「契約書」が文書を指す名詞に無く、まとめ依頼と読めていなかった
+        from raizuinu.doctask import _should_scan_history
+
+        assert _should_scan_history("先程の倉庫寄託契約書のまとめ内容を教えて") is True
+        assert _should_scan_history("さっき送った見積書を要約して") is True
+        assert _should_scan_history("添付のPDFをまとめて") is True
+
+    def test_a_handbook_question_is_still_not_a_document_task(self):
+        from raizuinu.doctask import _should_scan_history
+
+        assert _should_scan_history("契約書の保管ルールは？") is False
+        assert _should_scan_history("契約書の書き方を教えて") is False

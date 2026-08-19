@@ -87,7 +87,10 @@ _HOWTO_RE = re.compile(
 # 文書そのものを指す名詞。「経費精算の資料をまとめて教えて」のような
 # 通常のQ&Aを拾わないよう、下の参照語との同時出現を必須にする
 _DOC_NOUN_RE = re.compile(
-    r"ファイル|資料|文書|ドキュメント|テキスト|文字起こし|議事録|データ|添付|シート|スプレッドシート"
+    r"ファイル|資料|文書|ドキュメント|テキスト|文字起こし|議事録|データ|添付|シート|スプレッドシート|"
+    # 実際に読ませる書類の名前。これが無いと「契約書のまとめ」を文書依頼と読めない
+    r"契約書|覚書|念書|規程|規約|約款|仕様書|見積書|請求書|納品書|報告書|稟議書|申請書|"
+    r"議案書|提案書|明細書|通知書|証明書|PDF|ＰＤＦ"
 )
 # 「直前に投稿された文書」を指す参照語。部分一致の誤爆（「以上の」→「上の」、
 # 「以前の」→「前の」、「アップロード手順」→「アップ」）を避けるため語形を限定する
@@ -267,8 +270,125 @@ def find_document(
             continue
         found = _document_in_text(_QUOTE_RE.sub("", str(message.get("body", ""))))
         if found is not None and found["kind"] == "chatwork_file":
+            # 添付された元の発言も覚えておく（そこへの返信で続きを聞けるように）
+            found["source_message_id"] = str(message.get("message_id", ""))
             return found
     return None
+
+
+# Chatworkの返信タグ。[rp aid=6945415 to=384793683-1234567890]
+_REPLY_TAG_RE = re.compile(r"\[rp\s+aid=\d+\s+to=(\d+)-(\d+)\]")
+# ファイル名から日付や連番を除いた語。短すぎる語は一般名詞と当たるため見ない
+_NAME_TOKEN_RE = re.compile(r"[^\W\d_]{4,}", re.UNICODE)
+
+
+def reply_target(body: str) -> str:
+    """Chatworkの「返信」が指しているメッセージID（返信でなければ空文字）。"""
+    match = _REPLY_TAG_RE.search(str(body or ""))
+    return match.group(2) if match else ""
+
+
+def _name_keys(filename: str) -> list[str]:
+    """ファイル名から、質問文と突き合わせる語を作る。
+
+    「倉庫寄託契約書.pdf」→「倉庫寄託契約書」。日付や連番だけの語は落とす。
+    """
+    stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", str(filename or "")).strip()
+    if not stem:
+        return []
+    keys = {stem}
+    keys.update(_NAME_TOKEN_RE.findall(stem))
+    return sorted(keys, key=len, reverse=True)
+
+
+def mentions_document(question: str, filename: str) -> bool:
+    """質問文がその文書を名指ししているか（「倉庫寄託契約書の…」）。"""
+    text = str(question or "")
+    return any(key in text for key in _name_keys(filename))
+
+
+class DocumentMemory:
+    """ルームごとに、直近で読んだ文書を覚えておく。
+
+    会話の途中から入った人が「さっきの契約書の◯◯は？」と尋ねたとき、
+    ファイルを添付し直さなくても同じ文書を見に行けるようにする。
+
+    取り違えを避けるため、思い出すのは次の2つの場合だけにする。
+    - その文書に関するやり取り（元の添付、またはこちらの回答）への「返信」
+    - 質問文がファイル名を名指ししている
+
+    ルームをまたいで共有はしない。同じルームの人しか見られない文書のため。
+    """
+
+    def __init__(self, path: Any, ttl_minutes: int = 1440) -> None:
+        self._path = path
+        self._ttl = int(ttl_minutes) * 60
+
+    def remember(
+        self, room_id: int, document: dict[str, Any], message_ids: list[str], now: int
+    ) -> None:
+        files = document.get("files") or []
+        if document.get("kind") != "chatwork_file" or not files:
+            return  # 読み直せるのはChatworkの添付だけ（URLは相手側で変わりうる）
+        data = self._load()
+        entry = data.get(str(room_id)) or {}
+        same = [f.get("file_id") for f in entry.get("files") or []] == [
+            f.get("file_id") for f in files
+        ]
+        ids = list(entry.get("message_ids") or []) if same else []
+        for message_id in message_ids:
+            if message_id and str(message_id) not in ids:
+                ids.append(str(message_id))
+        data[str(room_id)] = {
+            "files": [
+                {"file_id": f.get("file_id"), "filename": f.get("filename", "")}
+                for f in files
+            ],
+            "message_ids": ids[-20:],  # 会話が伸びても状態を太らせない
+            "ts": int(now),
+        }
+        self._save(data)
+
+    def recall(
+        self, room_id: int, question: str, body: str, now: int
+    ) -> dict[str, Any] | None:
+        entry = self._load().get(str(room_id))
+        files = (entry or {}).get("files") or []
+        if not files:
+            return None
+        if int(now) - int(entry.get("ts", 0)) > self._ttl:
+            return None
+        target = reply_target(body)
+        hit = (target and target in (entry.get("message_ids") or [])) or any(
+            mentions_document(question, f.get("filename", "")) for f in files
+        )
+        if not hit:
+            return None
+        return {
+            "kind": "chatwork_file",
+            "files": files,
+            "total_files": len(files),
+            "recalled": True,
+        }
+
+    # --- 内部 ---
+
+    def _load(self) -> dict[str, Any]:
+        try:
+            import json
+
+            return json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def _save(self, data: dict[str, Any]) -> None:
+        try:
+            import json
+
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            print("[warn] 文書の記憶の保存に失敗", flush=True)
 
 
 def extract_docx_text(data: bytes) -> str:

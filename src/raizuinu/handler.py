@@ -108,6 +108,14 @@ class RaizuinuHandler:
             from .doctask import DocTaskRunner
 
             self._doc_task = DocTaskRunner(cfg, self._chatwork)
+        self._doc_memory = overrides.get("doc_memory")
+        if self._doc_memory is None and self._doc_task is not None:
+            from .doctask import DocumentMemory
+
+            self._doc_memory = DocumentMemory(
+                cfg.resolve_path(cfg.state_dir) / "room_documents.json",
+                ttl_minutes=int(cfg.doc_task.get("remember_minutes", 1440)),
+            )
         self._doc_build = overrides.get("doc_build")
         if self._doc_build is None and cfg.doc_build.get("enabled"):
             from .docbuild import DocBuildRunner
@@ -366,6 +374,12 @@ class RaizuinuHandler:
                 event.body, messages, question,
                 bot_account_id=event.to_account_id, handbook_url_check=url_check,
             )
+            if document is None and self._doc_memory is not None:
+                # 会話の途中から入った人が添付し直さずに済むよう、そのルームで
+                # 直近に読んだ文書を思い出す（その話題への返信か、名指しのときだけ）
+                document = self._doc_memory.recall(
+                    event.room_id, question, event.body, int(event.send_time)
+                )
             if (
                 document is None
                 and looks_like_document_request(question)
@@ -761,7 +775,7 @@ class RaizuinuHandler:
         except Exception:
             print("[warn] コスト計上に失敗: " + traceback.format_exc(), flush=True)
 
-        self._chatwork.send_message(
+        answer_id = self._chatwork.send_message(
             event.room_id,
             _reply_tag(event)
             + sanitize_for_chatwork(reply_text),
@@ -769,6 +783,19 @@ class RaizuinuHandler:
 
         # 返信成功後の後処理での例外は失敗メッセージを送らない（二重送信防止）
         try:
+            if self._doc_memory is not None:
+                # この文書についてのやり取り（依頼とこちらの回答）を覚えておく。
+                # 続きの質問が返信で来たときに、同じ文書を見に行けるようにする
+                self._doc_memory.remember(
+                    event.room_id,
+                    document,
+                    [
+                        document.get("source_message_id", ""),
+                        event.message_id,
+                        answer_id,
+                    ],
+                    int(event.send_time),
+                )
             if status is not None:
                 self._maybe_alert(status)
             self._audit_safely(
