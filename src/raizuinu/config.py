@@ -106,6 +106,16 @@ _DEFAULTS: dict[str, Any] = {
         "register_note": "",
         "greeting": "おはようございます。",
     },
+    # TaskRising（社内タスク管理）への登録。Supabaseを直接叩く。
+    # 経費支払いタスク・振込用CSV等が揃うまでは無効のまま置く
+    "taskrising": {
+        "enabled": False,
+        "url": "https://dldtjyyypmltylllhqdv.supabase.co",
+        "tasks_table": "tasks",
+        "timeout_seconds": 30,
+        # 依頼文の項目 → テーブルの列。スキーマが分かってから埋める
+        "field_map": {},
+    },
     # レターパックの手配依頼。送付状を作ったら総務へ取り次ぐ。
     # supplies_room_id は許可ルーム（Q&Aの対象）に入れない。投稿と巡回だけに使い、
     # 他部署のルームへ社内ナレッジが流れる経路を作らないため
@@ -187,6 +197,20 @@ class Config:
     @property
     def chatwork_webhook_token(self) -> str | None:
         return os.environ.get("CHATWORK_WEBHOOK_TOKEN")
+
+    # TaskRising（Supabase）。ボットユーザーで入るための3点。
+    # service_role キーは使わない（行レベルの権限制御を素通りするため）
+    @property
+    def taskrising_api_key(self) -> str | None:
+        return os.environ.get("TASKRISING_API_KEY")
+
+    @property
+    def taskrising_bot_email(self) -> str | None:
+        return os.environ.get("TASKRISING_BOT_EMAIL")
+
+    @property
+    def taskrising_bot_password(self) -> str | None:
+        return os.environ.get("TASKRISING_BOT_PASSWORD")
 
 
 def _deep_merge(base: dict, override: dict) -> None:
