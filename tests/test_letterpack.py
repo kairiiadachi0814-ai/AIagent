@@ -18,6 +18,7 @@ SUPPLIES_ROOM = 345854487
 STAFF_ID = 1160869
 DEPT_ROOM = 384793683
 REQUESTER = 6945415
+AGENT = 999  # アシスタント自身のアカウント
 
 DETAIL = {
     "company": "株式会社ライズクリエイション",
@@ -56,6 +57,9 @@ class FakeChatwork:
 
     def get_recent_messages(self, room_id, limit=20):
         return self._messages
+
+    def get_me(self):
+        return AGENT
 
 
 def fake_client(payload):
@@ -213,18 +217,24 @@ class TestOfferFlow:
 
 
 def open_thread(tmp_path, chatwork):
-    """総務へ投稿済みの状態を作る。"""
+    """総務へ投稿済みの状態を作る。→ (runner, 依頼を投稿したメッセージID)"""
     run = LetterpackRunner(make_config(tmp_path), chatwork)
     run.offer(DEPT_ROOM, REQUESTER, 1000, DETAIL)
     run.handle(DEPT_ROOM, REQUESTER, 1100, "ライト2枚で")
     run.handle(DEPT_ROOM, REQUESTER, 1200, "送信", display_name="足立 海里")
-    return run
+    return run, chatwork._next_id
 
 
-def staff_message(message_id, body):
+def staff_message(message_id, body, reply_to=None, to=None):
+    """総務からの発言。reply_to を指定すると、その投稿への「返信」になる。"""
+    tags = ""
+    if reply_to is not None:
+        tags += f"[rp aid={AGENT} to={SUPPLIES_ROOM}-{reply_to}] "
+    if to is not None:
+        tags += f"[To:{to}] "
     return {
         "message_id": str(message_id),
-        "body": body,
+        "body": tags + body,
         "account": {"account_id": STAFF_ID, "name": "坂口 美代子"},
     }
 
@@ -232,19 +242,19 @@ def staff_message(message_id, body):
 class TestFollowUp:
     def test_completion_is_relayed_and_thanked(self, tmp_path):
         chatwork = FakeChatwork()
-        open_thread(tmp_path, chatwork)
-        posted_id = int(chatwork.sent and chatwork._next_id)
-        chatwork._messages = [staff_message(posted_id + 5, "用意しました。総務の棚に置いています。")]
+        _, posted = open_thread(tmp_path, chatwork)
+        chatwork._messages = [
+            staff_message(posted + 5, "用意しました。総務の棚に置いています。", reply_to=posted)
+        ]
         chatwork.sent.clear()
 
-        follower = LetterpackFollower(
+        LetterpackFollower(
             make_config(tmp_path),
             chatwork,
             client=fake_client(
                 {"kind": "完了", "summary": "レターパックライト2枚を総務の棚に用意いただきました。", "question": ""}
             ),
-        )
-        follower.run_once()
+        ).run_once()
 
         rooms = [room for room, _ in chatwork.sent]
         assert DEPT_ROOM in rooms and SUPPLIES_ROOM in rooms
@@ -254,11 +264,60 @@ class TestFollowUp:
         thanks = next(b for r, b in chatwork.sent if r == SUPPLIES_ROOM)
         assert "ありがとうございます" in thanks
 
+    def test_a_reply_addressed_to_us_without_the_reply_button_still_counts(self, tmp_path):
+        # 「返信」ではなく宛先タグで返された場合。進行中が1件なら判別できる
+        chatwork = FakeChatwork()
+        _, posted = open_thread(tmp_path, chatwork)
+        chatwork._messages = [staff_message(posted + 5, "用意しました", to=AGENT)]
+        chatwork.sent.clear()
+        LetterpackFollower(
+            make_config(tmp_path), chatwork,
+            client=fake_client({"kind": "完了", "summary": "用意いただきました。", "question": ""}),
+        ).run_once()
+        assert DEPT_ROOM in [room for room, _ in chatwork.sent]
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            # 他の人の依頼への返事（タグなし）。実際にこれを横取りしていた
+            "備品は明日届く予定です。受け取り後、C欄を受け取り済みに変更してください。",
+            # 別の依頼者への返信
+            "[rp aid=8681926 to=345854487-7777] 承知しました、手配します。",
+            # 別ルームへの返信タグ
+            "[rp aid=999 to=384793683-9001] こちらは別のルームの話です。",
+        ],
+    )
+    def test_someone_elses_conversation_is_not_hijacked(self, tmp_path, message):
+        chatwork = FakeChatwork()
+        _, posted = open_thread(tmp_path, chatwork)
+        chatwork._messages = [
+            {
+                "message_id": str(posted + 5), "body": message,
+                "account": {"account_id": STAFF_ID, "name": "坂口 美代子"},
+            }
+        ]
+        chatwork.sent.clear()
+        LetterpackFollower(make_config(tmp_path), chatwork, client=None).run_once()
+        assert chatwork.sent == []  # 依頼者にもルームにも何も出さない
+
+    def test_an_ambiguous_mention_is_left_alone_when_several_are_open(self, tmp_path):
+        # 進行中が複数あると、宛先タグだけではどの件への返事か決められない
+        chatwork = FakeChatwork()
+        run, posted = open_thread(tmp_path, chatwork)
+        run.offer(DEPT_ROOM, 9129422, 2000, DETAIL)
+        run.handle(DEPT_ROOM, 9129422, 2100, "ライト1枚で")
+        run.handle(DEPT_ROOM, 9129422, 2200, "送信", display_name="伊藤")
+        chatwork._messages = [staff_message(chatwork._next_id + 5, "用意しました", to=AGENT)]
+        chatwork.sent.clear()
+        LetterpackFollower(make_config(tmp_path), chatwork, client=None).run_once()
+        assert chatwork.sent == []
+
     def test_a_question_is_relayed_and_the_answer_goes_back(self, tmp_path):
         chatwork = FakeChatwork()
-        run = open_thread(tmp_path, chatwork)
-        posted_id = chatwork._next_id
-        chatwork._messages = [staff_message(posted_id + 5, "いつまでに必要でしょうか？")]
+        run, posted = open_thread(tmp_path, chatwork)
+        chatwork._messages = [
+            staff_message(posted + 5, "いつまでに必要でしょうか？", reply_to=posted)
+        ]
         chatwork.sent.clear()
 
         LetterpackFollower(
@@ -279,10 +338,37 @@ class TestFollowUp:
         assert room_id == SUPPLIES_ROOM
         assert "明後日までにお願いします" in body
 
+    def test_a_reply_to_our_follow_up_is_picked_up_too(self, tmp_path):
+        # 依頼者の答えを総務へ返したあと、そこへの返信も同じやり取りとして拾う
+        chatwork = FakeChatwork()
+        run, posted = open_thread(tmp_path, chatwork)
+        chatwork._messages = [
+            staff_message(posted + 5, "いつまでに必要でしょうか？", reply_to=posted)
+        ]
+        LetterpackFollower(
+            make_config(tmp_path), chatwork,
+            client=fake_client({"kind": "質問", "summary": "納期の確認です。", "question": "納期"}),
+        ).run_once()
+        run.handle(DEPT_ROOM, REQUESTER, 99999999, "明後日までにお願いします")
+        followup_id = chatwork._next_id  # 総務へ返した投稿
+
+        chatwork._messages = [
+            # メッセージIDは時系列で増える。前回の巡回より後の投稿になるようにする
+            staff_message(posted + 20, "承知しました、明日用意します。", reply_to=followup_id)
+        ]
+        chatwork.sent.clear()
+        LetterpackFollower(
+            make_config(tmp_path), chatwork,
+            client=fake_client({"kind": "完了", "summary": "明日用意いただけるそうです。", "question": ""}),
+        ).run_once()
+        assert "明日用意" in next(b for r, b in chatwork.sent if r == DEPT_ROOM)
+
     def test_a_new_request_is_not_swallowed_as_an_answer(self, tmp_path):
         chatwork = FakeChatwork()
-        run = open_thread(tmp_path, chatwork)
-        chatwork._messages = [staff_message(chatwork._next_id + 5, "いつまでに必要ですか？")]
+        run, posted = open_thread(tmp_path, chatwork)
+        chatwork._messages = [
+            staff_message(posted + 5, "いつまでに必要ですか？", reply_to=posted)
+        ]
         LetterpackFollower(
             make_config(tmp_path),
             chatwork,
@@ -298,11 +384,11 @@ class TestFollowUp:
 
     def test_messages_from_others_are_ignored(self, tmp_path):
         chatwork = FakeChatwork()
-        open_thread(tmp_path, chatwork)
+        _, posted = open_thread(tmp_path, chatwork)
         chatwork._messages = [
             {
-                "message_id": str(chatwork._next_id + 5),
-                "body": "こちらは別の備品の話です",
+                "message_id": str(posted + 5),
+                "body": f"[rp aid=999 to={SUPPLIES_ROOM}-{posted}] こちらは別の備品の話です",
                 "account": {"account_id": 999999, "name": "別の人"},
             }
         ]
@@ -312,8 +398,8 @@ class TestFollowUp:
 
     def test_the_same_reply_is_not_relayed_twice(self, tmp_path):
         chatwork = FakeChatwork()
-        open_thread(tmp_path, chatwork)
-        chatwork._messages = [staff_message(chatwork._next_id + 5, "用意しました")]
+        _, posted = open_thread(tmp_path, chatwork)
+        chatwork._messages = [staff_message(posted + 5, "用意しました", reply_to=posted)]
         chatwork.sent.clear()
         payload = {"kind": "完了", "summary": "用意いただきました。", "question": ""}
         for _ in range(2):
@@ -330,12 +416,25 @@ class TestFollowUp:
                     raise RuntimeError("API down")
 
         chatwork = FakeChatwork()
-        open_thread(tmp_path, chatwork)
-        chatwork._messages = [staff_message(chatwork._next_id + 5, "用意しました")]
+        _, posted = open_thread(tmp_path, chatwork)
+        chatwork._messages = [staff_message(posted + 5, "用意しました", reply_to=posted)]
         chatwork.sent.clear()
         LetterpackFollower(make_config(tmp_path), chatwork, client=BrokenClient()).run_once()
         to_requester = next(b for r, b in chatwork.sent if r == DEPT_ROOM)
         assert "用意しました" in to_requester  # 判定できなくても伝える
+
+    def test_an_abandoned_request_is_reported_not_dropped_silently(self, tmp_path):
+        # 返信が来ないまま期限を過ぎたら、依頼者に伝えてから閉じる
+        chatwork = FakeChatwork()
+        open_thread(tmp_path, chatwork)
+        config = make_config(tmp_path)
+        config.data["letterpack"]["max_open_days"] = 0  # 即座に期限切れにする
+        chatwork.sent.clear()
+        LetterpackFollower(config, chatwork, client=None).run_once()
+        assert len(chatwork.sent) == 1
+        room_id, body = chatwork.sent[0]
+        assert room_id == DEPT_ROOM
+        assert "返信を確認できませんでした" in body
 
 
 class TestStore:

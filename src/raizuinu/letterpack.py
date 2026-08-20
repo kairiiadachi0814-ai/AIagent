@@ -42,6 +42,10 @@ _COUNT_RE = re.compile(r"(\d+)\s*(?:枚|通|部)")
 _DECLINE_RE = re.compile(r"(不要|いらな|要らな|結構です|なし$|無し$|いいえ|大丈夫です|やめ|見送)")
 _SEND_RE = re.compile(r"(送信|送って|送付して|依頼して|お願いします|これでお願い|ok|OK|オーケー|了解|はい)")
 _CANCEL_RE = re.compile(r"(取消|取り消|やめ|中止|キャンセル|やっぱり)")
+# 備品ルームは総務が部署全体の依頼をさばく場。こちらの依頼への返事だけを拾うため、
+# 返信タグ・宛先タグでこちらのメッセージを指しているものに限る
+_RP_RE = re.compile(r"\[rp\s+aid=\d+\s+to=(\d+)-(\d+)\]")
+_TO_RE = re.compile(r"\[To:(\d+)\]")
 
 # 送付状の返信の末尾に足す確認文
 OFFER = (
@@ -118,7 +122,8 @@ def build_request_text(detail: dict[str, Any], count: int, kind: str) -> str:
         f"・必要枚数: {count}枚\n"
         f"・種類: {kind}\n"
         f"\n"
-        f"お手数をおかけしますが、よろしくお願いいたします。"
+        f"お手数をおかけしますが、よろしくお願いいたします。\n"
+        f"（ご返信は、このメッセージへの返信でお願いできますと助かります）"
     )
 
 
@@ -349,6 +354,9 @@ class LetterpackRunner:
             "requester_account_id": int(requester_account),
             "requester_name": display_name,
             "posted_message_id": str(message_id),
+            # こちらが備品ルームへ出したメッセージ。総務の返信がどれを指しているかを
+            # 突き合わせて、他の依頼への返事を拾わないようにする
+            "message_ids": [str(message_id)],
             "last_seen": int(message_id),
             "status": "open",
             "detail": draft.get("detail") or {},
@@ -395,12 +403,16 @@ class LetterpackRunner:
             f"よろしくお願いいたします。"
         )
         try:
-            self._chatwork.send_message(room_id, head + "\n" + sanitize_for_chatwork(body))
+            message_id = self._chatwork.send_message(
+                room_id, head + "\n" + sanitize_for_chatwork(body)
+            )
         except Exception as exc:
             raise LetterpackError(
                 "すみません、備品・消耗品購入依頼チャットへの返信に失敗しました。"
                 "お手数ですが、直接お伝えいただけますか。"
             ) from exc
+        # この投稿への返信も、同じやり取りの続きとして拾えるようにする
+        thread.setdefault("message_ids", []).append(str(message_id))
         thread["status"] = "open"
         thread.pop("asked_ts", None)
         self._store.save(data)
@@ -464,41 +476,114 @@ class LetterpackFollower:
             return
 
         changed = self._expire(data, threads, int(settings.get("max_open_days", 7)))
-        for key, thread in threads.items():
-            if thread.get("status") not in ("open", "asked"):
+        newest = max((int(m.get("message_id", 0)) for m in messages), default=0)
+        agent_id = self._agent_account_id()
+
+        for message in messages:
+            if int((message.get("account") or {}).get("account_id", 0) or 0) != staff_id:
                 continue
-            replies = [
-                m
-                for m in messages
-                if int((m.get("account") or {}).get("account_id", 0) or 0) == staff_id
-                and int(m.get("message_id", 0)) > int(thread.get("last_seen", 0))
-            ]
-            if not replies:
-                continue
-            latest = replies[-1]
-            thread["last_seen"] = int(latest["message_id"])
+            key = self._attribute(message, threads, room_id, agent_id)
+            if key is None:
+                continue  # 他の依頼への返事。こちらの件ではない
+            thread = threads[key]
+            if int(message.get("message_id", 0)) <= int(thread.get("last_seen", 0)):
+                continue  # 取次ぎ済み
+            thread["last_seen"] = int(message["message_id"])
             changed = True
             try:
-                self._relay(room_id, thread, latest)
+                self._relay(room_id, thread, message)
             except Exception:
                 print("[warn] 総務返信の取次ぎに失敗: " + traceback.format_exc(), flush=True)
             data["threads"][key] = thread
+
+        # 拾わなかった発言を毎回見直さないよう、既読位置だけは進めておく
+        for key, thread in threads.items():
+            if newest > int(thread.get("last_seen", 0)):
+                thread["last_seen"] = newest
+                data["threads"][key] = thread
+                changed = True
         if changed:
             self._store.save(data)
 
     # --- 内部 ---
 
+    def _agent_account_id(self) -> int:
+        """こちら（アシスタント）のアカウントID。宛先タグの突き合わせに使う。"""
+        configured = int(self._config.data.get("agent_account_id") or 0)
+        if configured:
+            return configured
+        try:
+            return int(self._chatwork.get_me())
+        except Exception:
+            print("[warn] 自アカウントIDの取得に失敗: " + traceback.format_exc(), flush=True)
+            return 0
+
     @staticmethod
-    def _expire(data: dict, threads: dict, max_days: int) -> bool:
-        """放置されたやり取りを閉じる（状態ファイルが際限なく育つのを防ぐ）。"""
+    def _attribute(
+        message: dict, threads: dict, room_id: int, agent_id: int
+    ) -> str | None:
+        """総務の発言が、どの依頼への返事かを決める。決められなければ None。
+
+        備品ルームは部署全体の依頼が流れる場なので、総務の発言というだけで
+        自分あての返事とみなすと、他の人あての連絡を横取りしてしまう。
+        こちらのメッセージを名指ししているものだけを拾う。
+        """
+        body = str(message.get("body", ""))
+        for target_room, target_id in _RP_RE.findall(body):
+            if int(target_room) != int(room_id):
+                continue
+            for key, thread in threads.items():
+                if target_id in [str(m) for m in thread.get("message_ids") or []]:
+                    return key
+        if agent_id and str(agent_id) in _TO_RE.findall(body):
+            keys = list(threads)
+            if len(keys) == 1:
+                return keys[0]  # 進行中が1件なら、宛先タグだけでも判別できる
+            print(
+                "[warn] 総務からの返信を特定できませんでした"
+                f"（進行中のやり取りが{len(keys)}件）",
+                flush=True,
+            )
+        return None
+
+    def _expire(self, data: dict, threads: dict, max_days: int) -> bool:
+        """放置されたやり取りを閉じる。
+
+        黙って消すと依頼者が待ち続けるため、閉じたことは伝える。
+        """
         limit = datetime.now(JST).timestamp() - max_days * 86400
         changed = False
         for key, thread in list(threads.items()):
-            if int(thread.get("ts", 0)) < limit:
-                data["threads"][key]["status"] = "expired"
-                threads.pop(key)
-                changed = True
+            if int(thread.get("ts", 0)) >= limit:
+                continue
+            data["threads"][key]["status"] = "expired"
+            threads.pop(key)
+            changed = True
+            try:
+                self._notify_expired(thread, max_days)
+            except Exception:
+                print("[warn] 期限切れの通知に失敗: " + traceback.format_exc(), flush=True)
         return changed
+
+    def _notify_expired(self, thread: dict, max_days: int) -> None:
+        from .answer import sanitize_for_chatwork
+
+        settings = self._config.letterpack
+        room_id = int(settings.get("supplies_room_id", 0))
+        self._chatwork.send_message(
+            int(thread["requester_room_id"]),
+            mention(
+                int(thread.get("requester_account_id", 0)),
+                str(thread.get("requester_name") or ""),
+            )
+            + "\n"
+            + sanitize_for_chatwork(
+                f"レターパックの件、{max_days}日たっても総務からの返信を確認できませんでした。"
+                "こちらでの追跡は終了します。お手数ですが、備品・消耗品購入依頼チャットを"
+                "直接ご確認ください。\n"
+                + room_link(room_id, thread.get("posted_message_id", ""))
+            ),
+        )
 
     def _relay(self, room_id: int, thread: dict, message: dict) -> None:
         from .answer import sanitize_for_chatwork
