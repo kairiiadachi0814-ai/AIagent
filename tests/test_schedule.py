@@ -438,8 +438,10 @@ class TestRegisteredReplyTense:
         )
         runner = ScheduleRunner(make_config(tmp_path), client=client)
         reply, _, _ = runner.register("来週水曜15時から面談を入れて")
-        head = reply.split("\n")[0]
-        assert head == "承知しました。次の予定で登録しました。"
+        # 言い回しは毎回選び直すが、意味は「登録し終えた」で固定
+        from raizuinu.phrasing import BANKS
+
+        assert reply.splitlines()[0] in BANKS["schedule_done"]
 
     def test_past_tense_opening_is_kept(self, tmp_path, monkeypatch):
         writer = FakeWriter()

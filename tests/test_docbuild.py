@@ -926,7 +926,10 @@ class TestReplyOpening:
         reply, _, _ = runner.run("エムズステップ南様あての送付状を作って", requester_name="足立 海里")
         head = reply.split("\n")[0]
         assert "お願い" not in head  # 依頼を受けた側の返事として噛み合わせる
-        assert head == "承知しました。下書きを作成しました。"
+        # 言い回しは毎回選び直すが、意味は「作り終えた」で固定
+        from raizuinu.phrasing import BANKS
+
+        assert head in BANKS["doc_done"]
 
     def test_delivering_opening_is_kept(self, tmp_path):
         client = fake_client(
@@ -1341,6 +1344,8 @@ class TestAskBackWording:
         runner = DocBuildRunner(make_config(tmp_path), client=client)
         reply, meta, _ = runner.run("ヤマトライジング名で書類送付状を作って", requester_name="足立 海里")
         assert meta["error"] == "missing_fields"
-        assert reply.startswith("書類の下書き、お作りしますね。")
+        from raizuinu.phrasing import BANKS
+
+        assert reply.splitlines()[0] in BANKS["doc_ask"]
         assert "作成しました" not in reply
         assert "空欄" not in reply

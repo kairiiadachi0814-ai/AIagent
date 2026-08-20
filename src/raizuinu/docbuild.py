@@ -101,6 +101,7 @@ _ASKING_OPENING_RE = re.compile(
     r"^(?:[^。\n]*(?:よろしく|宜しく)お願い|お願いいたします|お願いします|"
     r"ご対応(?:のほど)?|恐れ入りますが|お手数ですが)"
 )
+# 既定の書き出し。実際には phrasing.BANKS["doc_done"] から毎回選び直す
 DEFAULT_OPENING = "承知しました。下書きを作成しました。"
 _CONTRACT_RE = re.compile(r"(契約書|覚書|念書|誓約書|NDA|秘密保持)")
 
@@ -286,13 +287,24 @@ _FIELDS_SCHEMA = {
 class DocBuildRunner:
     """依頼文からひな形を選び、項目を埋めた書類のバイト列を作る。"""
 
-    def __init__(self, config: Config, client: Any | None = None) -> None:
+    def __init__(
+        self, config: Config, client: Any | None = None, phrasebook: Any | None = None
+    ) -> None:
         self._config = config
         if client is None:
             import anthropic
 
             client = anthropic.Anthropic()
         self._client = client
+        if phrasebook is None:
+            from .phrasing import build
+
+            phrasebook = build(config)
+        self._phrasebook = phrasebook
+
+    def _say(self, key: str) -> str:
+        """定型の一言を選ぶ。毎回同じ言い方にならないようにする。"""
+        return self._phrasebook.pick(key)
 
     # --- 公開API ---
 
@@ -640,7 +652,7 @@ class DocBuildRunner:
         company: dict[str, Any],
         staff_override: str = "",
     ) -> str:
-        opening = _delivering_opening(fields.get("opening"))
+        opening = _delivering_opening(fields.get("opening"), self._say("doc_done"))
         # 「1部」を仮置きした行だけを伝える（「一式」は仮置きしていない）
         assumed = [
             item["name"]
@@ -663,9 +675,8 @@ class DocBuildRunner:
             "※下書きです。日付・宛名・部数をご確認のうえ、印刷や送付はお手元でお願いします。"
         )
 
-    @staticmethod
-    def _ask_for(opening: str, missing: list[str]) -> str:
-        lead = _asking_opening(opening, "書類の下書き、お作りしますね。")
+    def _ask_for(self, opening: str, missing: list[str]) -> str:
+        lead = _asking_opening(opening, self._say("doc_ask"))
         items = "\n".join(f"・{m}" for m in missing)
         return (
             f"{lead}\n\n"
@@ -673,9 +684,8 @@ class DocBuildRunner:
             f"{items}"
         )
 
-    @staticmethod
-    def _choose_guidance(opening: str, missing: list[str]) -> str:
-        lead = _asking_opening(opening, "送付状ですね、お作りします。")
+    def _choose_guidance(self, opening: str, missing: list[str]) -> str:
+        lead = _asking_opening(opening, self._say("doc_kind_ask"))
         text = (
             f"{lead}\n\n"
             "郵送に添える送付状と、FAX送付状のどちらでしょうか。教えていただければ作ります。"
@@ -688,7 +698,7 @@ class DocBuildRunner:
         return text
 
     def _unknown_company(self, opening: str, hint: str) -> str:
-        lead = _asking_opening(opening, "送付状ですね、お作りします。")
+        lead = _asking_opening(opening, self._say("doc_kind_ask"))
         names = "\n".join(f"・{c['name']}" for c in self._companies())
         return (
             f"{lead}\n\n"

@@ -196,12 +196,23 @@ class LetterpackStore:
 class LetterpackRunner:
     """依頼者とのやり取り（要否の確認 → 文面の確認 → 投稿）を受け持つ。"""
 
-    def __init__(self, config: Any, chatwork: Any, store: LetterpackStore | None = None) -> None:
+    def __init__(
+        self,
+        config: Any,
+        chatwork: Any,
+        store: LetterpackStore | None = None,
+        phrasebook: Any | None = None,
+    ) -> None:
         self._config = config
         self._chatwork = chatwork
         self._store = store or LetterpackStore(
             config.resolve_path(config.state_dir) / "letterpack.json"
         )
+        if phrasebook is None:
+            from .phrasing import build
+
+            phrasebook = build(config)
+        self._phrasebook = phrasebook
 
     # --- 公開API ---
 
@@ -255,7 +266,7 @@ class LetterpackRunner:
         if answer["declined"]:
             data["offers"].pop(key, None)
             self._store.save(data)
-            return "承知しました。レターパックの手配は行いません。"
+            return self._phrasebook.pick("letterpack_declined")
 
         detail = offer.get("detail") or {}
         missing = []
@@ -320,7 +331,7 @@ class LetterpackRunner:
         if _CANCEL_RE.search(folded):
             data["drafts"].pop(key, None)
             self._store.save(data)
-            return "承知しました。レターパックの依頼は送らずに取りやめます。"
+            return self._phrasebook.pick("letterpack_cancelled")
         if not _SEND_RE.search(folded):
             # 文面の直しは読み取らず、作り直しを促す（誤った内容で送らないため）
             return (
@@ -416,7 +427,7 @@ class LetterpackRunner:
         thread["status"] = "open"
         thread.pop("asked_ts", None)
         self._store.save(data)
-        return "総務へお伝えしました。返信があればまたお知らせします。"
+        return self._phrasebook.pick("letterpack_forwarded")
 
 
 def _looks_like_new_request(text: str) -> bool:

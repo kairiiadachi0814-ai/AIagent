@@ -33,6 +33,7 @@ Chatworkの許可ルームでメンションを受けたら、`handbook/` と `s
 
 - `src/raizuinu/` にコア実装（config／webhook／handbook／answer／chatwork／audit／cost／handler／app／lambda_function）。役割はパッケージdocstring参照
 - ひな形からの書類作成は `docbuild.py`（依頼→項目抽出→書式と差出人会社の決定）と `templatefill.py`（Word/Excelへの差し込み。標準ライブラリのみ）。ひな形の実体は `templates/`。Wordは書式ごとに1つだけ持ち（`送付状_標準.docx`／`送付状_楽天軒型.docx`）、差出人の会社情報は `templates/companies.json` から差し込む。**グループ会社が増えたときは companies.json に1件足すだけ**（ひな形は増やさない）。Boxの原本から白紙化して作り直すには `python tools/build_templates.py`（ローカルPC専用）
+- 定型の受け答えの揺らぎは `phrasing.py`。コード側で書いている一言（「下書きを作成しました」等）を同義の候補から毎回選び直し、前回と同じ言い方を避ける。**揺らいでよいのは社交辞令だけ**で、回答本文・出典・免責文・金額・他部署へ送る文面は対象外。各候補が呼び出し側の判定（未来形を弾く等）を満たすことを `tests/test_phrasing.py` で固定してある。`config: phrasing.vary_openings` を false にすると固定へ戻る
 - TaskRising（社内タスク管理）への登録は `taskrising.py`。実体はSupabase（PostgREST）で独自APIは無い。**service_role キーは使わず**、専用ボットユーザー（メール＋パスワード）でログインしてRLSの範囲で読み書きする。**経費支払いタスク・振込用CSV等が揃うまで `taskrising.enabled` は false のまま**。接続確認とテーブル定義の書き出しは `python tools/check_taskrising.py`（書き込みはしない）
 - 添付文書の読み取りは `doctask.py`。一度読んだ文書は `DocumentMemory` がルーム単位で覚え、**その話題への返信か、ファイル名の名指しのときだけ**思い出す（会話の途中から入った人が添付し直さずに済む。無関係な質問に文書を持ち出さないよう条件を絞ってある）
 - レターパックの手配取次ぎは `letterpack.py`。`LetterpackRunner` が依頼者とのやり取り（要否→文面確認→投稿）、`LetterpackFollower` が総務からの返信の巡回（watcherのタイマーに相乗り）。投稿先の備品ルームは **`allowed_room_ids` に入れない**（Q&Aの対象外にして、他部署のルームへ社内ナレッジが流れる経路を作らない）

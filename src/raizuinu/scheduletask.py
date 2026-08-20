@@ -143,13 +143,20 @@ SYSTEM_PROMPT = """あなたは株式会社ライズクリエイション経理�
 class ScheduleRunner:
     """予定の照会・登録・取り消しを行う。"""
 
-    def __init__(self, config: Config, client: Any | None = None) -> None:
+    def __init__(
+        self, config: Config, client: Any | None = None, phrasebook: Any | None = None
+    ) -> None:
         self._config = config
         if client is None:
             import anthropic
 
             client = anthropic.Anthropic()
         self._client = client
+        if phrasebook is None:
+            from .phrasing import build
+
+            phrasebook = build(config)
+        self._phrasebook = phrasebook
 
     # --- 公開API ---
 
@@ -337,7 +344,7 @@ class ScheduleRunner:
         )
 
     def _registered_reply(self, fields: dict[str, Any], events: list[Event]) -> str:
-        lines = [_done_opening(fields.get("opening")), ""]
+        lines = [_done_opening(fields.get("opening"), self._phrasebook.pick("schedule_done")), ""]
         for event in events:
             day = event.start.astimezone(JST)
             weekday = "月火水木金土日"[day.weekday()]
@@ -362,10 +369,11 @@ _FUTURE_OPENING_RE = re.compile(
     r"(します|いたします|ますね|ておきます|ときます|しておく|しとく)"
 )
 _ASKING_OPENING_RE = re.compile(r"^[^。\n]*(よろしくお願い|お願いし|ご対応)")
+# 既定の書き出し。実際には phrasing.BANKS["schedule_done"] から毎回選び直す
 DONE_OPENING = "承知しました。次の予定で登録しました。"
 
 
-def _done_opening(text: Any) -> str:
+def _done_opening(text: Any, default: str = DONE_OPENING) -> str:
     """登録し終えた側の書き出しにする。
 
     「これから登録します」と読める文面だと、確認待ちだと誤解される。
@@ -373,7 +381,7 @@ def _done_opening(text: Any) -> str:
     """
     opening = str(text or "").strip()
     if not opening or _FUTURE_OPENING_RE.search(opening) or _ASKING_OPENING_RE.match(opening):
-        return DONE_OPENING
+        return default
     return opening
 
 

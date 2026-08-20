@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from raizuinu.config import Config
+from raizuinu.phrasing import BANKS
 from raizuinu.letterpack import (
     LetterpackError,
     LetterpackFollower,
@@ -139,7 +140,7 @@ class TestOfferFlow:
         run = runner(tmp_path, chatwork)
         run.offer(DEPT_ROOM, REQUESTER, 1000, DETAIL)
         reply = run.handle(DEPT_ROOM, REQUESTER, 1100, "不要です")
-        assert "手配は行いません" in reply
+        assert reply in BANKS["letterpack_declined"]  # 言い回しは選び直すが意味は同じ
         assert chatwork.sent == []  # 総務へは何も送らない
         assert run.handle(DEPT_ROOM, REQUESTER, 1200, "ありがとう") is None
 
@@ -191,7 +192,7 @@ class TestOfferFlow:
         run.offer(DEPT_ROOM, REQUESTER, 1000, DETAIL)
         run.handle(DEPT_ROOM, REQUESTER, 1100, "ライト2枚で")
         reply = run.handle(DEPT_ROOM, REQUESTER, 1200, "やっぱり取り消しで")
-        assert "取りやめます" in reply
+        assert reply in BANKS["letterpack_cancelled"]
         assert chatwork.sent == []
 
     def test_an_expired_offer_is_left_to_normal_routing(self, tmp_path):
@@ -333,7 +334,7 @@ class TestFollowUp:
 
         chatwork.sent.clear()
         reply = run.handle(DEPT_ROOM, REQUESTER, 99999999, "明後日までにお願いします")
-        assert "総務へお伝えしました" in reply
+        assert reply in BANKS["letterpack_forwarded"]
         room_id, body = chatwork.sent[0]
         assert room_id == SUPPLIES_ROOM
         assert "明後日までにお願いします" in body

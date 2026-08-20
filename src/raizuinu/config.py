@@ -106,6 +106,9 @@ _DEFAULTS: dict[str, Any] = {
         "register_note": "",
         "greeting": "おはようございます。",
     },
+    # 定型の受け答えに揺らぎを持たせる（社交辞令の部分だけ。回答本文・出典・
+    # 免責文・金額などは対象外）。false にすると固定の言い回しに戻る
+    "phrasing": {"vary_openings": True},
     # TaskRising（社内タスク管理）への登録。Supabaseを直接叩く。
     # 経費支払いタスク・振込用CSV等が揃うまでは無効のまま置く
     "taskrising": {
