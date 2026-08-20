@@ -10,8 +10,14 @@ TaskRisingはNext.js＋Supabase（Postgres＋認証）で動いており、独�
   そのまま全データへ及ぶ
 - 画面の自動操作（ブラウザ）は使わない。画面の作り替えで壊れるうえ、
   VPSでブラウザを動かす必要が出るため
-- 秘密情報は環境変数のみ（TASKRISING_API_KEY／BOT_EMAIL／BOT_PASSWORD）。
-  例外メッセージにもキーを載せない
+- 人のログインはGoogleのまま。ボットはブラウザを開けないのでGoogleログインは
+  使えず、次のどちらかで入る（どちらでも動くようにしてある）
+  (A) メール＋パスワードのボット用ユーザー（TASKRISING_BOT_EMAIL／PASSWORD）
+  (B) ボットのGoogleアカウントで一度だけ人が手動ログインし、その際に発行される
+      更新トークンを預かる（TASKRISING_BOT_REFRESH_TOKEN）。更新トークンは
+      使うたびに入れ替わるため、新しいものを状態ファイルへ保存して引き継ぐ
+- 秘密情報は環境変数のみ（TASKRISING_API_KEY／BOT_EMAIL／BOT_PASSWORD／
+  BOT_REFRESH_TOKEN）。例外メッセージにもキーを載せない
 - 稼働は経費支払いタスク・振込用CSV等が揃ってから。既定では無効
   （config: taskrising.enabled = false）
 """
@@ -73,19 +79,26 @@ class TaskRisingClient:
         return url
 
     def missing_secrets(self) -> list[str]:
-        """足りない環境変数の名前（値は返さない）。"""
-        pairs = (
-            ("TASKRISING_API_KEY", self._config.taskrising_api_key),
-            ("TASKRISING_BOT_EMAIL", self._config.taskrising_bot_email),
-            ("TASKRISING_BOT_PASSWORD", self._config.taskrising_bot_password),
-        )
-        return [name for name, value in pairs if not value]
+        """足りない環境変数の名前（値は返さない）。
+
+        入り方は2通りあり、どちらかが揃っていればよい。
+        """
+        if not self._config.taskrising_api_key:
+            return ["TASKRISING_API_KEY"]
+        if self._refresh_token():
+            return []
+        if self._config.taskrising_bot_email and self._config.taskrising_bot_password:
+            return []
+        return [
+            "TASKRISING_BOT_EMAIL と TASKRISING_BOT_PASSWORD"
+            "（または TASKRISING_BOT_REFRESH_TOKEN）"
+        ]
 
     def sign_in(self) -> str:
         """ボットユーザーとしてログインし、アクセストークンを返す。
 
-        Googleログインは人の操作が要るためサーバーからは使えない。
-        ボット用にはメール＋パスワードのユーザーを1つ用意してもらう。
+        Googleログインはブラウザでの人の操作が要るためサーバーからは使えない。
+        更新トークンを預かっていればそれを使い、無ければメール＋パスワードで入る。
         """
         if self._token and self._now() < self._token_expires_at:
             return self._token
@@ -94,24 +107,74 @@ class TaskRisingClient:
             raise TaskRisingError(
                 "TaskRisingの接続情報が設定されていません: " + "／".join(missing)
             )
-        payload = self._call(
-            "POST",
-            f"{self.base_url}/auth/v1/token?grant_type=password",
-            headers={"apikey": self._config.taskrising_api_key},
-            json_body={
+        refresh = self._refresh_token()
+        if refresh:
+            try:
+                return self._grant(
+                    "refresh_token", {"refresh_token": refresh}
+                )
+            except TaskRisingError:
+                # 更新トークンは使い回しで失効することがある。
+                # メール＋パスワードが用意されていれば、そちらへ落とす
+                self._save_refresh_token("")
+                if not (
+                    self._config.taskrising_bot_email
+                    and self._config.taskrising_bot_password
+                ):
+                    raise
+        return self._grant(
+            "password",
+            {
                 "email": self._config.taskrising_bot_email,
                 "password": self._config.taskrising_bot_password,
             },
+        )
+
+    # --- ログインの実処理 ---
+
+    def _grant(self, grant_type: str, body: dict[str, Any]) -> str:
+        payload = self._call(
+            "POST",
+            f"{self.base_url}/auth/v1/token?grant_type={grant_type}",
+            headers={"apikey": self._config.taskrising_api_key},
+            json_body=body,
             authenticate=False,
         )
         token = str(payload.get("access_token") or "")
         if not token:
-            raise TaskRisingError("ログインに成功しましたが、アクセストークンを受け取れませんでした")
+            raise TaskRisingError("ログインできましたが、アクセストークンを受け取れませんでした")
         self._token = token
-        self._token_expires_at = self._now() + max(
-            0, int(payload.get("expires_in") or 3600) - _TOKEN_MARGIN_SECONDS
-        )
+        # expires_in が 0 で返ることもあるため、既定値へ倒すのは「項目が無いとき」だけ
+        expires_in = payload.get("expires_in")
+        if not isinstance(expires_in, (int, float)):
+            expires_in = 3600
+        self._token_expires_at = self._now() + max(0, int(expires_in) - _TOKEN_MARGIN_SECONDS)
+        # 更新トークンは使うたびに入れ替わる。新しいものを保存しないと次回入れなくなる
+        rotated = str(payload.get("refresh_token") or "")
+        if rotated:
+            self._save_refresh_token(rotated)
         return token
+
+    def _session_path(self):
+        return self._config.resolve_path(self._config.state_dir) / "taskrising_session.json"
+
+    def _refresh_token(self) -> str:
+        """保存済みの更新トークン。無ければ環境変数の初期値を使う。"""
+        path = self._session_path()
+        try:
+            saved = str(json.loads(path.read_text(encoding="utf-8")).get("refresh_token") or "")
+        except (OSError, ValueError):
+            saved = ""
+        return saved or str(self._config.taskrising_bot_refresh_token or "")
+
+    def _save_refresh_token(self, token: str) -> None:
+        path = self._session_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"refresh_token": token}), encoding="utf-8")
+            path.chmod(0o600)  # 他のユーザーから読めないようにする
+        except OSError:
+            print("[warn] TaskRisingの更新トークンを保存できませんでした", flush=True)
 
     def schema(self) -> dict[str, Any]:
         """PostgRESTが公開しているテーブル定義（OpenAPI）。

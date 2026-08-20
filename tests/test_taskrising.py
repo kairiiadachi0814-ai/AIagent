@@ -59,12 +59,17 @@ class TestSignIn:
     def test_missing_secrets_are_named_without_values(self, tmp_path, monkeypatch):
         config = make_config(tmp_path, monkeypatch, secrets=False)
         client = TaskRisingClient(config, http=FakeHttp([]))
-        assert client.missing_secrets() == [
-            "TASKRISING_API_KEY", "TASKRISING_BOT_EMAIL", "TASKRISING_BOT_PASSWORD",
-        ]
+        assert client.missing_secrets() == ["TASKRISING_API_KEY"]
         with pytest.raises(TaskRisingError) as exc:
             client.sign_in()
         assert "TASKRISING_API_KEY" in str(exc.value)
+
+    def test_the_key_alone_is_not_enough_to_sign_in(self, tmp_path, monkeypatch):
+        # キーだけあっても、ボットとして入る手段（パスワードか更新トークン）が要る
+        config = make_config(tmp_path, monkeypatch, secrets=False)
+        monkeypatch.setenv("TASKRISING_API_KEY", KEY)
+        client = TaskRisingClient(config, http=FakeHttp([]))
+        assert "TASKRISING_BOT_EMAIL" in client.missing_secrets()[0]
 
     def test_bot_user_signs_in_with_password_not_google(self, tmp_path, monkeypatch):
         # Googleログインは人の操作が要るため、サーバーからはメール＋パスワードで入る
@@ -96,6 +101,79 @@ class TestSignIn:
         with pytest.raises(TaskRisingError) as exc:
             client.sign_in()
         assert "HTTP 400" in str(exc.value)
+
+
+class TestGoogleAccountPath:
+    """ボットのGoogleアカウントで一度だけ手動ログインし、更新トークンで続ける方式。
+
+    人のログインはGoogleのまま変わらない。ボットはブラウザを開けないため、
+    Googleで発行された更新トークンを預かって使い回す。
+    """
+
+    def config(self, tmp_path, monkeypatch, refresh="refresh-abc"):
+        config = make_config(tmp_path, monkeypatch, secrets=False)
+        monkeypatch.setenv("TASKRISING_API_KEY", KEY)
+        monkeypatch.setenv("TASKRISING_BOT_REFRESH_TOKEN", refresh)
+        config.data["state_dir"] = str(tmp_path / "state")
+        return config
+
+    def test_a_refresh_token_is_enough(self, tmp_path, monkeypatch):
+        config = self.config(tmp_path, monkeypatch)
+        http = FakeHttp([(200, {"access_token": "jwt-1", "expires_in": 3600})])
+        client = TaskRisingClient(config, http=http)
+        assert client.missing_secrets() == []
+        assert client.sign_in() == "jwt-1"
+        call = http.calls[0]
+        assert call["url"].endswith("grant_type=refresh_token")
+        assert call["json"] == {"refresh_token": "refresh-abc"}
+
+    def test_the_rotated_token_is_kept_for_next_time(self, tmp_path, monkeypatch):
+        # 更新トークンは使うたびに入れ替わる。保存しないと次回入れなくなる
+        config = self.config(tmp_path, monkeypatch)
+        clock = {"t": 1000.0}
+        http = FakeHttp([
+            (200, {"access_token": "jwt-1", "expires_in": 3600, "refresh_token": "refresh-2"}),
+            (200, {"access_token": "jwt-2", "expires_in": 3600, "refresh_token": "refresh-3"}),
+        ])
+        client = TaskRisingClient(config, http=http, now=lambda: clock["t"])
+        client.sign_in()
+        clock["t"] += 3600  # 期限切れ
+        client.sign_in()
+        assert http.calls[1]["json"] == {"refresh_token": "refresh-2"}
+        saved = json.loads(
+            (tmp_path / "state" / "taskrising_session.json").read_text(encoding="utf-8")
+        )
+        assert saved["refresh_token"] == "refresh-3"
+
+    def test_an_expired_refresh_token_falls_back_to_the_password(self, tmp_path, monkeypatch):
+        config = self.config(tmp_path, monkeypatch)
+        monkeypatch.setenv("TASKRISING_BOT_EMAIL", "bot@example.com")
+        monkeypatch.setenv("TASKRISING_BOT_PASSWORD", PASSWORD)
+        http = FakeHttp([
+            (400, {"error": "invalid_grant"}),  # 更新トークンが失効
+            (200, {"access_token": "jwt-9", "expires_in": 3600}),
+        ])
+        client = TaskRisingClient(config, http=http)
+        assert client.sign_in() == "jwt-9"
+        assert http.calls[-1]["url"].endswith("grant_type=password")
+
+    def test_an_expired_refresh_token_without_a_password_is_reported(self, tmp_path, monkeypatch):
+        config = self.config(tmp_path, monkeypatch)
+        http = FakeHttp([(400, {"error": "invalid_grant"})])
+        client = TaskRisingClient(config, http=http)
+        with pytest.raises(TaskRisingError):
+            client.sign_in()
+
+    def test_the_saved_token_is_not_world_readable(self, tmp_path, monkeypatch):
+        import os
+        import stat
+
+        config = self.config(tmp_path, monkeypatch)
+        http = FakeHttp([(200, {"access_token": "j", "expires_in": 3600, "refresh_token": "r2"})])
+        TaskRisingClient(config, http=http).sign_in()
+        path = tmp_path / "state" / "taskrising_session.json"
+        if os.name != "nt":  # Windowsはパーミッションの概念が異なる
+            assert not stat.S_IMODE(path.stat().st_mode) & 0o077
 
 
 class TestSecretsAreNotLeaked:

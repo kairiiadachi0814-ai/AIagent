@@ -9,8 +9,9 @@
 
 必要な環境変数（値は表示しない）:
   TASKRISING_API_KEY        Supabaseの公開キー（anon / publishable）
-  TASKRISING_BOT_EMAIL      ボット用ユーザーのメールアドレス
-  TASKRISING_BOT_PASSWORD   同パスワード
+  次のどちらか一方
+  (A) TASKRISING_BOT_EMAIL / TASKRISING_BOT_PASSWORD   ボット用ユーザー
+  (B) TASKRISING_BOT_REFRESH_TOKEN                     Googleで一度ログインして得た更新トークン
 """
 
 from __future__ import annotations
@@ -66,8 +67,10 @@ def main() -> int:
     except TaskRisingError as exc:
         print(f"ログインできませんでした: {exc}")
         print(
-            "ボット用ユーザーがメール＋パスワードで作られているか、"
-            "Supabaseの Authentication → Providers で Email が有効かをご確認ください。"
+            "(A)メール＋パスワードなら、Supabaseの Authentication → Providers で"
+            " Email が有効かをご確認ください。\n"
+            "(B)更新トークンなら、期限切れの可能性があります。ボットのGoogle"
+            "アカウントで取り直してください。"
         )
         return 1
     print("ログイン: OK（ボットユーザーとして認証されました）")

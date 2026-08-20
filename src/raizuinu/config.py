@@ -212,6 +212,15 @@ class Config:
     def taskrising_bot_password(self) -> str | None:
         return os.environ.get("TASKRISING_BOT_PASSWORD")
 
+    @property
+    def taskrising_bot_refresh_token(self) -> str | None:
+        """ボットのGoogleアカウントで一度だけ手動ログインして得た更新トークン。
+
+        メール＋パスワードを使わない場合の入り口。使うたびに入れ替わるため、
+        以後は状態ファイル側が正となる（環境変数は最初の1回だけ効く）。
+        """
+        return os.environ.get("TASKRISING_BOT_REFRESH_TOKEN")
+
 
 def _deep_merge(base: dict, override: dict) -> None:
     for key, value in override.items():
