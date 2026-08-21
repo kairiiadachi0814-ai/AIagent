@@ -59,6 +59,16 @@ def _fold(text: str) -> str:
     return unicodedata.normalize("NFKC", str(text or "")).strip()
 
 
+# メンションのタグを外したあとに残る宛名（「経理財務アシスタントさん」）。
+# 依頼者の答えをそのまま転送すると、先方には宛名だけが浮いて見える
+_LEADING_ADDRESS_RE = re.compile(r"^[^\n]{1,24}さん[\s　]*\n+")
+
+
+def _strip_leading_address(text: str) -> str:
+    """依頼者の答えから、先頭に残った宛名の行を落とす。"""
+    return _LEADING_ADDRESS_RE.sub("", _fold(text)).strip()
+
+
 def read_request(text: str) -> dict[str, Any]:
     """依頼者の返事から枚数と種類を読む。
 
@@ -287,7 +297,10 @@ class LetterpackRunner:
         if offer and int(send_time) - int(offer.get("ts", 0)) <= window:
             return self._on_offer_answer(data, key, offer, send_time, text)
 
-        thread = self._find_asked_thread(data, key, send_time, window)
+        # 先方の質問への回答は、枚数の返事より待ち時間が長い（相手の都合がある）。
+        # 短い窓で切ると、答えても届かず先方が待ち続けることになる
+        answer_window = int(self._settings.get("answer_window_hours", 48)) * 3600
+        thread = self._find_asked_thread(data, key, send_time, answer_window)
         if thread is not None and not _looks_like_new_request(text):
             return self._on_question_answer(data, thread, text)
         return None
@@ -449,7 +462,7 @@ class LetterpackRunner:
         body = (
             f"お待たせしました。依頼者に確認しました。\n"
             f"\n"
-            f"{_fold(text)}\n"
+            f"{_strip_leading_address(text)}\n"
             f"\n"
             f"よろしくお願いいたします。"
         )

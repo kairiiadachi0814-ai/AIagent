@@ -351,11 +351,35 @@ class TestFollowUp:
         assert "依頼者に確認のうえ、折り返しご連絡します" in ack
 
         chatwork.sent.clear()
-        reply = run.handle(DEPT_ROOM, REQUESTER, 99999999, "明後日までにお願いします")
+        # メンションのタグを外すと宛名だけが残る。そのまま転送すると先方に浮いて見える
+        reply = run.handle(
+            DEPT_ROOM, REQUESTER, 99999999, "経理財務アシスタントさん\n明後日までにお願いします"
+        )
         assert reply in BANKS["letterpack_forwarded"]
         room_id, body = chatwork.sent[0]
         assert room_id == SUPPLIES_ROOM
         assert "明後日までにお願いします" in body
+        assert "経理財務アシスタントさん" not in body
+
+    def test_the_requester_has_days_to_answer_not_hours(self, tmp_path):
+        # 先方の質問への回答は相手の都合次第。短い窓で切ると、答えても届かない
+        chatwork = FakeChatwork()
+        run, posted = open_thread(tmp_path, chatwork)
+        chatwork._messages = [
+            staff_message(posted + 5, "いつ取りに来られますか？", reply_to=posted)
+        ]
+        LetterpackFollower(
+            make_config(tmp_path), chatwork,
+            client=fake_client(
+                {"kind": "質問", "arranged": True, "summary": "受け取り日の確認です。", "question": "受け取り日"}
+            ),
+        ).run_once()
+        chatwork.sent.clear()
+        import time
+
+        later = int(time.time()) + 20 * 3600  # 20時間後に回答
+        assert run.handle(DEPT_ROOM, REQUESTER, later, "明日伺います") is not None
+        assert chatwork.sent[0][0] == SUPPLIES_ROOM
 
     def test_a_reply_to_our_follow_up_is_picked_up_too(self, tmp_path):
         # 依頼者の答えを総務へ返したあと、そこへの返信も同じやり取りとして拾う

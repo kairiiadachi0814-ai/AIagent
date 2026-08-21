@@ -131,6 +131,8 @@ _DEFAULTS: dict[str, Any] = {
         "follow_up": True,
         # 「2枚で」「送信」といった短い返事を、いつまで続きとみなすか
         "reply_window_minutes": 120,
+        # 先方からの質問に依頼者が答えるまでの猶予。相手の都合があるので長めに取る
+        "answer_window_hours": 48,
         # 返信が来ないまま放置されたやり取りを閉じるまでの日数
         "max_open_days": 7,
     },
