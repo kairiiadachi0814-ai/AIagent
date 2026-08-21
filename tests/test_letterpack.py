@@ -358,7 +358,7 @@ class TestFollowUp:
         assert reply in BANKS["letterpack_forwarded"]
         room_id, body = chatwork.sent[0]
         assert room_id == SUPPLIES_ROOM
-        assert "明後日までにお願いします" in body
+        assert "明後日までにお願いしますとのことです。" in body  # こちらが伝える形にする
         assert "経理財務アシスタントさん" not in body
 
     def test_the_requester_has_days_to_answer_not_hours(self, tmp_path):
@@ -457,6 +457,76 @@ class TestFollowUp:
         ).run_once()
         rooms = [r for r, _ in chatwork.sent]
         assert SUPPLIES_ROOM in rooms and DEPT_ROOM in rooms
+
+    def test_the_answer_is_reported_not_ventriloquised(self, tmp_path):
+        # 依頼者の言葉をそのまま並べると、依頼者本人が喋っているように読める
+        from raizuinu.letterpack import quote_answer
+
+        assert quote_answer("取りに行きます。") == "取りに行きます。とのことです。"
+        assert quote_answer("明日でお願いします") == "明日でお願いしますとのことです。"
+        # すでに伝聞の形なら重ねない
+        for already in ("木曜に伺うとのことです", "受け取れるそうです", "伺うと言っています"):
+            assert quote_answer(already) == already
+
+    @pytest.mark.parametrize(
+        "waited,expects_apology",
+        [(0, False), (60, False), (299, False), (300, True), (7200, True)],
+    )
+    def test_it_only_apologises_when_it_actually_kept_them_waiting(
+        self, waited, expects_apology
+    ):
+        from raizuinu.letterpack import confirmed_lead
+
+        lead = confirmed_lead(waited)
+        assert ("お待たせしました" in lead) is expects_apology
+        assert "依頼者に確認しました。" in lead  # 何をしたかは必ず言う
+
+    def test_a_quick_answer_carries_no_apology_end_to_end(self, tmp_path):
+        chatwork = FakeChatwork()
+        run, posted = open_thread(tmp_path, chatwork)
+        chatwork._messages = [
+            staff_message(posted + 5, "いつ取りに来られますか？", reply_to=posted)
+        ]
+        LetterpackFollower(
+            make_config(tmp_path), chatwork,
+            client=fake_client(
+                {"kind": "質問", "arranged": True, "summary": "受け取り日の確認です。", "question": "受け取り日"}
+            ),
+        ).run_once()
+        import json as _json
+        import time
+
+        # 巡回が付けた asked_ts を読み、その1分後に答えた場合を作る
+        state = _json.loads(
+            (tmp_path / "state" / "letterpack.json").read_text(encoding="utf-8")
+        )
+        asked_ts = next(t["asked_ts"] for t in state["threads"].values() if t.get("asked_ts"))
+        chatwork.sent.clear()
+        run.handle(DEPT_ROOM, REQUESTER, int(asked_ts) + 60, "取りに行きます。")
+        body = next(b for r, b in chatwork.sent if r == SUPPLIES_ROOM)
+        assert body.startswith(f"[To:{STAFF_ID}] 坂口 美代子さん\n依頼者に確認しました。")
+        assert "お待たせしました" not in body
+        assert "取りに行きます。とのことです。" in body
+
+        # 6時間後の回答なら詫びる
+        chatwork.sent.clear()
+        chatwork._messages = [
+            staff_message(posted + 20, "いつ取りに来られますか？", reply_to=posted)
+        ]
+        LetterpackFollower(
+            make_config(tmp_path), chatwork,
+            client=fake_client(
+                {"kind": "質問", "arranged": True, "summary": "再確認です。", "question": "受け取り日"}
+            ),
+        ).run_once()
+        state = _json.loads(
+            (tmp_path / "state" / "letterpack.json").read_text(encoding="utf-8")
+        )
+        asked_ts = next(t["asked_ts"] for t in state["threads"].values() if t.get("asked_ts"))
+        chatwork.sent.clear()
+        run.handle(DEPT_ROOM, REQUESTER, int(asked_ts) + 6 * 3600, "明日伺います")
+        body = next(b for r, b in chatwork.sent if r == SUPPLIES_ROOM)
+        assert "お待たせしました。依頼者に確認しました。" in body
 
     def test_a_new_request_is_not_swallowed_as_an_answer(self, tmp_path):
         chatwork = FakeChatwork()

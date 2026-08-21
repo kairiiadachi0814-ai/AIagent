@@ -69,6 +69,35 @@ def _strip_leading_address(text: str) -> str:
     return _LEADING_ADDRESS_RE.sub("", _fold(text)).strip()
 
 
+# 依頼者の言葉をそのまま並べると、依頼者本人が喋っているように読める。
+# こちらが聞いて伝えている形にする
+_ALREADY_REPORTED_RE = re.compile(
+    r"(とのこと|だそう|そうです|と言って|とおっしゃ|と聞いて)"
+    r"(です|でした|で|います|おります|ました)?[。．\s]*$"
+)
+# 「お待たせしました」は実際に待たせたときだけ使う（すぐ返ったのに言うと白々しい）
+WAITED_SECONDS = 300
+
+
+def quote_answer(text: str) -> str:
+    """依頼者の答えを、取り次ぐ側の言い方にする。
+
+    「取りに行きます。」→「取りに行きます。とのことです。」
+    すでに伝聞の形で書かれていれば、そのまま使う。
+    """
+    answer = _strip_leading_address(text)
+    if not answer or _ALREADY_REPORTED_RE.search(answer):
+        return answer
+    return f"{answer}とのことです。"
+
+
+def confirmed_lead(waited_seconds: int) -> str:
+    """依頼者に確認した旨の書き出し。待たせていなければ詫びない。"""
+    if waited_seconds >= WAITED_SECONDS:
+        return "お待たせしました。依頼者に確認しました。"
+    return "依頼者に確認しました。"
+
+
 def read_request(text: str) -> dict[str, Any]:
     """依頼者の返事から枚数と種類を読む。
 
@@ -302,7 +331,7 @@ class LetterpackRunner:
         answer_window = int(self._settings.get("answer_window_hours", 48)) * 3600
         thread = self._find_asked_thread(data, key, send_time, answer_window)
         if thread is not None and not _looks_like_new_request(text):
-            return self._on_question_answer(data, thread, text)
+            return self._on_question_answer(data, thread, text, int(send_time))
         return None
 
     # --- 内部 ---
@@ -452,17 +481,21 @@ class LetterpackRunner:
                 return thread
         return None
 
-    def _on_question_answer(self, data: dict, thread: dict, text: str) -> str:
+    def _on_question_answer(
+        self, data: dict, thread: dict, text: str, send_time: int = 0
+    ) -> str:
         """総務からの質問に依頼者が答えた → そのまま備品ルームへ返す。"""
         route = route_for(self._settings, (thread.get("detail") or {}).get("company_id", ""))
         room_id = int(thread.get("room_id") or route.get("room_id", 0))
         from .answer import sanitize_for_chatwork
 
         head = mention_all(route.get("recipients") or [])
+        # 実際に待たせた時間で書き出しを決める。すぐ返せたのに詫びない
+        waited = int(send_time) - int(thread.get("asked_ts", 0) or 0)
         body = (
-            f"お待たせしました。依頼者に確認しました。\n"
+            f"{confirmed_lead(waited)}\n"
             f"\n"
-            f"{_strip_leading_address(text)}\n"
+            f"{quote_answer(text)}\n"
             f"\n"
             f"よろしくお願いいたします。"
         )
