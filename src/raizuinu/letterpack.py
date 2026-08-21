@@ -510,7 +510,10 @@ class LetterpackRunner:
             ) from exc
         # この投稿への返信も、同じやり取りの続きとして拾えるようにする
         thread.setdefault("message_ids", []).append(str(message_id))
-        thread["status"] = "open"
+        # こちらが答え終えた状態。以後の沈黙は、受け取ってもらえた合図とみなす
+        # （リアクションだけで済ませる人がいるが、APIからは見えない）
+        thread["status"] = "answered"
+        thread["answered_ts"] = int(datetime.now(JST).timestamp())
         thread.pop("asked_ts", None)
         self._store.save(data)
         return self._phrasebook.pick("letterpack_forwarded")
@@ -559,7 +562,9 @@ class LetterpackFollower:
             return
         data = self._store.load()
         threads = {
-            key: t for key, t in data["threads"].items() if t.get("status") in ("open", "asked")
+            key: t
+            for key, t in data["threads"].items()
+            if t.get("status") in ("open", "asked", "answered")
         }
         if not threads:
             return  # 追いかけるものが無ければAPIも呼ばない
@@ -664,13 +669,32 @@ class LetterpackFollower:
         return None
 
     def _expire(self, data: dict, threads: dict, max_days: int) -> bool:
-        """放置されたやり取りを閉じる。
+        """区切りのついたやり取りを閉じる。
 
-        黙って消すと依頼者が待ち続けるため、閉じたことは伝える。
+        Chatworkのリアクションはこちらからは見えない（APIが返さない）。
+        「承知しました」と書く代わりにリアクションだけで済ませる人がいるため、
+        沈黙を一律に「返事がない」と扱うと、済んだ話に警告を出してしまう。
+
+        こちらが最後に話し終えている（相手の質問に答えた）なら、沈黙は
+        受け取ってもらえた合図とみなして静かに閉じる。まだ一度も返事を
+        もらえていないときだけ、依頼者へ知らせる。
         """
-        limit = datetime.now(JST).timestamp() - max_days * 86400
+        now = datetime.now(JST).timestamp()
+        settle = int(self._config.letterpack.get("settle_hours", 24)) * 3600
+        limit = now - max_days * 86400
         changed = False
         for key, thread in list(threads.items()):
+            answered_ts = int(thread.get("answered_ts", 0) or 0)
+            if answered_ts and now - answered_ts >= settle:
+                # こちらの回答で話が閉じている。リアクションで済ませた場合もここ
+                data["threads"][key]["status"] = "settled"
+                threads.pop(key)
+                changed = True
+                try:
+                    self._notify_settled(thread)
+                except Exception:
+                    print("[warn] 完了の通知に失敗: " + traceback.format_exc(), flush=True)
+                continue
             if int(thread.get("ts", 0)) >= limit:
                 continue
             data["threads"][key]["status"] = "expired"
@@ -682,11 +706,16 @@ class LetterpackFollower:
                 print("[warn] 期限切れの通知に失敗: " + traceback.format_exc(), flush=True)
         return changed
 
-    def _notify_expired(self, thread: dict, max_days: int) -> None:
+    def _notify_settled(self, thread: dict) -> None:
+        """こちらの回答のあと動きがないまま区切りがついたときの後始末。
+
+        手配済みと分かっている場合は、依頼者にはすでに伝えてある。
+        重ねて知らせても手間が増えるだけなので黙って閉じる。
+        """
+        if thread.get("arranged"):
+            return
         from .answer import sanitize_for_chatwork
 
-        settings = self._config.letterpack
-        room_id = int(settings.get("supplies_room_id", 0))
         self._chatwork.send_message(
             int(thread["requester_room_id"]),
             mention(
@@ -695,9 +724,30 @@ class LetterpackFollower:
             )
             + "\n"
             + sanitize_for_chatwork(
-                f"レターパックの件、{max_days}日たっても総務からの返信を確認できませんでした。"
-                "こちらでの追跡は終了します。お手数ですが、備品・消耗品購入依頼チャットを"
+                "レターパックの件、その後のやり取りがないため、この件は閉じます。"
+                "まだ受け取れていないようでしたら、備品の依頼チャットをご確認ください。\n"
+                + room_link(
+                    int(thread.get("room_id") or 0), thread.get("posted_message_id", "")
+                )
+            ),
+        )
+
+    def _notify_expired(self, thread: dict, max_days: int) -> None:
+        from .answer import sanitize_for_chatwork
+
+        room_id = int(thread.get("room_id") or 0)
+        self._chatwork.send_message(
+            int(thread["requester_room_id"]),
+            mention(
+                int(thread.get("requester_account_id", 0)),
+                str(thread.get("requester_name") or ""),
+            )
+            + "\n"
+            + sanitize_for_chatwork(
+                f"レターパックの件、{max_days}日たっても返信を確認できませんでした。"
+                "こちらでの追跡は終了します。お手数ですが、備品の依頼チャットを"
                 "直接ご確認ください。\n"
+                "（リアクションだけで返されている場合、こちらでは確認できません）\n"
                 + room_link(room_id, thread.get("posted_message_id", ""))
             ),
         )
@@ -722,6 +772,8 @@ class LetterpackFollower:
             str((message.get("account") or {}).get("name") or ""),
         )
 
+        if verdict.get("arranged"):
+            thread["arranged"] = True  # 閉じるときに、手配済みかどうかで扱いを変える
         lead = f"レターパックの件、{name}さんから返信がありました。"
         thanks = "ご手配ありがとうございます。" if verdict.get("arranged") else ""
         if verdict["kind"] == "完了":

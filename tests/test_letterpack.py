@@ -588,6 +588,92 @@ class TestFollowUp:
         to_requester = next(b for r, b in chatwork.sent if r == DEPT_ROOM)
         assert "用意しました" in to_requester  # 判定できなくても伝える
 
+    def answered_thread(self, tmp_path, chatwork, arranged=True):
+        """先方の質問にこちらが答え終えた状態を作る。"""
+        run, posted = open_thread(tmp_path, chatwork)
+        chatwork._messages = [
+            staff_message(posted + 5, "いつ取りに来られますか？", reply_to=posted)
+        ]
+        LetterpackFollower(
+            make_config(tmp_path), chatwork,
+            client=fake_client(
+                {"kind": "質問", "arranged": arranged, "summary": "受け取り日の確認です。",
+                 "question": "受け取り日"}
+            ),
+        ).run_once()
+        run.handle(DEPT_ROOM, REQUESTER, 99999999, "取りに行きます。")
+        return run
+
+    def test_a_reaction_only_close_does_not_raise_an_alarm(self, tmp_path):
+        """Chatworkのリアクションはこちらからは見えない（APIが返さない）。
+
+        「承知しました」と書く代わりにリアクションで済ませる人がいるため、
+        沈黙を一律に「返事がない」と扱うと、済んだ話に警告を出してしまう。
+        """
+        chatwork = FakeChatwork()
+        self.answered_thread(tmp_path, chatwork, arranged=True)
+        chatwork._messages = []  # 以後、テキストの返信は無い（リアクションのみ）
+        chatwork.sent.clear()
+
+        config = make_config(tmp_path)
+        config.data["letterpack"]["settle_hours"] = 0  # すぐ区切りをつける
+        LetterpackFollower(config, chatwork, client=None).run_once()
+
+        assert chatwork.sent == []  # 手配済みと分かっているので黙って閉じる
+        import json as _json
+
+        state = _json.loads(
+            (tmp_path / "state" / "letterpack.json").read_text(encoding="utf-8")
+        )
+        assert [t["status"] for t in state["threads"].values()] == ["settled"]
+
+    def test_an_unconfirmed_close_tells_the_requester(self, tmp_path):
+        # 手配済みか分からないまま音沙汰が無くなった場合は、ひと言伝えて閉じる
+        chatwork = FakeChatwork()
+        self.answered_thread(tmp_path, chatwork, arranged=False)
+        chatwork._messages = []
+        chatwork.sent.clear()
+        config = make_config(tmp_path)
+        config.data["letterpack"]["settle_hours"] = 0
+        LetterpackFollower(config, chatwork, client=None).run_once()
+        assert len(chatwork.sent) == 1
+        room_id, body = chatwork.sent[0]
+        assert room_id == DEPT_ROOM
+        assert "この件は閉じます" in body
+        assert "返信を確認できませんでした" not in body  # 警告にはしない
+
+    def test_a_late_text_reply_is_still_relayed_before_settling(self, tmp_path):
+        # 区切りがつく前にテキストで返ってきたら、これまでどおり取り次ぐ
+        chatwork = FakeChatwork()
+        self.answered_thread(tmp_path, chatwork)
+        posted = int(next(iter(chatwork.sent), (0, ""))[0] or 0)
+        chatwork._messages = [
+            staff_message(
+                99999999999, "ありがとうございます。お待ちしています。",
+                to=AGENT,
+            )
+        ]
+        chatwork.sent.clear()
+        LetterpackFollower(
+            make_config(tmp_path), chatwork,
+            client=fake_client(
+                {"kind": "完了", "arranged": True, "summary": "受け取りをお待ちとのことです。",
+                 "question": ""}
+            ),
+        ).run_once()
+        assert DEPT_ROOM in [r for r, _ in chatwork.sent]
+
+    def test_an_abandoned_request_mentions_that_reactions_are_invisible(self, tmp_path):
+        # 一度も返事が無い場合の警告には、リアクションの可能性を添える
+        chatwork = FakeChatwork()
+        open_thread(tmp_path, chatwork)
+        config = make_config(tmp_path)
+        config.data["letterpack"]["max_open_days"] = 0
+        chatwork.sent.clear()
+        LetterpackFollower(config, chatwork, client=None).run_once()
+        body = chatwork.sent[0][1]
+        assert "リアクションだけで返されている場合" in body
+
     def test_an_abandoned_request_is_reported_not_dropped_silently(self, tmp_path):
         # 返信が来ないまま期限を過ぎたら、依頼者に伝えてから閉じる
         chatwork = FakeChatwork()
