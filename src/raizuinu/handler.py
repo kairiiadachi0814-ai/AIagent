@@ -692,6 +692,8 @@ class RaizuinuHandler:
                 int(event.send_time),
                 {
                     "company": (meta.get("company_name") or ""),
+                    # 会社ごとに備品の依頼先が違う（ライズは総務、楽天軒は経理財務部）
+                    "company_id": (meta.get("company") or ""),
                     "to_lines": meta.get("fields", {}).get("to_lines") or [],
                     "items": meta.get("fields", {}).get("items") or [],
                     "staff": meta.get("fields", {}).get("staff") or "",

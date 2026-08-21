@@ -20,6 +20,13 @@ STAFF_ID = 1160869
 DEPT_ROOM = 384793683
 REQUESTER = 6945415
 AGENT = 999  # アシスタント自身のアカウント
+RAKUTEN_ROOM = 392462780  # 楽天軒　備品チャット
+RAKUTEN_STAFF = (
+    (9228914, "篠田 笑佳"),
+    (9763216, "福本 明日香"),
+    (10622368, "中浦 祐子"),
+    (10675817, "札葉 美早"),
+)
 
 DETAIL = {
     "company": "株式会社ライズクリエイション",
@@ -33,9 +40,18 @@ def make_config(tmp_path):
     config = Config.load(tmp_path / "no-config.json")
     config.data["letterpack"] = {
         "enabled": True,
-        "supplies_room_id": SUPPLIES_ROOM,
-        "staff_account_id": STAFF_ID,
-        "staff_name": "坂口 美代子",
+        "routes": {
+            "default": {
+                "room_id": SUPPLIES_ROOM,
+                "recipients": [{"account_id": STAFF_ID, "name": "坂口 美代子"}],
+            },
+            "RAKUTENKEN": {
+                "room_id": RAKUTEN_ROOM,
+                "recipients": [
+                    {"account_id": a, "name": n} for a, n in RAKUTEN_STAFF
+                ],
+            },
+        },
         "follow_up": True,
         "reply_window_minutes": 120,
         "max_open_days": 7,
@@ -436,6 +452,116 @@ class TestFollowUp:
         room_id, body = chatwork.sent[0]
         assert room_id == DEPT_ROOM
         assert "返信を確認できませんでした" in body
+
+
+class TestRouting:
+    """差出人の会社ごとに、備品の依頼先が変わること。"""
+
+    def draft(self, tmp_path, chatwork, company_id, company_name):
+        run = LetterpackRunner(make_config(tmp_path), chatwork)
+        detail = {**DETAIL, "company": company_name, "company_id": company_id}
+        run.offer(DEPT_ROOM, REQUESTER, 1000, detail)
+        preview = run.handle(DEPT_ROOM, REQUESTER, 1100, "ライト2枚で")
+        sent = run.handle(DEPT_ROOM, REQUESTER, 1200, "送信", display_name="足立 海里")
+        return run, preview, sent
+
+    def test_rakutenken_goes_to_its_own_room_and_people(self, tmp_path):
+        chatwork = FakeChatwork()
+        _, preview, sent = self.draft(
+            tmp_path, chatwork, "RAKUTENKEN", "ＲＡＫＵＴＥＮＫＥＮ株式会社"
+        )
+        room_id, body = chatwork.sent[0]
+        assert room_id == RAKUTEN_ROOM
+        for account_id, name in RAKUTEN_STAFF:
+            assert f"[To:{account_id}] {name}さん" in body
+        assert f"[To:{STAFF_ID}]" not in body  # 総務あてには出さない
+        # 中身はライズのときと同じ4項目
+        assert "・使用会社名: ＲＡＫＵＴＥＮＫＥＮ株式会社" in body
+        assert "・必要枚数: 2枚" in body
+        assert "・種類: レターパックライト" in body
+        assert f"#!rid{RAKUTEN_ROOM}-" in sent
+
+    def test_the_preview_names_the_right_people(self, tmp_path):
+        chatwork = FakeChatwork()
+        _, preview, _ = self.draft(
+            tmp_path, chatwork, "RAKUTENKEN", "ＲＡＫＵＴＥＮＫＥＮ株式会社"
+        )
+        assert "篠田 笑佳・福本 明日香・中浦 祐子・札葉 美早さんへ" in preview
+        # 確認の段階では誰にも通知が飛ばない
+        for account_id, _ in RAKUTEN_STAFF:
+            assert f"[To:{account_id}]" not in preview
+
+    def test_other_companies_still_go_to_soumu(self, tmp_path):
+        for company_id, name in [
+            ("ライズクリエイション", "株式会社ライズクリエイション"),
+            ("ヤマトライジング", "株式会社ヤマトライジング"),
+            ("", "株式会社ライズクリエイション"),
+        ]:
+            chatwork = FakeChatwork()
+            self.draft(tmp_path / f"c{company_id}", chatwork, company_id, name)
+            room_id, body = chatwork.sent[0]
+            assert room_id == SUPPLIES_ROOM, company_id
+            assert f"[To:{STAFF_ID}] 坂口 美代子さん" in body
+
+    def test_a_reply_in_the_rakuten_room_is_relayed(self, tmp_path):
+        chatwork = FakeChatwork()
+        self.draft(tmp_path, chatwork, "RAKUTENKEN", "ＲＡＫＵＴＥＮＫＥＮ株式会社")
+        posted = chatwork._next_id
+        chatwork._messages = [
+            {
+                "message_id": str(posted + 5),
+                "body": f"[rp aid={AGENT} to={RAKUTEN_ROOM}-{posted}] 用意しました。",
+                "account": {"account_id": RAKUTEN_STAFF[1][0], "name": "福本　明日香 (休)土日祝"},
+            }
+        ]
+        chatwork.sent.clear()
+        LetterpackFollower(
+            make_config(tmp_path), chatwork,
+            client=fake_client({"kind": "完了", "summary": "2枚用意いただきました。", "question": ""}),
+        ).run_once()
+        rooms = [r for r, _ in chatwork.sent]
+        assert DEPT_ROOM in rooms and RAKUTEN_ROOM in rooms
+        assert SUPPLIES_ROOM not in rooms
+        # 返してくれた本人の名前で伝え、お礼もその人へ返す
+        to_requester = next(b for r, b in chatwork.sent if r == DEPT_ROOM)
+        assert "福本 明日香さんから返信がありました" in to_requester
+        thanks = next(b for r, b in chatwork.sent if r == RAKUTEN_ROOM)
+        assert f"[To:{RAKUTEN_STAFF[1][0]}]" in thanks
+
+    def test_a_reply_from_someone_we_did_not_ask_is_ignored(self, tmp_path):
+        # 楽天軒ルームにいる別の人（依頼先に含まれない）の発言は拾わない
+        chatwork = FakeChatwork()
+        self.draft(tmp_path, chatwork, "RAKUTENKEN", "ＲＡＫＵＴＥＮＫＥＮ株式会社")
+        posted = chatwork._next_id
+        chatwork._messages = [
+            {
+                "message_id": str(posted + 5),
+                "body": f"[rp aid={AGENT} to={RAKUTEN_ROOM}-{posted}] 横から失礼します",
+                "account": {"account_id": 111111, "name": "別部署の人"},
+            }
+        ]
+        chatwork.sent.clear()
+        LetterpackFollower(make_config(tmp_path), chatwork, client=None).run_once()
+        assert chatwork.sent == []
+
+    def test_two_companies_in_flight_are_kept_apart(self, tmp_path):
+        # 2社ぶん同時に進行しても、それぞれのルームだけを見る
+        chatwork = FakeChatwork()
+        run = LetterpackRunner(make_config(tmp_path), chatwork)
+        for account, company_id, company in [
+            (REQUESTER, "RAKUTENKEN", "ＲＡＫＵＴＥＮＫＥＮ株式会社"),
+            (9129422, "ライズクリエイション", "株式会社ライズクリエイション"),
+        ]:
+            run.offer(DEPT_ROOM, account, 1000, {**DETAIL, "company": company, "company_id": company_id})
+            run.handle(DEPT_ROOM, account, 1100, "ライト1枚で")
+            run.handle(DEPT_ROOM, account, 1200, "送信", display_name="依頼者")
+        assert sorted(r for r, _ in chatwork.sent) == sorted([RAKUTEN_ROOM, SUPPLIES_ROOM])
+
+        polled = []
+        chatwork.get_recent_messages = lambda room_id, limit=20: polled.append(room_id) or []
+        chatwork.sent.clear()
+        LetterpackFollower(make_config(tmp_path), chatwork, client=None).run_once()
+        assert sorted(polled) == sorted([RAKUTEN_ROOM, SUPPLIES_ROOM])
 
 
 class TestStore:

@@ -49,7 +49,7 @@ _TO_RE = re.compile(r"\[To:(\d+)\]")
 
 # 送付状の返信の末尾に足す確認文
 OFFER = (
-    "郵送でしたら、レターパックの手配を総務へ依頼できます。"
+    "郵送でしたら、レターパックの手配を依頼できます。"
     "必要でしたら枚数と種類（プラス／ライト）をお知らせください。"
     "不要なら「不要」とだけお返事いただければ、この件は閉じます。"
 )
@@ -101,9 +101,42 @@ def mention(account_id: int, name: str) -> str:
 
     本文とは分けて持つ。本文は sanitize_for_chatwork を通すため、タグを
     本文へ混ぜると全角に置き換わって相手に通知が飛ばなくなる。文面を見せる
-    段階ではあえて本文ごと通し、確認の時点で総務へ通知が飛ばないようにする。
+    段階ではあえて本文ごと通し、確認の時点で相手へ通知が飛ばないようにする。
     """
     return f"[To:{account_id}] {name}さん"
+
+
+def mention_all(recipients: list[dict[str, Any]]) -> str:
+    """宛先が複数のときの宛先タグ（1人1行）。"""
+    return "\n".join(
+        mention(int(r.get("account_id", 0)), str(r.get("name", ""))) for r in recipients
+    )
+
+
+def recipient_names(recipients: list[dict[str, Any]]) -> str:
+    return "・".join(str(r.get("name", "")) for r in recipients if r.get("name"))
+
+
+def route_for(settings: dict[str, Any], company_id: str) -> dict[str, Any]:
+    """差出人の会社に対応する備品ルームと宛先。
+
+    グループ会社ごとに備品の依頼先が違う（ライズは総務、楽天軒は経理財務部の
+    担当者あて）。会社が増えても routes に1件足すだけで済むようにする。
+    """
+    routes = settings.get("routes") or {}
+    route = routes.get(str(company_id or "")) or routes.get("default")
+    if route:
+        return route
+    # 旧設定（ルームと担当者を1組だけ持っていた形）
+    return {
+        "room_id": int(settings.get("supplies_room_id", 0)),
+        "recipients": [
+            {
+                "account_id": int(settings.get("staff_account_id", 0)),
+                "name": str(settings.get("staff_name", "")),
+            }
+        ],
+    }
 
 
 def build_request_text(detail: dict[str, Any], count: int, kind: str) -> str:
@@ -311,12 +344,11 @@ class LetterpackRunner:
         # ここで無効にしておく（見た目は残る）。送信時に生のタグを付け直す
         from .answer import sanitize_for_chatwork
 
-        head = sanitize_for_chatwork(
-            mention(int(settings.get("staff_account_id", 0)), str(settings.get("staff_name", "")))
-        )
+        route = route_for(settings, detail.get("company_id", ""))
+        recipients = route.get("recipients") or []
+        head = sanitize_for_chatwork(mention_all(recipients))
         return (
-            "総務の"
-            f"{settings.get('staff_name', '')}さんへ、下記の内容で依頼します。"
+            f"{recipient_names(recipients)}さんへ、下記の内容で依頼します。"
             "よろしければ「送信」とお返事ください。直すところがあれば教えてください。\n"
             "\n"
             "――――――――――\n"
@@ -341,20 +373,20 @@ class LetterpackRunner:
         return self._send(data, key, draft, display_name)
 
     def _send(self, data: dict, key: str, draft: dict, display_name: str) -> str:
-        settings = self._settings
-        room_id = int(settings.get("supplies_room_id", 0))
+        detail = draft.get("detail") or {}
+        route = route_for(self._settings, detail.get("company_id", ""))
+        room_id = int(route.get("room_id", 0))
+        recipients = route.get("recipients") or []
         from .answer import sanitize_for_chatwork
 
-        head = mention(
-            int(settings.get("staff_account_id", 0)), str(settings.get("staff_name", ""))
-        )
+        head = mention_all(recipients)
         try:
             message_id = self._chatwork.send_message(
                 room_id, head + "\n" + sanitize_for_chatwork(draft["text"])
             )
         except Exception as exc:
             raise LetterpackError(
-                "すみません、備品・消耗品購入依頼チャットへの投稿に失敗しました。"
+                "すみません、備品の依頼チャットへの投稿に失敗しました。"
                 "お手数ですが、直接ご依頼いただけますか。"
             ) from exc
 
@@ -368,6 +400,9 @@ class LetterpackRunner:
             # こちらが備品ルームへ出したメッセージ。総務の返信がどれを指しているかを
             # 突き合わせて、他の依頼への返事を拾わないようにする
             "message_ids": [str(message_id)],
+            # 巡回でどのルームの誰の返事を待つか。会社ごとに送り先が違う
+            "room_id": room_id,
+            "recipient_ids": [int(r.get("account_id", 0)) for r in recipients],
             "last_seen": int(message_id),
             "status": "open",
             "detail": draft.get("detail") or {},
@@ -399,13 +434,11 @@ class LetterpackRunner:
 
     def _on_question_answer(self, data: dict, thread: dict, text: str) -> str:
         """総務からの質問に依頼者が答えた → そのまま備品ルームへ返す。"""
-        settings = self._settings
-        room_id = int(settings.get("supplies_room_id", 0))
+        route = route_for(self._settings, (thread.get("detail") or {}).get("company_id", ""))
+        room_id = int(thread.get("room_id") or route.get("room_id", 0))
         from .answer import sanitize_for_chatwork
 
-        head = mention(
-            int(settings.get("staff_account_id", 0)), str(settings.get("staff_name", ""))
-        )
+        head = mention_all(route.get("recipients") or [])
         body = (
             f"お待たせしました。依頼者に確認しました。\n"
             f"\n"
@@ -419,7 +452,7 @@ class LetterpackRunner:
             )
         except Exception as exc:
             raise LetterpackError(
-                "すみません、備品・消耗品購入依頼チャットへの返信に失敗しました。"
+                "すみません、備品の依頼チャットへの返信に失敗しました。"
                 "お手数ですが、直接お伝えいただけますか。"
             ) from exc
         # この投稿への返信も、同じやり取りの続きとして拾えるようにする
@@ -478,43 +511,57 @@ class LetterpackFollower:
         if not threads:
             return  # 追いかけるものが無ければAPIも呼ばない
 
-        room_id = int(settings.get("supplies_room_id", 0))
-        staff_id = int(settings.get("staff_account_id", 0))
-        try:
-            messages = self._chatwork.get_recent_messages(room_id, limit=50)
-        except Exception:
-            print("[warn] 備品ルームの取得に失敗: " + traceback.format_exc(), flush=True)
-            return
-
         changed = self._expire(data, threads, int(settings.get("max_open_days", 7)))
-        newest = max((int(m.get("message_id", 0)) for m in messages), default=0)
         agent_id = self._agent_account_id()
 
-        for message in messages:
-            if int((message.get("account") or {}).get("account_id", 0) or 0) != staff_id:
-                continue
-            key = self._attribute(message, threads, room_id, agent_id)
-            if key is None:
-                continue  # 他の依頼への返事。こちらの件ではない
-            thread = threads[key]
-            if int(message.get("message_id", 0)) <= int(thread.get("last_seen", 0)):
-                continue  # 取次ぎ済み
-            thread["last_seen"] = int(message["message_id"])
-            changed = True
+        # 会社ごとに備品ルームが違う。やり取りをルーム単位にまとめて見に行く
+        for room_id, room_threads in self._by_room(threads).items():
             try:
-                self._relay(room_id, thread, message)
+                messages = self._chatwork.get_recent_messages(room_id, limit=50)
             except Exception:
-                print("[warn] 総務返信の取次ぎに失敗: " + traceback.format_exc(), flush=True)
-            data["threads"][key] = thread
+                print(f"[warn] 備品ルーム{room_id}の取得に失敗: " + traceback.format_exc(), flush=True)
+                continue
+            newest = max((int(m.get("message_id", 0)) for m in messages), default=0)
 
-        # 拾わなかった発言を毎回見直さないよう、既読位置だけは進めておく
-        for key, thread in threads.items():
-            if newest > int(thread.get("last_seen", 0)):
-                thread["last_seen"] = newest
-                data["threads"][key] = thread
+            for message in messages:
+                sender = int((message.get("account") or {}).get("account_id", 0) or 0)
+                key = self._attribute(message, room_threads, room_id, agent_id, sender)
+                if key is None:
+                    continue  # 他の依頼への返事。こちらの件ではない
+                thread = room_threads[key]
+                if int(message.get("message_id", 0)) <= int(thread.get("last_seen", 0)):
+                    continue  # 取次ぎ済み
+                thread["last_seen"] = int(message["message_id"])
                 changed = True
+                try:
+                    self._relay(room_id, thread, message)
+                except Exception:
+                    print("[warn] 返信の取次ぎに失敗: " + traceback.format_exc(), flush=True)
+                data["threads"][key] = thread
+
+            # 拾わなかった発言を毎回見直さないよう、既読位置だけは進めておく
+            for key, thread in room_threads.items():
+                if newest > int(thread.get("last_seen", 0)):
+                    thread["last_seen"] = newest
+                    data["threads"][key] = thread
+                    changed = True
         if changed:
             self._store.save(data)
+
+    def _by_room(self, threads: dict) -> dict[int, dict]:
+        """進行中のやり取りを、投稿先の備品ルームごとにまとめる。"""
+        settings = self._config.letterpack
+        grouped: dict[int, dict] = {}
+        for key, thread in threads.items():
+            room_id = int(
+                thread.get("room_id")
+                or route_for(settings, (thread.get("detail") or {}).get("company_id", "")).get(
+                    "room_id", 0
+                )
+            )
+            if room_id:
+                grouped.setdefault(room_id, {})[key] = thread
+        return grouped
 
     # --- 内部 ---
 
@@ -531,28 +578,34 @@ class LetterpackFollower:
 
     @staticmethod
     def _attribute(
-        message: dict, threads: dict, room_id: int, agent_id: int
+        message: dict, threads: dict, room_id: int, agent_id: int, sender: int
     ) -> str | None:
-        """総務の発言が、どの依頼への返事かを決める。決められなければ None。
+        """依頼先からの発言が、どの依頼への返事かを決める。決められなければ None。
 
-        備品ルームは部署全体の依頼が流れる場なので、総務の発言というだけで
+        備品ルームは部署全体の依頼が流れる場なので、依頼先の人の発言というだけで
         自分あての返事とみなすと、他の人あての連絡を横取りしてしまう。
-        こちらのメッセージを名指ししているものだけを拾う。
+        依頼した相手からの発言で、かつこちらのメッセージを名指ししているものだけを拾う。
         """
         body = str(message.get("body", ""))
+        addressed = [
+            key
+            for key, thread in threads.items()
+            if sender in [int(i) for i in thread.get("recipient_ids") or []]
+        ]
+        if not addressed:
+            return None  # 依頼していない人の発言
         for target_room, target_id in _RP_RE.findall(body):
             if int(target_room) != int(room_id):
                 continue
-            for key, thread in threads.items():
-                if target_id in [str(m) for m in thread.get("message_ids") or []]:
+            for key in addressed:
+                if target_id in [str(m) for m in threads[key].get("message_ids") or []]:
                     return key
         if agent_id and str(agent_id) in _TO_RE.findall(body):
-            keys = list(threads)
-            if len(keys) == 1:
-                return keys[0]  # 進行中が1件なら、宛先タグだけでも判別できる
+            if len(addressed) == 1:
+                return addressed[0]  # 進行中が1件なら、宛先タグだけでも判別できる
             print(
-                "[warn] 総務からの返信を特定できませんでした"
-                f"（進行中のやり取りが{len(keys)}件）",
+                "[warn] 返信を特定できませんでした"
+                f"（進行中のやり取りが{len(addressed)}件）",
                 flush=True,
             )
         return None
@@ -600,22 +653,32 @@ class LetterpackFollower:
         from .answer import sanitize_for_chatwork
         from .webhook import strip_chatwork_tags
 
-        settings = self._config.letterpack
         body = strip_chatwork_tags(str(message.get("body", "")))
         verdict = self._classify(body)
         link = room_link(room_id, message.get("message_id", ""))
-        name = str(settings.get("staff_name", "総務"))
+        # 返してくれた本人の名前で伝え、お礼もその人に返す（依頼先が複数人のことがある）。
+        # 表示名には勤務状況などが書き足されているため、台帳側の名前を使う
+        replier = int((message.get("account") or {}).get("account_id", 0) or 0)
+        route = route_for(self._config.letterpack, (thread.get("detail") or {}).get("company_id", ""))
+        name = next(
+            (
+                str(r.get("name", ""))
+                for r in route.get("recipients") or []
+                if int(r.get("account_id", 0)) == replier
+            ),
+            str((message.get("account") or {}).get("name") or ""),
+        )
 
-        lead = f"レターパックの件、総務の{name}さんから返信がありました。"
+        lead = f"レターパックの件、{name}さんから返信がありました。"
         if verdict["kind"] == "質問":
-            note = "お手数ですが、この返信にそのままお答えください。総務へお伝えします。"
+            note = "お手数ですが、この返信にそのままお答えください。先方へお伝えします。"
             thread["status"] = "asked"
             thread["asked_ts"] = int(datetime.now(JST).timestamp())
         elif verdict["kind"] == "完了":
             note = "手配は完了です。お礼はこちらでお伝えしました。"
             thread["status"] = "done"
         else:
-            note = "続きがあればお答えください。総務へお伝えします。"
+            note = "続きがあればお答えください。先方へお伝えします。"
             thread["status"] = "asked"
             thread["asked_ts"] = int(datetime.now(JST).timestamp())
 
@@ -631,7 +694,7 @@ class LetterpackFollower:
         if verdict["kind"] == "完了":
             self._chatwork.send_message(
                 room_id,
-                mention(int(settings.get("staff_account_id", 0)), name)
+                mention(replier, name)
                 + "\n"
                 + sanitize_for_chatwork(
                     "ご対応ありがとうございます。依頼者へ申し送りました。"

@@ -124,9 +124,9 @@ _DEFAULTS: dict[str, Any] = {
     # 他部署のルームへ社内ナレッジが流れる経路を作らないため
     "letterpack": {
         "enabled": False,
-        "supplies_room_id": 0,
-        "staff_account_id": 0,
-        "staff_name": "",
+        # 差出人の会社ごとの依頼先。company_id で引き、無ければ default を使う。
+        # ライズは総務あて、楽天軒は経理財務部の担当者あて、と送り先が違う
+        "routes": {},
         # 総務の返信を巡回で拾う（備品ルームはwebhookの対象外のため）
         "follow_up": True,
         # 「2枚で」「送信」といった短い返事を、いつまで続きとみなすか

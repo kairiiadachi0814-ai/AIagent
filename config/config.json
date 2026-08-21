@@ -72,9 +72,24 @@
   },
   "letterpack": {
     "enabled": true,
-    "supplies_room_id": 345854487,
-    "staff_account_id": 1160869,
-    "staff_name": "坂口 美代子",
+    "_note": "routes は差出人の会社ごとの依頼先。company_id（templates/companies.json のID）で引き、無ければ default。会社が増えたらここに1件足す",
+    "routes": {
+      "default": {
+        "room_id": 345854487,
+        "recipients": [
+          { "account_id": 1160869, "name": "坂口 美代子" }
+        ]
+      },
+      "RAKUTENKEN": {
+        "room_id": 392462780,
+        "recipients": [
+          { "account_id": 9228914, "name": "篠田 笑佳" },
+          { "account_id": 9763216, "name": "福本 明日香" },
+          { "account_id": 10622368, "name": "中浦 祐子" },
+          { "account_id": 10675817, "name": "札葉 美早" }
+        ]
+      }
+    },
     "follow_up": true,
     "reply_window_minutes": 120,
     "max_open_days": 7
