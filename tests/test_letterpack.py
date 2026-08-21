@@ -665,7 +665,7 @@ class TestFollowUp:
         ).run_once()
         assert DEPT_ROOM in [r for r, _ in chatwork.sent]
 
-    def test_no_reply_is_reported_after_six_business_hours(self, tmp_path):
+    def test_no_reply_is_reported_only_after_six_office_hours(self, tmp_path):
         import json as _json
         import time
 
@@ -679,38 +679,57 @@ class TestFollowUp:
                 thread["ts"] = int(time.time()) - seconds_ago
                 thread["status"] = "open"
                 thread.pop("replied_ts", None)
+                thread.pop("answered_ts", None)
             path.write_text(_json.dumps(state, ensure_ascii=False), encoding="utf-8")
 
-        # 5時間ではまだ知らせない
-        set_posted_at(5 * 3600)
+        # 出したばかりなら知らせない（実行時刻によらず経過0）
+        set_posted_at(0)
         chatwork.sent.clear()
         LetterpackFollower(make_config(tmp_path), chatwork, client=None).run_once()
         assert chatwork.sent == []
 
-        # 6時間で知らせる（平日に実行した場合）
-        set_posted_at(7 * 3600)
+        # 30日前の依頼なら、いつ実行しても営業時間で6時間を超えている
+        set_posted_at(30 * 86400)
         chatwork.sent.clear()
         LetterpackFollower(make_config(tmp_path), chatwork, client=None).run_once()
-        if datetime.now(JST).weekday() < 5:
-            body = next(b for r, b in chatwork.sent if r == DEPT_ROOM)
-            assert "依頼から6時間（土日を除く）が経ちました" in body
+        body = next(b for r, b in chatwork.sent if r == DEPT_ROOM)
+        assert "依頼から6時間（平日9時〜18時で計算）が経ちました" in body
+        assert "リアクションだけで返されている場合" in body
 
-    def test_the_weekend_is_not_counted(self):
-        from raizuinu.letterpack import business_seconds
+    def test_only_office_hours_on_working_days_are_counted(self):
+        from raizuinu.letterpack import office_seconds
 
         def at(text):
             return int(
                 datetime.strptime(text, "%Y-%m-%d %H:%M").replace(tzinfo=JST).timestamp()
             )
 
-        # 金曜18時 → 土曜18時。土曜は数えないので、経過は6時間（金曜の18〜24時）
-        assert business_seconds(at("2026-08-21 18:00"), at("2026-08-22 18:00")) == 6 * 3600
-        # 土曜のあいだは1秒も進まない
-        assert business_seconds(at("2026-08-22 09:00"), at("2026-08-23 21:00")) == 0
-        # 月曜9時 → 月曜15時はそのまま6時間
-        assert business_seconds(at("2026-08-24 09:00"), at("2026-08-24 15:00")) == 6 * 3600
+        HOL = {"2026-08-11"}  # 山の日（火）
+        # 平日の日中はそのまま
+        assert office_seconds(at("2026-08-24 09:00"), at("2026-08-24 15:00")) == 6 * 3600
+        # 夜間は数えない。金17時→金23時は1時間だけ（17〜18時）
+        assert office_seconds(at("2026-08-21 17:00"), at("2026-08-21 23:00")) == 3600
+        # 土日は数えない。金17時→月9時は1時間のまま
+        assert office_seconds(at("2026-08-21 17:00"), at("2026-08-24 09:00")) == 3600
+        # 週明けの営業時間ぶんだけ積み上がる（金1時間＋月5時間＝6時間）
+        assert office_seconds(at("2026-08-21 17:00"), at("2026-08-24 14:00")) == 6 * 3600
+        # 祝日は数えない（8/10月17時→8/12水9時。8/11は山の日）
+        assert office_seconds(at("2026-08-10 17:00"), at("2026-08-12 09:00"), HOL) == 3600
         # 逆転していても落ちない
-        assert business_seconds(at("2026-08-24 15:00"), at("2026-08-24 09:00")) == 0
+        assert office_seconds(at("2026-08-24 15:00"), at("2026-08-24 09:00")) == 0
+
+    def test_the_holiday_table_covers_the_known_rules(self):
+        import json as _json
+        import pathlib as _pathlib
+
+        table = _json.loads(
+            (_pathlib.Path("config") / "holidays.json").read_text(encoding="utf-8")
+        )["holidays"]
+        assert table["2026-01-01"] == "元日"
+        assert table["2026-05-06"] == "振替休日"  # 5/3が日曜のため
+        assert table["2026-09-22"] == "国民の休日"  # 敬老の日と秋分の日に挟まれる
+        assert table["2026-03-20"] == "春分の日"
+        assert table["2027-03-22"] == "振替休日"  # 春分の日が日曜のため
 
     def test_a_thread_that_got_a_reply_is_not_chased(self, tmp_path):
         # 一度でも返事をもらっていれば、6時間の催促は当てない

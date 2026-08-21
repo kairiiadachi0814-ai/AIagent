@@ -36,7 +36,7 @@ Chatworkの許可ルームでメンションを受けたら、`handbook/` と `s
 - 定型の受け答えの揺らぎは `phrasing.py`。コード側で書いている一言（「下書きを作成しました」等）を同義の候補から毎回選び直し、前回と同じ言い方を避ける。**揺らいでよいのは社交辞令だけ**で、回答本文・出典・免責文・金額・他部署へ送る文面は対象外。各候補が呼び出し側の判定（未来形を弾く等）を満たすことを `tests/test_phrasing.py` で固定してある。`config: phrasing.vary_openings` を false にすると固定へ戻る
 - TaskRising（社内タスク管理）への登録は `taskrising.py`。実体はSupabase（PostgREST）で独自APIは無い。**service_role キーは使わず**、専用ボットユーザー（メール＋パスワード）でログインしてRLSの範囲で読み書きする。**経費支払いタスク・振込用CSV等が揃うまで `taskrising.enabled` は false のまま**。接続確認とテーブル定義の書き出しは `python tools/check_taskrising.py`（書き込みはしない）
 - 添付文書の読み取りは `doctask.py`。一度読んだ文書は `DocumentMemory` がルーム単位で覚え、**その話題への返信か、ファイル名の名指しのときだけ**思い出す（会話の途中から入った人が添付し直さずに済む。無関係な質問に文書を持ち出さないよう条件を絞ってある）
-- レターパックの手配取次ぎは `letterpack.py`。`LetterpackRunner` が依頼者とのやり取り（要否→文面確認→投稿）、`LetterpackFollower` が総務からの返信の巡回（watcherのタイマーに相乗り）。送り先は**差出人の会社ごとに変わる**（`letterpack.routes` を company_id で引く。ライズ系＝総務の備品ルーム、楽天軒＝楽天軒備品チャットの経理財務部4名）。会社が増えたら routes に1件足すだけ。投稿先の備品ルームは **`allowed_room_ids` に入れない**（Q&Aの対象外にして、他部署のルームへ社内ナレッジが流れる経路を作らない）
+- レターパックの手配取次ぎは `letterpack.py`。`LetterpackRunner` が依頼者とのやり取り（要否→文面確認→投稿）、`LetterpackFollower` が総務からの返信の巡回（watcherのタイマーに相乗り）。送り先は**差出人の会社ごとに変わる**（`letterpack.routes` を company_id で引く。ライズ系＝総務の備品ルーム、楽天軒＝楽天軒備品チャットの経理財務部4名）。会社が増えたら routes に1件足すだけ。催促の経過時間は営業時間（平日9〜18時、土日祝を除く）で数える。祝日表は `config/holidays.json`（`python tools/build_holidays.py 2029 2030` で作り直す）。投稿先の備品ルームは **`allowed_room_ids` に入れない**（Q&Aの対象外にして、他部署のルームへ社内ナレッジが流れる経路を作らない）
 - ハンドブック転記ファイル（63件）は現状リポジトリ直下のフラット構成。参照ルートは `config/config.json` の `handbook.roots` で管理し、将来 `handbook/`・`sops/` 階層へ移す場合も設定変更のみで追従する
 - 11章未決事項の推奨案（暫定採用）は `docs/phase1-requirements.md` 11章と `config/config.json` に記録
 - 秘密情報は環境変数のみ: `ANTHROPIC_API_KEY`／`CHATWORK_API_TOKEN`／`CHATWORK_WEBHOOK_TOKEN`

@@ -25,7 +25,7 @@ import json
 import re
 import traceback
 import unicodedata
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -91,25 +91,51 @@ def quote_answer(text: str) -> str:
     return f"{answer}とのことです。"
 
 
-def business_seconds(start_ts: int, end_ts: int) -> int:
-    """土日を除いた経過秒数。
+OFFICE_START_HOUR = 9
+OFFICE_END_HOUR = 18
 
-    金曜の夕方に出した依頼へ土曜の朝に「返事がない」と言うのは筋が悪い。
-    土日は数に入れず、平日の時間だけを積む。
+
+def load_holidays(config: Any) -> tuple[set[str], list[int]]:
+    """国民の祝日（config/holidays.json）。→ (日付の集合, 収録年の範囲)
+
+    表は tools/build_holidays.py で作る。年が変わったら作り直す。
+    """
+    try:
+        path = config.resolve_path("config") / "holidays.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, AttributeError):
+        return set(), []
+    return set(data.get("holidays") or {}), list(data.get("covers") or [])
+
+
+def office_seconds(
+    start_ts: int,
+    end_ts: int,
+    holidays: Any = (),
+    start_hour: int = OFFICE_START_HOUR,
+    end_hour: int = OFFICE_END_HOUR,
+) -> int:
+    """営業時間（平日9:00〜18:00、土日祝を除く）で数えた経過秒数。
+
+    金曜17時の依頼に対して23時に「返事がない」と言っても、相手は退勤して
+    いて誰も動けない。依頼者の手元にも夜中に通知が飛ぶ。相手が見られる
+    時間だけを積み、催促が営業時間に収まるようにする。
     """
     if end_ts <= start_ts:
         return 0
-    cursor = datetime.fromtimestamp(int(start_ts), JST)
+    holidays = set(holidays)
+    start = datetime.fromtimestamp(int(start_ts), JST)
     end = datetime.fromtimestamp(int(end_ts), JST)
     total = 0.0
-    while cursor < end:
-        midnight = (cursor + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        chunk_end = min(end, midnight)
-        if cursor.weekday() < 5:  # 月〜金だけ数える
-            total += (chunk_end - cursor).total_seconds()
-        cursor = chunk_end
+    day = start.date()
+    while day <= end.date():
+        if day.weekday() < 5 and day.isoformat() not in holidays:
+            opens = datetime.combine(day, time(start_hour), tzinfo=JST)
+            closes = datetime.combine(day, time(end_hour), tzinfo=JST)
+            lo, hi = max(start, opens), min(end, closes)
+            if hi > lo:
+                total += (hi - lo).total_seconds()
+        day += timedelta(days=1)
     return int(total)
 
 
@@ -705,19 +731,32 @@ class LetterpackFollower:
         now = datetime.now(JST).timestamp()
         settle = int(settings.get("settle_hours", 24)) * 3600
         no_reply_hours = int(settings.get("no_reply_hours", 6))
+        office = settings.get("office_hours") or {}
+        holidays, covers = load_holidays(self._config)
+        if covers and datetime.now(JST).year > max(covers):
+            # 表が切れたまま黙って動くと、祝日に催促が飛ぶ
+            print(
+                f"[warn] 祝日表が{max(covers)}年までです。"
+                "tools/build_holidays.py で作り直してください",
+                flush=True,
+            )
         limit = now - max_days * 86400
         changed = False
         for key, thread in list(threads.items()):
             # 一度も返事をもらえていない依頼は早めに知らせる。届いていない
             # 可能性があるため。土日は数えない（週明けまで待つ）
             if thread.get("status") == "open" and not thread.get("replied_ts"):
-                waited = business_seconds(int(thread.get("ts", 0)), int(now))
+                waited = office_seconds(
+                    int(thread.get("ts", 0)), int(now), holidays,
+                    int(office.get("start", OFFICE_START_HOUR)),
+                    int(office.get("end", OFFICE_END_HOUR)),
+                )
                 if waited >= no_reply_hours * 3600:
                     data["threads"][key]["status"] = "expired"
                     threads.pop(key)
                     changed = True
                     try:
-                        self._notify_expired(thread, f"{no_reply_hours}時間（土日を除く）")
+                        self._notify_expired(thread, f"{no_reply_hours}時間（平日9時〜18時で計算）")
                     except Exception:
                         print("[warn] 未返信の通知に失敗: " + traceback.format_exc(), flush=True)
                     continue
