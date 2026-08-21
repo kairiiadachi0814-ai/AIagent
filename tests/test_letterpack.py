@@ -346,7 +346,9 @@ class TestFollowUp:
         ).run_once()
         to_requester = next(b for r, b in chatwork.sent if r == DEPT_ROOM)
         assert "いつまでに必要か" in to_requester
-        assert SUPPLIES_ROOM not in [r for r, _ in chatwork.sent]  # 勝手に答えない
+        # 相手を放置しない。ただし勝手に答えず、確認する旨だけを返す
+        ack = next(b for r, b in chatwork.sent if r == SUPPLIES_ROOM)
+        assert "依頼者に確認のうえ、折り返しご連絡します" in ack
 
         chatwork.sent.clear()
         reply = run.handle(DEPT_ROOM, REQUESTER, 99999999, "明後日までにお願いします")
@@ -379,6 +381,58 @@ class TestFollowUp:
             client=fake_client({"kind": "完了", "summary": "明日用意いただけるそうです。", "question": ""}),
         ).run_once()
         assert "明日用意" in next(b for r, b in chatwork.sent if r == DEPT_ROOM)
+
+    def test_a_reply_is_never_left_without_an_acknowledgement(self, tmp_path):
+        """実例（2026-08-21）: 総務の「承知しました。お渡しいたしますので
+        取りにきていただけるでしょうか。」に何も返さず、依頼者の回答待ちで
+        止まっていた。相手からは無視されたように見える。
+        """
+        chatwork = FakeChatwork()
+        _, posted = open_thread(tmp_path, chatwork)
+        chatwork._messages = [
+            staff_message(
+                posted + 5,
+                "承知しました。お渡しいたしますので取りにきていただけるでしょうか。",
+                reply_to=posted,
+            )
+        ]
+        chatwork.sent.clear()
+        LetterpackFollower(
+            make_config(tmp_path),
+            chatwork,
+            client=fake_client(
+                {
+                    "kind": "質問", "arranged": True,
+                    "summary": "手配いただき、受け取りに来てほしいとのことです。",
+                    "question": "受け取りに行けるか",
+                }
+            ),
+        ).run_once()
+
+        ack = next(b for r, b in chatwork.sent if r == SUPPLIES_ROOM)
+        assert f"[To:{STAFF_ID}]" in ack  # 返してくれた本人あて
+        assert "ご手配ありがとうございます" in ack  # 手配済みなら礼を言う
+        assert "折り返しご連絡します" in ack  # 勝手に答えず、確認する旨だけ
+        assert DEPT_ROOM in [r for r, _ in chatwork.sent]  # 依頼者へも伝える
+
+    @pytest.mark.parametrize(
+        "verdict",
+        [
+            {"kind": "質問", "arranged": False, "summary": "在庫を確認中とのことです。", "question": "在庫"},
+            {"kind": "その他", "arranged": False, "summary": "受け取りました。", "question": ""},
+            {"kind": "完了", "arranged": True, "summary": "用意いただきました。", "question": ""},
+        ],
+    )
+    def test_something_always_goes_back_whatever_the_verdict(self, tmp_path, verdict):
+        chatwork = FakeChatwork()
+        _, posted = open_thread(tmp_path, chatwork)
+        chatwork._messages = [staff_message(posted + 5, "本文", reply_to=posted)]
+        chatwork.sent.clear()
+        LetterpackFollower(
+            make_config(tmp_path), chatwork, client=fake_client(verdict)
+        ).run_once()
+        rooms = [r for r, _ in chatwork.sent]
+        assert SUPPLIES_ROOM in rooms and DEPT_ROOM in rooms
 
     def test_a_new_request_is_not_swallowed_as_an_answer(self, tmp_path):
         chatwork = FakeChatwork()

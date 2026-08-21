@@ -176,21 +176,28 @@ REPLY_SCHEMA: dict[str, Any] = {
                 "判断できなければその他"
             ),
         },
+        "arranged": {
+            "type": "boolean",
+            "description": (
+                "手配が済んだ・用意した・準備できた旨が書かれていれば true。"
+                "受け取り方法などを併せて聞かれていても、手配自体が済んでいれば true"
+            ),
+        },
         "summary": {
             "type": "string",
-            "description": "依頼者へ伝える内容を1〜2文で。総務の言葉づかいは変えてよい",
+            "description": "依頼者へ伝える内容を1〜2文で。相手の言葉づかいは変えてよい",
         },
         "question": {
             "type": "string",
             "description": "質問のときだけ、聞かれている内容を1文で。それ以外は空文字",
         },
     },
-    "required": ["kind", "summary", "question"],
+    "required": ["kind", "arranged", "summary", "question"],
     "additionalProperties": False,
 }
 
 REPLY_SYSTEM = (
-    "あなたは社内チャットの取次ぎ担当です。備品の手配を依頼した相手（総務）からの"
+    "あなたは社内チャットの取次ぎ担当です。備品の手配を依頼した相手からの"
     "返信を読み、依頼者へ伝えるために内容を整理します。"
     "推測で情報を足さないこと。書かれていないこと（受け取り場所・期日など）を"
     "補わないこと。"
@@ -670,15 +677,16 @@ class LetterpackFollower:
         )
 
         lead = f"レターパックの件、{name}さんから返信がありました。"
-        if verdict["kind"] == "質問":
-            note = "お手数ですが、この返信にそのままお答えください。先方へお伝えします。"
-            thread["status"] = "asked"
-            thread["asked_ts"] = int(datetime.now(JST).timestamp())
-        elif verdict["kind"] == "完了":
+        thanks = "ご手配ありがとうございます。" if verdict.get("arranged") else ""
+        if verdict["kind"] == "完了":
             note = "手配は完了です。お礼はこちらでお伝えしました。"
+            ack = "ご対応ありがとうございます。依頼者へ申し送りました。引き続きよろしくお願いいたします。"
             thread["status"] = "done"
         else:
-            note = "続きがあればお答えください。先方へお伝えします。"
+            note = "お手数ですが、この返信にそのままお答えください。先方へお伝えします。"
+            # 依頼者の答えを待つ間、相手を放置しない。こちらで勝手に答えず、
+            # 受け取ったことと確認する旨だけを返す
+            ack = f"{thanks}依頼者に確認のうえ、折り返しご連絡します。"
             thread["status"] = "asked"
             thread["asked_ts"] = int(datetime.now(JST).timestamp())
 
@@ -691,20 +699,14 @@ class LetterpackFollower:
             + "\n"
             + sanitize_for_chatwork(f"{lead}\n\n{verdict['summary']}\n\n{note}\n{link}"),
         )
-        if verdict["kind"] == "完了":
-            self._chatwork.send_message(
-                room_id,
-                mention(replier, name)
-                + "\n"
-                + sanitize_for_chatwork(
-                    "ご対応ありがとうございます。依頼者へ申し送りました。"
-                    "引き続きよろしくお願いいたします。"
-                ),
-            )
+        # 返事をもらったら必ず何かを返す。黙っていると、相手からは無視されたように見える
+        self._chatwork.send_message(
+            room_id, mention(replier, name) + "\n" + sanitize_for_chatwork(ack)
+        )
 
     def _classify(self, body: str) -> dict[str, str]:
         """返信が「完了」か「質問」かを見る。判断できなければそのまま伝える。"""
-        fallback = {"kind": "その他", "summary": body[:400], "question": ""}
+        fallback = {"kind": "その他", "arranged": False, "summary": body[:400], "question": ""}
         if not body.strip():
             return fallback
         if self._client is None:
@@ -747,6 +749,7 @@ class LetterpackFollower:
             return fallback
         return {
             "kind": str(parsed.get("kind") or "その他"),
+            "arranged": bool(parsed.get("arranged")),
             "summary": str(parsed.get("summary") or body[:400]),
             "question": str(parsed.get("question") or ""),
         }
