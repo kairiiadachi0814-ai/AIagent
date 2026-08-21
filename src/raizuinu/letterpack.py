@@ -91,6 +91,28 @@ def quote_answer(text: str) -> str:
     return f"{answer}とのことです。"
 
 
+def business_seconds(start_ts: int, end_ts: int) -> int:
+    """土日を除いた経過秒数。
+
+    金曜の夕方に出した依頼へ土曜の朝に「返事がない」と言うのは筋が悪い。
+    土日は数に入れず、平日の時間だけを積む。
+    """
+    if end_ts <= start_ts:
+        return 0
+    cursor = datetime.fromtimestamp(int(start_ts), JST)
+    end = datetime.fromtimestamp(int(end_ts), JST)
+    total = 0.0
+    while cursor < end:
+        midnight = (cursor + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        chunk_end = min(end, midnight)
+        if cursor.weekday() < 5:  # 月〜金だけ数える
+            total += (chunk_end - cursor).total_seconds()
+        cursor = chunk_end
+    return int(total)
+
+
 def confirmed_lead(waited_seconds: int) -> str:
     """依頼者に確認した旨の書き出し。待たせていなければ詫びない。"""
     if waited_seconds >= WAITED_SECONDS:
@@ -679,11 +701,26 @@ class LetterpackFollower:
         受け取ってもらえた合図とみなして静かに閉じる。まだ一度も返事を
         もらえていないときだけ、依頼者へ知らせる。
         """
+        settings = self._config.letterpack
         now = datetime.now(JST).timestamp()
-        settle = int(self._config.letterpack.get("settle_hours", 24)) * 3600
+        settle = int(settings.get("settle_hours", 24)) * 3600
+        no_reply_hours = int(settings.get("no_reply_hours", 6))
         limit = now - max_days * 86400
         changed = False
         for key, thread in list(threads.items()):
+            # 一度も返事をもらえていない依頼は早めに知らせる。届いていない
+            # 可能性があるため。土日は数えない（週明けまで待つ）
+            if thread.get("status") == "open" and not thread.get("replied_ts"):
+                waited = business_seconds(int(thread.get("ts", 0)), int(now))
+                if waited >= no_reply_hours * 3600:
+                    data["threads"][key]["status"] = "expired"
+                    threads.pop(key)
+                    changed = True
+                    try:
+                        self._notify_expired(thread, f"{no_reply_hours}時間（土日を除く）")
+                    except Exception:
+                        print("[warn] 未返信の通知に失敗: " + traceback.format_exc(), flush=True)
+                    continue
             answered_ts = int(thread.get("answered_ts", 0) or 0)
             if answered_ts and now - answered_ts >= settle:
                 # こちらの回答で話が閉じている。リアクションで済ませた場合もここ
@@ -701,7 +738,7 @@ class LetterpackFollower:
             threads.pop(key)
             changed = True
             try:
-                self._notify_expired(thread, max_days)
+                self._notify_expired(thread, f"{max_days}日")
             except Exception:
                 print("[warn] 期限切れの通知に失敗: " + traceback.format_exc(), flush=True)
         return changed
@@ -732,7 +769,7 @@ class LetterpackFollower:
             ),
         )
 
-    def _notify_expired(self, thread: dict, max_days: int) -> None:
+    def _notify_expired(self, thread: dict, waited_label: str) -> None:
         from .answer import sanitize_for_chatwork
 
         room_id = int(thread.get("room_id") or 0)
@@ -744,9 +781,9 @@ class LetterpackFollower:
             )
             + "\n"
             + sanitize_for_chatwork(
-                f"レターパックの件、{max_days}日たっても返信を確認できませんでした。"
-                "こちらでの追跡は終了します。お手数ですが、備品の依頼チャットを"
-                "直接ご確認ください。\n"
+                f"レターパックの件、依頼から{waited_label}が経ちましたが、"
+                "返信を確認できませんでした。こちらでの追跡は終了します。"
+                "お手数ですが、備品の依頼チャットをご確認ください。\n"
                 "（リアクションだけで返されている場合、こちらでは確認できません）\n"
                 + room_link(room_id, thread.get("posted_message_id", ""))
             ),
@@ -772,6 +809,7 @@ class LetterpackFollower:
             str((message.get("account") or {}).get("name") or ""),
         )
 
+        thread["replied_ts"] = int(datetime.now(JST).timestamp())
         if verdict.get("arranged"):
             thread["arranged"] = True  # 閉じるときに、手配済みかどうかで扱いを変える
         lead = f"レターパックの件、{name}さんから返信がありました。"

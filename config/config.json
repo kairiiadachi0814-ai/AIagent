@@ -94,6 +94,7 @@
     "reply_window_minutes": 120,
     "answer_window_hours": 48,
     "settle_hours": 24,
+    "no_reply_hours": 6,
     "max_open_days": 7
   },
   "webhook_async": true,

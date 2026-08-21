@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,7 @@ STAFF_ID = 1160869
 DEPT_ROOM = 384793683
 REQUESTER = 6945415
 AGENT = 999  # アシスタント自身のアカウント
+JST = timezone(timedelta(hours=9))
 RAKUTEN_ROOM = 392462780  # 楽天軒　備品チャット
 RAKUTEN_STAFF = (
     (9228914, "篠田 笑佳"),
@@ -662,6 +664,72 @@ class TestFollowUp:
             ),
         ).run_once()
         assert DEPT_ROOM in [r for r, _ in chatwork.sent]
+
+    def test_no_reply_is_reported_after_six_business_hours(self, tmp_path):
+        import json as _json
+        import time
+
+        chatwork = FakeChatwork()
+        open_thread(tmp_path, chatwork)
+        path = tmp_path / "state" / "letterpack.json"
+
+        def set_posted_at(seconds_ago):
+            state = _json.loads(path.read_text(encoding="utf-8"))
+            for thread in state["threads"].values():
+                thread["ts"] = int(time.time()) - seconds_ago
+                thread["status"] = "open"
+                thread.pop("replied_ts", None)
+            path.write_text(_json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+        # 5時間ではまだ知らせない
+        set_posted_at(5 * 3600)
+        chatwork.sent.clear()
+        LetterpackFollower(make_config(tmp_path), chatwork, client=None).run_once()
+        assert chatwork.sent == []
+
+        # 6時間で知らせる（平日に実行した場合）
+        set_posted_at(7 * 3600)
+        chatwork.sent.clear()
+        LetterpackFollower(make_config(tmp_path), chatwork, client=None).run_once()
+        if datetime.now(JST).weekday() < 5:
+            body = next(b for r, b in chatwork.sent if r == DEPT_ROOM)
+            assert "依頼から6時間（土日を除く）が経ちました" in body
+
+    def test_the_weekend_is_not_counted(self):
+        from raizuinu.letterpack import business_seconds
+
+        def at(text):
+            return int(
+                datetime.strptime(text, "%Y-%m-%d %H:%M").replace(tzinfo=JST).timestamp()
+            )
+
+        # 金曜18時 → 土曜18時。土曜は数えないので、経過は6時間（金曜の18〜24時）
+        assert business_seconds(at("2026-08-21 18:00"), at("2026-08-22 18:00")) == 6 * 3600
+        # 土曜のあいだは1秒も進まない
+        assert business_seconds(at("2026-08-22 09:00"), at("2026-08-23 21:00")) == 0
+        # 月曜9時 → 月曜15時はそのまま6時間
+        assert business_seconds(at("2026-08-24 09:00"), at("2026-08-24 15:00")) == 6 * 3600
+        # 逆転していても落ちない
+        assert business_seconds(at("2026-08-24 15:00"), at("2026-08-24 09:00")) == 0
+
+    def test_a_thread_that_got_a_reply_is_not_chased(self, tmp_path):
+        # 一度でも返事をもらっていれば、6時間の催促は当てない
+        import json as _json
+        import time
+
+        chatwork = FakeChatwork()
+        self.answered_thread(tmp_path, chatwork)
+        path = tmp_path / "state" / "letterpack.json"
+        state = _json.loads(path.read_text(encoding="utf-8"))
+        for thread in state["threads"].values():
+            thread["ts"] = int(time.time()) - 30 * 3600
+            thread["status"] = "open"
+            thread.pop("answered_ts", None)
+        path.write_text(_json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        chatwork._messages = []
+        chatwork.sent.clear()
+        LetterpackFollower(make_config(tmp_path), chatwork, client=None).run_once()
+        assert chatwork.sent == []
 
     def test_an_abandoned_request_mentions_that_reactions_are_invisible(self, tmp_path):
         # 一度も返事が無い場合の警告には、リアクションの可能性を添える
