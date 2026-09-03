@@ -144,6 +144,16 @@ _DEFAULTS: dict[str, Any] = {
         # 返信が来ないまま放置されたやり取りを閉じるまでの日数
         "max_open_days": 7,
     },
+    # チャットの過去ログを貯めて、そこから答える。ChatworkのAPIは直近100件しか
+    # 返さないため、巡回のたびに書き写して積み上げる。検索は質問が来たルーム内だけ
+    "chat_archive": {
+        "enabled": False,
+        "room_ids": [],
+        # 保存期間（日）。パスワードのように変更が稀な値を追えるよう長めに取る
+        "retention_days": 730,
+        # 1回の照会でモデルに読ませる発言の数
+        "max_hits": 8,
+    },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {
         "enabled": False,

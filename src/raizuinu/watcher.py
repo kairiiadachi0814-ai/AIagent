@@ -353,7 +353,41 @@ def main() -> None:
         LetterpackFollower(config).run_once()
     except Exception:
         print("[error] レターパックの追跡に失敗: " + traceback.format_exc(), flush=True)
+    try:
+        archive_rooms(config)
+    except Exception:
+        print("[error] 過去ログの保存に失敗: " + traceback.format_exc(), flush=True)
     DiscussionWatcher(config).run_once()
+
+
+def archive_rooms(config: Config, chatwork: Any | None = None) -> dict[int, int]:
+    """設定されたルームの発言を過去ログへ書き写す。→ ルームごとの追加件数。
+
+    ChatworkのAPIは直近100件しか返さないため、巡回のたびに拾って積み上げる
+    しかない（「楽天BillPayのパスワードは？」のような、チャットにしか無い値へ
+    後から答えるため）。
+    """
+    settings = config.chat_archive
+    if not settings.get("enabled"):
+        return {}
+    from .chatlog import ChatArchive
+
+    chatwork = chatwork or ChatworkClient(config.chatwork_api_token or "")
+    archive = ChatArchive(
+        config.resolve_path(config.state_dir) / "chatlog.sqlite3",
+        retention_days=int(settings.get("retention_days", 730)),
+    )
+    added = {}
+    for room_id in settings.get("room_ids") or []:
+        try:
+            messages = chatwork.get_recent_messages(int(room_id), limit=100)
+            added[int(room_id)] = archive.record(int(room_id), messages)
+        except Exception:
+            print(f"[warn] ルーム{room_id}の取得に失敗: " + traceback.format_exc(), flush=True)
+    removed = archive.prune()
+    if removed:
+        print(f"[info] 保存期間を過ぎた発言を{removed}件消しました", flush=True)
+    return added
 
 
 if __name__ == "__main__":

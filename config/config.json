@@ -101,6 +101,12 @@
   "webhook_async": true,
   "webhook_max_concurrency": 2,
   "webhook_max_queue": 10,
+  "chat_archive": {
+    "enabled": true,
+    "room_ids": [384793683, 444945031, 444781726],
+    "retention_days": 730,
+    "max_hits": 8
+  },
   "discussion_watch": {
     "enabled": true,
     "room_ids": [

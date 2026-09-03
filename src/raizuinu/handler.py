@@ -131,6 +131,17 @@ class RaizuinuHandler:
             from .letterpack import LetterpackRunner
 
             self._letterpack = LetterpackRunner(cfg, self._chatwork)
+        self._chatlog = overrides.get("chatlog")
+        if self._chatlog is None and cfg.chat_archive.get("enabled"):
+            from .chatlog import ChatArchive, ChatLogAnswerer
+
+            self._chatlog = ChatLogAnswerer(
+                cfg,
+                ChatArchive(
+                    cfg.resolve_path(cfg.state_dir) / "chatlog.sqlite3",
+                    retention_days=int(cfg.chat_archive.get("retention_days", 730)),
+                ),
+            )
         self._guest = overrides.get("guest")
         if self._guest is None and cfg.member_account_ids:
             from .guest import GuestResponder
@@ -439,6 +450,12 @@ class RaizuinuHandler:
             self._handle_feedback(event, answer, status)
             return
 
+        # ハンドブックに無い質問は、そのルームの過去のやり取りを探す。
+        # 「楽天BillPayのパスワードは？」のように、チャットにしか無い値がある
+        if not answer.has_answer and answer.intent == "question" and self._chatlog is not None:
+            if self._answer_from_chatlog(event, question, status):
+                return
+
         reply = format_reply(answer, event.account_id, event.room_id, event.message_id)
         self._chatwork.send_message(event.room_id, reply)
 
@@ -742,6 +759,45 @@ class RaizuinuHandler:
                 + traceback.format_exc(),
                 flush=True,
             )
+
+    def _answer_from_chatlog(self, event: MentionEvent, question: str, status) -> bool:
+        """そのルームの過去ログから答える。答えが無ければ False（通常の返信へ戻す）。"""
+        from .answer import sanitize_for_chatwork
+
+        try:
+            text, meta, usage = self._chatlog.lookup(event.room_id, question)
+        except Exception:
+            print("[warn] 過去ログの照会に失敗: " + traceback.format_exc(), flush=True)
+            return False
+        status = self._add_usage_safely(usage) or status
+        if not text:
+            return False
+
+        self._chatwork.send_message(
+            event.room_id, _reply_tag(event) + sanitize_for_chatwork(text)
+        )
+        try:
+            if status is not None:
+                self._maybe_alert(status)
+            self._audit_safely(
+                {
+                    "type": "chatlog_answer",
+                    "room_id": event.room_id,
+                    "account_id": event.account_id,
+                    "message_id": event.message_id,
+                    "question": question,
+                    # 本文は残さない。パスワード等をログへ写して置き場を増やさない
+                    "answer": "（過去ログからの回答。本文は記録しません）",
+                    "detail": meta,
+                    "model": self._config.model,
+                    "usage": usage,
+                    "cost_jpy": round(self._cost.estimate_cost_jpy(usage), 3) if usage else 0.0,
+                    "monthly_total_jpy": round(status.total_jpy, 2) if status else None,
+                }
+            )
+        except Exception:
+            print("[warn] 返信後の監査処理に失敗: " + traceback.format_exc(), flush=True)
+        return True
 
     def _add_usage_safely(self, usage: dict) -> object | None:
         """コストを計上する。計上の失敗で返信自体を止めない。"""
