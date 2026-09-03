@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from .answer import AnswerGenerator, sanitize_for_chatwork
-from .chatwork import ChatworkClient
+from .chatwork import ChatworkClient, OneShotCache
 from .config import Config
 from .cost import CostTracker
 from .handbook import HandbookLoader
@@ -345,19 +345,22 @@ class DiscussionWatcher:
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     config = Config.load()
+    # 3つの処理が同じルームを見に行くことがあるため、取得は1回にまとめる。
+    # 包みの寿命はこの実行だけ（次の巡回では取り直す）
+    chatwork = OneShotCache(ChatworkClient(config.chatwork_api_token or ""))
     # レターパックの取次ぎも同じタイマーに相乗りする（タイマーを増やさない）。
     # 片方が落ちてももう片方は動かす
     try:
         from .letterpack import LetterpackFollower
 
-        LetterpackFollower(config).run_once()
+        LetterpackFollower(config, chatwork=chatwork).run_once()
     except Exception:
         print("[error] レターパックの追跡に失敗: " + traceback.format_exc(), flush=True)
     try:
-        archive_rooms(config)
+        archive_rooms(config, chatwork)
     except Exception:
         print("[error] 過去ログの保存に失敗: " + traceback.format_exc(), flush=True)
-    DiscussionWatcher(config).run_once()
+    DiscussionWatcher(config, chatwork=chatwork).run_once()
 
 
 def archive_rooms(config: Config, chatwork: Any | None = None) -> dict[int, int]:

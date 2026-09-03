@@ -290,3 +290,91 @@ class TestSecretsAreNotCopiedAround:
         record = audit.records[-1]
         assert record["type"] == "chatlog_answer"
         assert "new222" not in json.dumps(record, ensure_ascii=False)
+
+
+class TestOneFetchPerRoom:
+    """巡回では3つの処理が同じルームを見に行く。取得は1回にまとめる。"""
+
+    def test_the_cache_fetches_each_room_once(self):
+        from raizuinu.chatwork import OneShotCache
+
+        calls = []
+
+        class FakeClient:
+            def get_recent_messages(self, room_id, limit=20):
+                calls.append((room_id, limit))
+                return [message(i, f"発言{i}", "2026-06-20 09:00") for i in range(100)]
+
+            def get_me(self):
+                calls.append("me")
+                return 11574026
+
+            def send_message(self, room_id, body):
+                return "1"
+
+        cache = OneShotCache(FakeClient())
+        # 件数が違っても取り直さない（本体は常に100件取って切って返す）
+        assert len(cache.get_recent_messages(ROOM, limit=30)) == 30
+        assert len(cache.get_recent_messages(ROOM, limit=100)) == 100
+        assert len(cache.get_recent_messages(ROOM, limit=50)) == 50
+        cache.get_me()
+        cache.get_me()
+        assert calls == [(ROOM, 100), "me"]  # ルーム1回、自分の確認も1回
+
+    def test_different_rooms_are_fetched_separately(self):
+        from raizuinu.chatwork import OneShotCache
+
+        calls = []
+
+        class FakeClient:
+            def get_recent_messages(self, room_id, limit=20):
+                calls.append(room_id)
+                return []
+
+        cache = OneShotCache(FakeClient())
+        cache.get_recent_messages(ROOM)
+        cache.get_recent_messages(OTHER_ROOM)
+        cache.get_recent_messages(ROOM)
+        assert calls == [ROOM, OTHER_ROOM]
+
+    def test_other_operations_pass_straight_through(self):
+        from raizuinu.chatwork import OneShotCache
+
+        sent = []
+
+        class FakeClient:
+            def send_message(self, room_id, body):
+                sent.append((room_id, body))
+                return "999"
+
+        cache = OneShotCache(FakeClient())
+        assert cache.send_message(ROOM, "本文") == "999"
+        assert sent == [(ROOM, "本文")]
+
+    def test_a_whole_run_touches_the_shared_room_once(self, tmp_path, monkeypatch):
+        """過去ログの保存と議論の巡回が、同じルームを2回取りに行かないこと。"""
+        from raizuinu.chatwork import OneShotCache
+        from raizuinu.watcher import DiscussionWatcher, archive_rooms
+
+        calls = []
+
+        class FakeClient:
+            def get_recent_messages(self, room_id, limit=20):
+                calls.append(room_id)
+                return [message(1, "共有された発言です", "2026-06-20 09:00")]
+
+            def get_me(self):
+                return 999
+
+        config = make_config(tmp_path, rooms=(ROOM,))
+        config.data["discussion_watch"] = {
+            "enabled": True, "room_ids": [ROOM], "mode": "shadow",
+            "max_batch_messages": 30, "min_message_chars": 10,
+        }
+        chatwork = OneShotCache(FakeClient())
+        archive_rooms(config, chatwork)
+        DiscussionWatcher(
+            config, chatwork=chatwork, generator=object(), screen_client=object(),
+            handbook_loader=object(),
+        ).run_once()
+        assert calls == [ROOM]  # 2回ではなく1回

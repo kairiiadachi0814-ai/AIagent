@@ -109,6 +109,39 @@ class ChatworkClient:
             )
 
 
+class OneShotCache:
+    """1回の巡回のあいだ、同じルームの取得を1度で済ませる包み。
+
+    巡回では過去ログの保存・レターパックの追跡・議論の見回りが、同じルームを
+    それぞれ見に行くことがある。取得はAPIの回数を使うだけなので1回にまとめる。
+
+    寿命は1回の実行だけにすること。常駐プロセスで使い回すと、古い内容を
+    掴んだまま動き続けることになる。
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+        self._messages: dict[int, list[dict[str, Any]]] = {}
+        self._me: int | None = None
+
+    def get_recent_messages(self, room_id: int, limit: int = 20) -> list[dict[str, Any]]:
+        room_id = int(room_id)
+        if room_id not in self._messages:
+            # 本体は常に最新100件を取り、呼び出し側の件数で切って返す。
+            # まとめて持っておけば、より多い件数を求められても取り直さずに済む
+            self._messages[room_id] = self._client.get_recent_messages(room_id, limit=100)
+        return self._messages[room_id][-limit:]
+
+    def get_me(self) -> int:
+        if self._me is None:
+            self._me = self._client.get_me()
+        return self._me
+
+    def __getattr__(self, name: str) -> Any:
+        # 送信など、まとめる意味のない操作はそのまま本体へ渡す
+        return getattr(self._client, name)
+
+
 def _multipart(filename: str, data: bytes, message: str) -> tuple[bytes, str]:
     """multipart/form-dataの本文を自前で組む。
 
