@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from raizuinu.config import Config
+from raizuinu.phrasing import BANKS
 from raizuinu.faxwatch import (
     ASK_DONE,
     JST,
@@ -454,8 +455,11 @@ class TestFollowUp:
         )
         w.clock.now = at(2026, 9, 4, 9, 0)
         w.run_once()
-        assert len(w._chatwork.sent) == 1
+        assert len(w._chatwork.sent) == 2  # 通知と、報告へのお礼だけ（朝の確認は無い）
         assert w._load_state()["open"] == []
+        thanks = bodies(w)[1]
+        assert thanks.startswith(f"[rp aid={SHINODA} to={FAX_ROOM}-9500]\n")  # 相手の報告に返す
+        assert thanks.split("\n", 1)[1] in BANKS["fax_done_thanks"]
 
     def test_a_plain_done_message_also_counts(self, tmp_path):
         # 返信タグ無しで「確認完了しました」と書かれても済んだと読む
@@ -463,7 +467,29 @@ class TestFollowUp:
         w._chatwork.messages.append(human(9500, "確認完了しました", ADACHI))
         w.clock.now = at(2026, 9, 4, 9, 0)
         w.run_once()
-        assert len(w._chatwork.sent) == 1
+        assert len(w._chatwork.sent) == 2
+        assert bodies(w)[1].startswith(f"[rp aid={ADACHI} to={FAX_ROOM}-9500]")
+
+    def test_one_report_closing_two_orders_gets_one_thanks(self, tmp_path):
+        msgs = [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT),
+                bot(3, NOTICE_NO_SENDER.replace("4950", "4960")),
+                bot(4, ATTACHMENT.replace("4950", "4960"))]
+        w = watcher(tmp_path, msgs, ORDER)
+        prime(w)
+        assert w.run_once() == 2
+        w._chatwork.messages.append(human(9500, "2件とも対応完了です"))
+        w.run_once()
+        assert len(w._chatwork.sent) == 3  # お礼は1回
+        assert w._load_state()["open"] == []
+        w.clock.now = at(2026, 9, 4, 9, 0)
+        w.run_once()
+        assert len(w._chatwork.sent) == 3
+
+    def test_thanks_wording_never_reads_as_a_completion_report(self):
+        # お礼の文が「完了」の報告と誤読されると、自分の投稿で発注書を閉じてしまう
+        for phrase in BANKS["fax_done_thanks"]:
+            assert not is_completion(phrase), phrase
+            assert "ありがとう" in phrase
 
     def test_still_working_is_not_done(self, tmp_path):
         w = self.order(tmp_path)
@@ -492,7 +518,8 @@ class TestFollowUp:
         )
         w.clock.now = at(2026, 9, 4, 12, 0)
         w.run_once()
-        assert len(w._chatwork.sent) == 2
+        assert len(w._chatwork.sent) == 3  # 通知・朝の確認・お礼。昼の再確認は無い
+        assert "ありがとう" in bodies(w)[2]
 
     def test_the_bots_own_wording_is_not_mistaken_for_a_reply(self, tmp_path):
         # 自IDが取れないときも、自分の通知文（「対応完了」とお知らせください）で閉じない

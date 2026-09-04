@@ -293,12 +293,14 @@ class FaxWatcher:
         cost: Any | None = None,
         directory: PartnerDirectory | None = None,
         now: Callable[[], datetime] | None = None,
+        phrasebook: Any | None = None,
     ) -> None:
         self._config = config
         self._chatwork = chatwork
         self._client = client
         self._cost = cost
         self._now = now or (lambda: datetime.now(JST))
+        self._phrasebook = phrasebook
         if http_get is None:
             import requests
 
@@ -494,6 +496,7 @@ class FaxWatcher:
             return
         me = self._me()
         remaining = []
+        thanked: set[str] = set()
         for thread in threads:
             ids = {str(thread.get("posted_id")), str(thread.get("pdf_id"))} | {
                 str(c) for c in thread.get("check_ids") or []
@@ -526,7 +529,26 @@ class FaxWatcher:
                     "stage": int(thread.get("stage", 0)),
                 }
             )
+            # 報告には一言返す。1つの「完了」で複数の発注書が閉じても、お礼は1回
+            closer_id = str(closer.get("message_id"))
+            if closer_id not in thanked:
+                thanked.add(closer_id)
+                self._thank(room_id, closer)
         state["open"] = remaining
+
+    def _thank(self, room_id: int, message: dict) -> None:
+        """完了の報告に、相手のメッセージへの返信で礼を言う（黙って閉じない）。"""
+        try:
+            if self._phrasebook is None:
+                from .phrasing import build
+
+                self._phrasebook = build(self._config)
+            tag = f"[rp aid={_account_of(message)} to={room_id}-{message.get('message_id')}]"
+            self._chatwork.send_message(
+                room_id, f"{tag}\n{self._phrasebook.pick('fax_done_thanks', scope=str(room_id))}"
+            )
+        except Exception:
+            print("[warn] 完了報告への返事に失敗: " + traceback.format_exc(), flush=True)
 
     def _follow_up(self, state: dict, room_id: int, notifier: int, now: datetime) -> None:
         """返事の無い発注書を、翌営業日の朝と昼に一度ずつ聞く。"""
