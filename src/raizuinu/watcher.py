@@ -360,6 +360,12 @@ def main() -> None:
         archive_rooms(config, chatwork)
     except Exception:
         print("[error] 過去ログの保存に失敗: " + traceback.format_exc(), flush=True)
+    try:
+        from .faxwatch import FaxWatcher
+
+        FaxWatcher(config, chatwork).run_once()
+    except Exception:
+        print("[error] FAXの見張りに失敗: " + traceback.format_exc(), flush=True)
     DiscussionWatcher(config, chatwork=chatwork).run_once()
 
 

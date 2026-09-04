@@ -101,6 +101,16 @@
   "webhook_async": true,
   "webhook_max_concurrency": 2,
   "webhook_max_queue": 10,
+  "fax_watch": {
+    "enabled": true,
+    "_note": "room_id は許可ルームに入れない（巡回と投稿だけ）。台帳は「リンクを知っている全員が閲覧可」の共有が必要",
+    "room_id": 446282163,
+    "notifier_account_id": 10294683,
+    "notify_account_ids": [9228914, 6945415],
+    "directory_csv_url": "https://docs.google.com/spreadsheets/d/1cOIYTuhBV3Je9PZtl8gz4DIbNKES0hrtBn-5nOQgO9M/export?format=csv",
+    "max_pdf_mb": 15,
+    "max_per_day": 50
+  },
   "chat_archive": {
     "enabled": true,
     "room_ids": [384793683, 444945031, 444781726],

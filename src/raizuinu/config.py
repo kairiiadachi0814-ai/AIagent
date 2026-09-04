@@ -154,6 +154,21 @@ _DEFAULTS: dict[str, Any] = {
         # 1回の照会でモデルに読ませる発言の数
         "max_hits": 8,
     },
+    # FAX受信の見張り。通知ボットが流すPDFを読んで、差出人と内容を知らせる。
+    # room_id は許可ルーム（Q&Aの対象）に入れない。巡回と投稿だけに使う
+    "fax_watch": {
+        "enabled": False,
+        "room_id": 0,
+        # 通知ボット（通知管理くん）のアカウントID。この発言だけを見る
+        "notifier_account_id": 0,
+        # 知らせる相手
+        "notify_account_ids": [],
+        # FAX番号→取引先名の台帳（Googleスプレッドシートの公開CSV書き出し）
+        "directory_csv_url": "",
+        "max_pdf_mb": 15,
+        # 迷惑FAXが大量に来ても費用が青天井にならないよう、1日の処理数を切る
+        "max_per_day": 50,
+    },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {
         "enabled": False,
