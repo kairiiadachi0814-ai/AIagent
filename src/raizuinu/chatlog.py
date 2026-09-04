@@ -58,6 +58,41 @@ def search_terms(question: str) -> list[str]:
     return terms
 
 
+# 表示名に書き足された勤務状況（「足立 海里　資料作成集中（急ぎ案件のみ対応可）※土日休」）。
+# そのまま「〜さんの発言」と書くと、断り書きが読みづらくなる
+_NAME_NOISE_RE = re.compile(r"[（(【\[<].*?[）)】\]>]|[※≪＜㊡].*$|[／/|｜].*$")
+# 括弧を外すと日付が名前に直結することがある（「坂口 美代子7月2日休み」）
+_NAME_DATE_RE = re.compile(r"\d{1,2}\s*[月/]\s*\d{1,2}.*$")
+# 日本語が1文字も無い答えは、値だけを返している（「hB6HdhjT0b」など）
+_JAPANESE_RE = re.compile(r"[ぁ-んァ-ヶ一-龥]")
+
+
+def clean_name(display_name: str) -> str:
+    """表示名から勤務状況などの書き足しを落とし、名前の部分だけ残す。
+
+    「足立 海里　資料作成集中（急ぎ案件のみ対応可）　※土日休」→「足立 海里」
+    姓名は空白で区切られるため、括弧書き・日付を外したうえで先頭2語まで採る。
+    """
+    name = _NAME_NOISE_RE.sub("", str(display_name or ""))
+    name = _NAME_DATE_RE.sub("", name)
+    parts = [p for p in re.split(r"[\s　]+", name.strip()) if p]
+    return " ".join(parts[:2]) or str(display_name or "").strip()
+
+
+def as_sentence(answer: str) -> str:
+    """値だけの答えを、人の受け答えとして読める形にする。
+
+    話し方はプロンプトで指示しているが、値だけが返ってくることがある。
+    そのまま流すと「hB6HdhjT0b」の一言だけになるため、最後の砦として文にする。
+    """
+    text = str(answer or "").strip()
+    if not text:
+        return text
+    if _JAPANESE_RE.search(text):
+        return text
+    return f"{text} です。"
+
+
 class ChatArchive:
     """見えた発言を貯めておく置き場（SQLite）。
 
@@ -210,7 +245,19 @@ LOOKUP_SYSTEM = """あなたは社内チャットの過去ログから答えを�
 - 値（パスワード・番号・URL・金額・日付）は発言のとおり一字一句正確に写す
 - 答えが見つからなければ has_answer を false にする。近そうな別の話題で
   埋め合わせない
-- 答えは短く。前置きや言い訳を書かない
+
+話し方:
+- 社内の気さくで頼れる経理の先輩が、隣の席からさらっと教えてくれるような
+  です・ます調にする。かしこまりすぎない
+- **値だけを書いてはならない。** 何についての値かが分かる文にすること。
+  「hB6HdhjT0b」のように値だけ返すと、人の受け答えとして噛み合わない
+- 質問を受け止める一言から入ってよい。書き出しは毎回変えること
+- 例（そのまま使い回さず、質問に合わせて組み立て直すこと）:
+    「au payマーケットのパスワードは hB6HdhjT0b です。」
+    「はい、控えがありました。ID は rise-keiri、パスワードは xxxx です。」
+    「振込先の口座、南都銀行 本店営業部 普通 1234567 でした。」
+- 1〜2文で足ります。長い前置きや言い訳は書かない
+- 絵文字・顔文字は使わない
 """
 
 
@@ -291,12 +338,13 @@ class ChatLogAnswerer:
     @staticmethod
     def _format(found: dict[str, Any], used: dict[str, Any], superseded: bool) -> str:
         """答えの末尾に、過去ログから拾ったことを必ず書く。"""
-        when = datetime.fromtimestamp(used["send_time"], JST).strftime("%Y年%m月%d日")
+        answer = as_sentence(str(found.get("answer", "")))
+        when = datetime.fromtimestamp(used["send_time"], JST)
         note = (
-            f"※このルームの過去のやり取りを遡ってお答えしています"
-            f"（{when} の{used['name']}さんの発言より）。"
+            f"※このルームの過去のやり取りから拾っています"
+            f"（{when.year}年{when.month}月{when.day}日 {clean_name(used['name'])}さんの発言）。"
         )
         if superseded:
-            note += "同じ内容の古い発言もありましたが、最新のものを採用しています。"
-        note += "その後に変更されている可能性もあるため、念のためご確認ください。"
-        return f"{str(found.get('answer', '')).strip()}\n\n{note}"
+            note += "同じ話が何度か出ていたので、いちばん新しいものを採っています。"
+        note += "その後に変わっているかもしれないので、うまくいかなければ教えてください。"
+        return f"{answer}\n\n{note}"

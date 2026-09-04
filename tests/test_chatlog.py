@@ -154,9 +154,9 @@ class TestLookup:
         assert "new222" in text
         assert "old111" not in text
         # 過去ログから答えたことを必ず書く（ご指示）
-        assert "過去のやり取りを遡ってお答えしています" in text
-        assert "2026年06月20日 の足立 海里さんの発言より" in text
-        assert "最新のものを採用しています" in text
+        assert "過去のやり取りから拾っています" in text
+        assert "2026年6月20日 足立 海里さんの発言" in text
+        assert "いちばん新しいものを採っています" in text
         assert meta["used_message_id"] == "2"
         assert usage["input_tokens"] == 800
 
@@ -378,3 +378,65 @@ class TestOneFetchPerRoom:
             handbook_loader=object(),
         ).run_once()
         assert calls == [ROOM]  # 2回ではなく1回
+
+
+class TestItReadsLikeAPerson:
+    """実例（2026-09-04）: 「au payマーケットのパスワードってなに？」に対し、
+    パスワードだけを1行で返してしまった。人の受け答えとして噛み合わない。
+    """
+
+    def test_the_prompt_forbids_returning_a_bare_value(self):
+        from raizuinu.chatlog import LOOKUP_SYSTEM
+
+        assert "値だけを書いてはならない" in LOOKUP_SYSTEM
+        assert "です・ます調" in LOOKUP_SYSTEM
+        assert "書き出しは毎回変える" in LOOKUP_SYSTEM
+
+    @pytest.mark.parametrize(
+        "answer,expected",
+        [
+            ("hB6HdhjT0b", "hB6HdhjT0b です。"),          # 値だけ返ってきたら文にする
+            ("rise-keiri / xxxx", "rise-keiri / xxxx です。"),
+            ("au payマーケットのパスワードは hB6HdhjT0b です。",
+             "au payマーケットのパスワードは hB6HdhjT0b です。"),  # 文ならそのまま
+            ("", ""),
+        ],
+    )
+    def test_a_bare_value_is_made_into_a_sentence(self, answer, expected):
+        from raizuinu.chatlog import as_sentence
+
+        assert as_sentence(answer) == expected
+
+    @pytest.mark.parametrize(
+        "display,expected",
+        [
+            ("足立 海里　資料作成集中（急ぎ案件のみ対応可）　※土日休", "足立 海里"),
+            ("坂田 美穂　休:土日祝", "坂田 美穂"),
+            ("坂口　美代子【土・日曜日◆祝日】7月2日休み", "坂口 美代子"),
+            ("福本　明日香 (休)土日祝", "福本 明日香"),
+            ("札葉美早㊡土日祝", "札葉美早"),
+            ("中浦 祐子", "中浦 祐子"),
+        ],
+    )
+    def test_work_status_is_stripped_from_the_name(self, display, expected):
+        # 「足立 海里　資料作成集中（急ぎ案件のみ対応可）　※土日休さんの発言より」は読みづらい
+        from raizuinu.chatlog import clean_name
+
+        assert clean_name(display) == expected
+
+    def test_the_whole_reply_reads_as_a_sentence(self, tmp_path):
+        store = archive(tmp_path)
+        store.record(ROOM, [
+            message(1, "au payマーケットのパスワードは hB6HdhjT0b です", "2026-09-01 10:00",
+                    name="足立 海里　資料作成集中（急ぎ案件のみ対応可）　※土日休"),
+        ])
+        answerer = ChatLogAnswerer(
+            make_config(tmp_path), store,
+            client=fake_client({"has_answer": True, "answer": "hB6HdhjT0b",
+                                "used_index": 0, "superseded": False}),
+        )
+        text, _, _ = answerer.lookup(ROOM, "au payマーケットのパスワードってなに？")
+        head = text.splitlines()[0]
+        assert head == "hB6HdhjT0b です。"       # 値だけの行にはしない
+        assert "資料作成集中" not in text          # 勤務状況を持ち込まない
+        assert "2026年9月1日 足立 海里さんの発言" in text

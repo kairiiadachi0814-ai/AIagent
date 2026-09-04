@@ -126,3 +126,39 @@ class TestWhatMustNotVary:
         joined = " ".join(p for options in BANKS.values() for p in options)
         for forbidden in ("出典", "税理士", "弁護士", "一般的な会計知識", "ひな形"):
             assert forbidden not in joined
+
+
+class TestEveryUserFacingPromptHasATone:
+    """利用者に直接届く文を書かせるプロンプトは、必ず話し方を指示していること。
+
+    指示が無い経路は機械的な返答になる。実例（2026-09-04）: 過去ログ照会の
+    プロンプトに話し方が無く、パスワードだけを1行で返してしまった。
+    """
+
+    def prompts(self):
+        from raizuinu.answer import SYSTEM_INSTRUCTIONS as qa
+        from raizuinu.chatlog import LOOKUP_SYSTEM as chatlog
+        from raizuinu.doctask import SYSTEM_PROMPT as doctask
+        from raizuinu.guest import SYSTEM_PROMPT as guest
+
+        return {"Q&A": qa, "過去ログ照会": chatlog, "文書タスク": doctask, "部外応対": guest}
+
+    @pytest.mark.parametrize("name", ["Q&A", "過去ログ照会", "文書タスク", "部外応対"])
+    def test_the_prompt_says_how_to_speak(self, name):
+        prompt = self.prompts()[name]
+        assert "です・ます" in prompt, name
+
+    @pytest.mark.parametrize("name", ["Q&A", "過去ログ照会", "文書タスク", "部外応対"])
+    def test_the_prompt_asks_for_variety(self, name):
+        # 同じ型が続くと、機械が定型文を返しているように読める
+        prompt = self.prompts()[name]
+        assert re.search(r"(毎回.{0,8}変え|使い回さず|同じ.{0,10}にしない)", prompt), name
+
+    def test_the_letterpack_request_stays_fixed(self):
+        # 他部署が読む依頼文は、揺らがず揃っていたほうがよい
+        from raizuinu.letterpack import build_request_text
+
+        detail = {"company": "株式会社A", "to_lines": ["株式会社B"], "items": [], "staff": "足立"}
+        assert build_request_text(detail, 1, "レターパックライト") == build_request_text(
+            detail, 1, "レターパックライト"
+        )
