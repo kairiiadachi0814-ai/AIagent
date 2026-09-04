@@ -440,3 +440,23 @@ class TestItReadsLikeAPerson:
         assert head == "hB6HdhjT0b です。"       # 値だけの行にはしない
         assert "資料作成集中" not in text          # 勤務状況を持ち込まない
         assert "2026年9月1日 足立 海里さんの発言" in text
+
+    def test_the_whole_message_is_shown_to_the_model(self, tmp_path):
+        """「パスワード教えて。前にこのチャットで共有した様な気がする。」の
+        2行目にも応じられるよう、メッセージ全体を渡していること。
+        """
+        store = archive(tmp_path)
+        store.record(ROOM, [
+            message(1, "au payマーケットのパスワードは hB6HdhjT0b です", "2026-09-01 10:00"),
+        ])
+        client = fake_client({"has_answer": True, "answer": "はい、ありました。",
+                              "used_index": 0, "superseded": False})
+        ChatLogAnswerer(make_config(tmp_path), store, client=client).lookup(
+            ROOM, "au payマーケットのパスワード教えて。\n前にこのチャットで共有した様な気がする。"
+        )
+        prompt = client.kwargs["messages"][0]["content"]
+        assert "前にこのチャットで共有した様な気がする。" in prompt
+        assert prompt.startswith("相手のメッセージ:")  # 「質問」ではなくメッセージとして渡す
+        system = client.kwargs["system"]
+        assert "値を尋ねる以外に書いていることにも、必ず一言応じる" in system
+        assert "本文で言い直さなくてよい" in system  # 日付は末尾の断り書きに入る

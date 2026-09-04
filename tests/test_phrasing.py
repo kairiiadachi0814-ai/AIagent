@@ -162,3 +162,11 @@ class TestEveryUserFacingPromptHasATone:
         assert build_request_text(detail, 1, "レターパックライト") == build_request_text(
             detail, 1, "レターパックライト"
         )
+
+    @pytest.mark.parametrize("name", ["Q&A", "過去ログ照会", "文書タスク"])
+    def test_the_prompt_asks_it_to_answer_the_whole_message(self, name):
+        """実例（2026-09-04）: 「パスワード教えて。前にこのチャットで共有した
+        様な気がする。」の2行目に触れず、値だけ返してしまった。
+        """
+        prompt = self.prompts()[name]
+        assert re.search(r"(一緒に書いている|相手が書いた|一言応じる|一言応じること)", prompt), name
