@@ -459,13 +459,16 @@ class FaxWatcher:
             sender, basis = "", ""
 
         is_order = bool(found.get("is_order"))
+        kind = str(found.get("kind") or "その他")
         text = self._compose(found, sender, basis, number, notice, filename, ask_done and is_order)
         from .answer import sanitize_for_chatwork
 
         reply_tag = f"[rp aid={int(item.get('account_id', 0))} to={room_id}-{item['message_id']}]"
-        posted_id = self._chatwork.send_message(
-            room_id, f"{reply_tag}\n{self._heads()}\n" + sanitize_for_chatwork(text)
-        )
+        # 案内・広告などは呼び出さず、ルームに置くだけ（To を付けると通知が鳴る）
+        mention_kinds = set(settings.get("mention_kinds") or [])
+        heads = self._heads() if (is_order or kind in mention_kinds) else ""
+        parts = [reply_tag] + ([heads] if heads else []) + [sanitize_for_chatwork(text)]
+        posted_id = self._chatwork.send_message(room_id, "\n".join(parts))
         self._audit(
             {
                 "type": "fax_notice",
@@ -483,7 +486,7 @@ class FaxWatcher:
             "posted_id": str(posted_id or ""),
             "is_order": is_order,
             "sender": sender,
-            "kind": str(found.get("kind") or "FAX"),
+            "kind": kind,
             "filename": filename,
         }
 

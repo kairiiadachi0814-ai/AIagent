@@ -73,6 +73,7 @@ def make_config(tmp_path):
         "enabled": True, "room_id": FAX_ROOM, "notifier_account_id": NOTIFIER,
         "notify_account_ids": [SHINODA, ADACHI], "directory_csv_url": CSV_URL,
         "max_pdf_mb": 15, "max_per_day": 50,
+        "mention_kinds": ["発注書", "注文書", "請求書", "見積書", "納品書"],
         "notify_window": {"start": "08:30", "end": "19:30"},
         "follow_up": {"enabled": True, "check_time": "09:00", "recheck_time": "12:00"},
     }
@@ -299,6 +300,25 @@ class TestNotifying:
         assert "特定できませんでした（送信元番号なし" in body
         assert "■発注内容" not in body
         assert ASK_DONE not in body  # 発注書でなければ返事は求めない
+        assert "[To:" not in body  # 広告で呼び出さない（ルームに置くだけ）
+        assert body.startswith(f"[rp aid={NOTIFIER} to={FAX_ROOM}-2]\nFAXが届きました")  # 空行を残さない
+
+    @pytest.mark.parametrize("kind", ["請求書", "見積書", "納品書", "注文書"])
+    def test_business_documents_still_call_people(self, tmp_path, kind):
+        payload = {**AD, "kind": kind, "sender": "光パックス石川", "summary": f"{kind}です。"}
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], payload)
+        prime(w)
+        w.run_once()
+        body = bodies(w)[0]
+        assert f"[To:{SHINODA}]" in body and f"[To:{ADACHI}]" in body
+        assert f"光パックス石川からFAXが届きました（{kind}）" in body
+
+    @pytest.mark.parametrize("kind", ["案内", "その他"])
+    def test_notices_and_the_rest_are_posted_quietly(self, tmp_path, kind):
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], {**AD, "kind": kind})
+        prime(w)
+        w.run_once()
+        assert "[To:" not in bodies(w)[0]
 
     def test_the_same_fax_is_not_announced_twice(self, tmp_path):
         w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], ORDER)

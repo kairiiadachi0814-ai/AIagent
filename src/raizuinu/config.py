@@ -163,6 +163,8 @@ _DEFAULTS: dict[str, Any] = {
         "notifier_account_id": 0,
         # 知らせる相手
         "notify_account_ids": [],
+        # To を付けて呼び出す文書の種類。案内・広告・その他は To 無しでルームに置くだけ
+        "mention_kinds": ["発注書", "注文書", "請求書", "見積書", "納品書"],
         # FAX番号→取引先名の台帳（Googleスプレッドシートの公開CSV書き出し）
         "directory_csv_url": "",
         "max_pdf_mb": 15,
