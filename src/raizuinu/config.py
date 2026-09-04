@@ -168,6 +168,12 @@ _DEFAULTS: dict[str, Any] = {
         "max_pdf_mb": 15,
         # 迷惑FAXが大量に来ても費用が青天井にならないよう、1日の処理数を切る
         "max_per_day": 50,
+        # 知らせる時間帯（月〜金）。外れた分は取っておき、次の時間帯の頭に知らせる。
+        # 土日は流さない。祝日は平日と同じに扱う（祝日も業務があるため）
+        "notify_window": {"start": "08:30", "end": "19:30"},
+        # 発注書・注文書の見届け。「対応完了」の返事が無ければ翌営業日の check_time に
+        # 済んだかを聞き、それにも返事が無ければ recheck_time にもう一度だけ聞く
+        "follow_up": {"enabled": True, "check_time": "09:00", "recheck_time": "12:00"},
     },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {
