@@ -58,7 +58,7 @@ git archive HEAD | ssh -i /c/Users/admin/.ssh/raizuinu_vps ubuntu@tk2-262-40529.
   "sudo -u raizuinu tar -x -C /opt/raizuinu/app && sudo systemctl restart raizuinu"
 ```
 
-依存パッケージ（requirements.txt）を変えた場合は、更新後に：
+依存パッケージ（requirements.txt）を変えた場合は、更新後に（2026-09-07: FAXの回転読みで `pypdf` を追加）：
 
 ```
 ssh -i /c/Users/admin/.ssh/raizuinu_vps ubuntu@tk2-262-40529.vs.sakura.ne.jp \

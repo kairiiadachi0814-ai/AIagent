@@ -95,6 +95,38 @@ def strip_tags(body: str) -> str:
     return _TAG_RE.sub("", str(body or ""))
 
 
+def rotate_pdf(data: bytes, degrees: int) -> bytes | None:
+    """全ページを時計回りに degrees 回したPDF。回せなければ None。
+
+    FAXは紙を逆さまに入れて送られてくることがあり、そのままではモデルが
+    読めない（実例 2026-09-05: 珍味屋の発注書が「その他」になった）。
+    """
+    try:
+        import pypdf
+    except ImportError:
+        print("[warn] pypdf が無いため、逆さまのFAXを回せません", flush=True)
+        return None
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        writer = pypdf.PdfWriter()
+        for page in reader.pages:
+            page.rotate(int(degrees))
+            writer.add_page(page)
+        out = io.BytesIO()
+        writer.write(out)
+        return out.getvalue()
+    except Exception:
+        print("[warn] PDFを回せませんでした: " + traceback.format_exc(), flush=True)
+        return None
+
+
+def _merge_usage(first: dict, second: dict) -> dict:
+    merged = dict(first or {})
+    for key, value in (second or {}).items():
+        merged[key] = merged.get(key, 0) + value
+    return merged
+
+
 def is_completion(body: str) -> bool:
     """「対応完了」「確認済です」など、済んだと読める返事か。"""
     text = unicodedata.normalize("NFKC", strip_tags(body))
@@ -253,8 +285,17 @@ READ_SCHEMA: dict[str, Any] = {
         },
         "due": {"type": "string", "description": "納期・希望日。書かれていなければ空文字"},
         "notes": {"type": "string", "description": "担当者名・連絡先・備考など、伝えるべき一言。無ければ空文字"},
+        "rotation": {
+            "type": "integer",
+            "enum": [0, 90, 180, 270],
+            "description": "文書を正しい向きで読むために時計回りに回す角度。上下逆さまなら180。正しい向きなら0",
+        },
+        "readable": {
+            "type": "boolean",
+            "description": "差出人・種類・内容の主要な項目が判読できたら true。逆さま・不鮮明・鏡像などでほとんど読めなければ false",
+        },
     },
-    "required": ["sender", "kind", "is_order", "summary", "items", "due", "notes"],
+    "required": ["sender", "kind", "is_order", "summary", "items", "due", "notes", "rotation", "readable"],
     "additionalProperties": False,
 }
 
@@ -268,6 +309,8 @@ READ_SYSTEM = """あなたは株式会社ライズクリエイション経理財
 - 発注してよいか・金額が妥当かなどの判断はしない。内容の整理だけを行う
 - FAXは画質が粗いことがある。自信の無い読み取りは summary で
   「（判読しづらい）」と添える
+- FAXは上下逆さまに送られてくることがある。逆さまなら rotation に 180 を入れ、
+  readable は false にしてよい（無理に読まなくてよい。こちらで回してから読み直す）
 """
 
 # 発注書の通知の末尾に添える一言。翌朝の確認を減らすため、返し方を示しておく
@@ -447,6 +490,17 @@ class FaxWatcher:
         data, filename = self._download(room_id, item["attachment"])
         found = self._read(data, filename)
         usage = found.pop("_usage", {})
+        rotated = 0
+        # 逆さま・判読不能なら、回してもう一度だけ読む（向きが分からなければ180）
+        rotation = int(found.get("rotation") or 0)
+        if rotation or not found.get("readable", True):
+            turned = rotate_pdf(data, rotation or 180)
+            if turned is not None:
+                again = self._read(turned, filename)
+                usage = _merge_usage(usage, again.pop("_usage", {}))
+                if again.get("readable", True) or not found.get("readable", True):
+                    found, rotated = again, rotation or 180
+        readable = bool(found.get("readable", True))
 
         # 差出人: 台帳で引けたらそれを正とする。無ければ文書の記載
         number = notice.get("sender_number", "")
@@ -458,15 +512,19 @@ class FaxWatcher:
         else:
             sender, basis = "", ""
 
-        is_order = bool(found.get("is_order"))
-        kind = str(found.get("kind") or "その他")
-        text = self._compose(found, sender, basis, number, notice, filename, ask_done and is_order)
+        is_order = bool(found.get("is_order")) and readable
+        kind = str(found.get("kind") or "その他") if readable else "不明"
+        if readable:
+            text = self._compose(found, sender, basis, number, notice, filename, ask_done and is_order)
+        else:
+            text = self._compose_unreadable(found, notice, filename)
         from .answer import sanitize_for_chatwork
 
         reply_tag = f"[rp aid={int(item.get('account_id', 0))} to={room_id}-{item['message_id']}]"
-        # 案内・広告などは呼び出さず、ルームに置くだけ（To を付けると通知が鳴る）
+        # 案内・広告などは呼び出さず、ルームに置くだけ（To を付けると通知が鳴る）。
+        # 読めなかったものは発注書かもしれないので呼び出す
         mention_kinds = set(settings.get("mention_kinds") or [])
-        heads = self._heads() if (is_order or kind in mention_kinds) else ""
+        heads = self._heads() if (is_order or not readable or kind in mention_kinds) else ""
         parts = [reply_tag] + ([heads] if heads else []) + [sanitize_for_chatwork(text)]
         posted_id = self._chatwork.send_message(room_id, "\n".join(parts))
         self._audit(
@@ -477,18 +535,41 @@ class FaxWatcher:
                 "filename": filename,
                 "sender": sender,
                 "basis": basis,
-                "kind": found.get("kind"),
+                "kind": kind,
                 "is_order": is_order,
+                "readable": readable,
+                "rotated": rotated,
                 "usage": usage,
             }
         )
         return {
             "posted_id": str(posted_id or ""),
             "is_order": is_order,
+            "readable": readable,
             "sender": sender,
             "kind": kind,
             "filename": filename,
         }
+
+    @staticmethod
+    def _compose_unreadable(found: dict, notice: dict, filename: str) -> str:
+        """回しても読めなかったとき。黙って「その他」にせず、人に見てもらう。"""
+        lines = [
+            f"FAX「{filename}」が届きましたが、こちらでは内容を読み取れませんでした（不鮮明などのため）。",
+            "お手数ですがPDFを直接ご確認ください。",
+        ]
+        seen = [str(found.get(k) or "").strip() for k in ("summary", "notes")]
+        seen = [s for s in seen if s]
+        if seen:
+            lines.append("")
+            lines.append("読み取れた範囲: " + " ".join(seen))
+        lines.append("")
+        meta = [f"ファイル: {filename}"]
+        received = notice.get("received_at", "")
+        if received:
+            meta.append(f"受信 {received}")
+        lines.append("（" + "／".join(meta) + "）")
+        return "\n".join(lines)
 
     # --- 発注書の見届け ---
 
@@ -702,7 +783,10 @@ class FaxWatcher:
         try:
             found = json.loads(text)
         except (json.JSONDecodeError, TypeError):
-            found = {"sender": "", "kind": "その他", "is_order": False, "summary": "", "items": [], "due": "", "notes": ""}
+            found = {
+                "sender": "", "kind": "その他", "is_order": False, "summary": "", "items": [],
+                "due": "", "notes": "", "rotation": 0, "readable": False,
+            }
         found["_usage"] = usage
         return found
 

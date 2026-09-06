@@ -5,3 +5,4 @@ pytest>=8.0.0
 icalendar>=6.0.0
 recurring-ical-events>=3.0.0
 google-auth>=2.30.0
+pypdf>=4.0.0

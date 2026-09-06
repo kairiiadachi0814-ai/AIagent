@@ -46,8 +46,28 @@ NOTICE_WITH_SENDER = (
 )
 ATTACHMENT = "[info][title][dtext:file_uploaded][/title][download:2153301583]4950_001.pdf (13.43 KB)[/download][/info]"
 ATTACHMENT_2 = "[info][title][dtext:file_uploaded][/title][download:2153301999]4951_001.pdf (21.0 KB)[/download][/info]"
-PDF = b"%PDF-1.4\n1 0 obj<</Type/Page>>endobj\n%%EOF"
 CSV = "FAX番号,取引先名\n0745787390,とくとく香芝SA下り\n0761768551,光パックス石川\n"
+
+
+def blank_pdf():
+    import io
+    import pypdf
+
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=200, height=280)
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+PDF = blank_pdf()
+
+
+def page_rotation(pdf_bytes):
+    import io
+    import pypdf
+
+    return pypdf.PdfReader(io.BytesIO(pdf_bytes)).pages[0].rotation
 
 
 def at(*args):
@@ -112,21 +132,37 @@ def fake_http(csv_text=CSV):
 
 
 def fake_client(payload):
-    response = SimpleNamespace(
-        stop_reason="end_turn",
-        content=[SimpleNamespace(type="text", text=json.dumps(payload, ensure_ascii=False))],
-        usage=SimpleNamespace(input_tokens=2000, output_tokens=200,
-                              cache_creation_input_tokens=0, cache_read_input_tokens=0),
-    )
-    client = SimpleNamespace(kwargs=None, calls=0)
+    """payload は1つの読み取り結果か、呼び出し順に返す結果のリスト（最後を繰り返す）。"""
+    payloads = list(payload) if isinstance(payload, list) else [payload]
+    client = SimpleNamespace(kwargs=None, calls=0, history=[])
 
     def create(**kwargs):
         client.kwargs = kwargs
+        client.history.append(kwargs)
+        found = {"rotation": 0, "readable": True, **payloads[min(client.calls, len(payloads) - 1)]}
         client.calls += 1
-        return response
+        return SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text=json.dumps(found, ensure_ascii=False))],
+            usage=SimpleNamespace(input_tokens=2000, output_tokens=200,
+                                  cache_creation_input_tokens=0, cache_read_input_tokens=0),
+        )
 
     client.messages = SimpleNamespace(create=create)
     return client
+
+
+def document_bytes(kwargs):
+    import base64
+
+    return base64.b64decode(kwargs["messages"][0]["content"][0]["source"]["data"])
+
+
+UPSIDE_DOWN = {"sender": "", "kind": "その他", "is_order": False, "rotation": 180, "readable": False,
+               "summary": "上下反転していて判読できない（判読しづらい）", "items": [], "due": "",
+               "notes": "TEL/FAX 06-6644-0780 の記載あり"}
+BLURRY = {"sender": "", "kind": "その他", "is_order": False, "rotation": 0, "readable": False,
+          "summary": "不鮮明で判読できない", "items": [], "due": "", "notes": ""}
 
 
 ORDER = {
@@ -370,6 +406,54 @@ class TestNotifying:
         w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], ORDER)
         w._config.data["fax_watch"]["enabled"] = False
         assert w.run_once() == 0
+
+
+class TestUpsideDown:
+    """実例（2026-09-05）: 珍味屋の天津栗発注書が逆さまに届き、「その他」で流れかけた。"""
+
+    def test_an_upside_down_fax_is_turned_and_read_again(self, tmp_path):
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)],
+                    [UPSIDE_DOWN, {**ORDER, "sender": "有限会社珍味屋"}])
+        prime(w)
+        assert w.run_once() == 1
+        assert w._client.calls == 2  # 回してもう一度だけ
+        assert page_rotation(document_bytes(w._client.history[0])) == 0
+        assert page_rotation(document_bytes(w._client.history[1])) == 180
+        body = bodies(w)[0]
+        assert "有限会社珍味屋から発注書が届きました" in body
+        assert f"[To:{SHINODA}]" in body
+        assert "判読できない" not in body
+        assert len(w._load_state()["open"]) == 1  # 発注書として見届ける
+
+    def test_a_readable_fax_is_read_only_once(self, tmp_path):
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], ORDER)
+        prime(w)
+        w.run_once()
+        assert w._client.calls == 1
+
+    def test_a_blurry_fax_is_tried_upside_down_then_handed_to_people(self, tmp_path):
+        # 向きが分からなくても180度回して一度試す。それでも読めなければ To 付きで人に渡す
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], [BLURRY, BLURRY])
+        prime(w)
+        w.run_once()
+        assert w._client.calls == 2
+        body = bodies(w)[0]
+        assert f"[To:{SHINODA}]" in body and f"[To:{ADACHI}]" in body  # 「その他」扱いで黙らない
+        assert "内容を読み取れませんでした" in body
+        assert "PDFを直接ご確認ください" in body
+        assert "読み取れた範囲: 不鮮明で判読できない" in body
+        assert "受信 2026/09/04 19:10:09" in body
+        assert w._load_state()["open"] == []  # 発注書かどうか分からないので催促はしない
+
+    def test_without_pypdf_the_first_reading_is_used(self, tmp_path, monkeypatch):
+        import raizuinu.faxwatch as module
+
+        monkeypatch.setattr(module, "rotate_pdf", lambda data, degrees: None)
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], [UPSIDE_DOWN, ORDER])
+        prime(w)
+        w.run_once()
+        assert w._client.calls == 1
+        assert "内容を読み取れませんでした" in bodies(w)[0]
 
 
 class TestNotifyWindow:
