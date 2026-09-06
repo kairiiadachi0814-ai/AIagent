@@ -305,7 +305,11 @@ READ_SYSTEM = """あなたは株式会社ライズクリエイション経理財
 厳守すること:
 - 文書に書かれていることだけを使う。書かれていないことを推測で補わない
 - 品名・数量・金額・納期・日付は文書のとおり一字一句正確に写す。丸めない
-- 読み取れない箇所は空文字にする。それらしい値を作らない
+- 読み取れない箇所は空文字にする。それらしい値を作らない。様式に金額欄が
+  無ければ amount は空文字のままでよい
+- 納品日が行ごとに違う様式（納品日と数量の表）なら、items は行ごとに分け、
+  name の先頭に納品日を付ける（例: 「6/5(金) 天津栗 焼冷凍10KG/CS」）。
+  due には納品日の範囲や一覧を入れる
 - 発注してよいか・金額が妥当かなどの判断はしない。内容の整理だけを行う
 - FAXは画質が粗いことがある。自信の無い読み取りは summary で
   「（判読しづらい）」と添える
@@ -825,9 +829,15 @@ class FaxWatcher:
         if found.get("is_order") and items:
             lines.append("")
             lines.append("■発注内容")
+            # 金額欄の無い様式（納品日と数量だけの注文票など）では、金額を
+            # 「読み取れず」と書かない。1行でも値がある列だけ空欄を指摘する
+            columns = [
+                key for key in ("quantity", "amount")
+                if any(str(i.get(key, "") or "").strip() for i in items)
+            ]
             for item in items:
                 bits = [str(item.get("name", "")).strip()]
-                for key in ("quantity", "amount"):
+                for key in columns:
                     value = str(item.get(key, "") or "").strip()
                     bits.append(value if value else "（読み取れず）")
                 lines.append("・" + "　".join(bits))

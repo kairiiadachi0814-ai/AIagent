@@ -317,6 +317,19 @@ class TestNotifying:
         assert f"to={FAX_ROOM}-2]" in body  # PDFの投稿への返信として付ける
         assert body.endswith(ASK_DONE)  # 返し方を示しておく
 
+    def test_a_form_without_prices_does_not_say_amounts_were_unreadable(self, tmp_path):
+        # 実例（2026-09-05）: 納品日と数量だけの注文票。金額欄そのものが無い
+        payload = {**ORDER, "items": [
+            {"name": "6/5(金) 天津栗 焼冷凍10KG/CS", "quantity": "2C/S", "amount": ""},
+            {"name": "6/26(金) 天津栗 焼冷凍10KG/CS", "quantity": "2C/S", "amount": ""},
+        ]}
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], payload)
+        prime(w)
+        w.run_once()
+        body = bodies(w)[0]
+        assert "・6/5(金) 天津栗 焼冷凍10KG/CS　2C/S\n" in body
+        assert "（読み取れず）" not in body
+
     def test_the_directory_wins_over_the_document(self, tmp_path):
         # 番号が台帳にあれば、文書の社名よりそちらを正とする
         w = watcher(tmp_path, [bot(1, NOTICE_WITH_SENDER), bot(2, ATTACHMENT_2)],
