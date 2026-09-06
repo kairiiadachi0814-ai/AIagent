@@ -146,7 +146,33 @@
     "unsynced_source": "Googleカレンダー",
     "unsynced_note": "（トヨクモ未反映）",
     "register_note": "※Googleカレンダーに登録しました。トヨクモ スケジューラーにも表示するには、個人設定＞他のカレンダーから読込 で「読込」を押してください（自動では反映されません）。",
-    "greeting": "おはようございます。"
+    "greeting": "おはようございます。",
+    "_members_note": "勤務日・勤務時間はChatworkの表示名（2026-09-07時点）から起こした暫定値。本人の予定は /etc/raizuinu/env の SCHEDULE_ICS_URL_<account_id>（トヨクモのiCal出力URL）を足すと読む。work_days は 0=月 … 4=金",
+    "members": [
+      { "name": "足立", "account_id": 6945415, "owner": true },
+      { "name": "篠田", "account_id": 9228914, "work_days": [0, 3, 4] },
+      { "name": "福本", "account_id": 9763216, "work_days": [0, 1, 2, 3, 4], "skip_holidays": true },
+      { "name": "中浦", "account_id": 10622368, "work_days": [0, 1, 2], "work_hours": { "start": "10:00", "end": "16:30" } },
+      { "name": "札葉", "account_id": 10675817, "work_days": [0, 1, 2, 3, 4], "skip_holidays": true },
+      { "name": "坂田", "account_id": 8681926, "work_days": [0, 1, 2, 3, 4], "skip_holidays": true },
+      { "name": "伊藤", "account_id": 9129422, "work_days": [3, 4] },
+      { "name": "奥田", "account_id": 9773899, "work_days": [0, 1, 2], "skip_holidays": true }
+    ],
+    "proposal": {
+      "enabled": true,
+      "work_hours": { "start": "09:00", "end": "18:00" },
+      "lunch": { "start": "12:00", "end": "13:00" },
+      "buffer_minutes": 15,
+      "default_minutes": 60,
+      "horizon_days": 14,
+      "max_candidates": 3,
+      "per_day": 2,
+      "skip_holidays": true,
+      "all_day_blocks": true,
+      "lead_minutes": 60,
+      "grid_minutes": 30,
+      "remember_minutes": 1440
+    }
   },
   "member_account_ids": [
     6945415,

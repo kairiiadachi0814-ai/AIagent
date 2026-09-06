@@ -65,6 +65,27 @@ ssh -i /c/Users/admin/.ssh/raizuinu_vps ubuntu@tk2-262-40529.vs.sakura.ne.jp \
   "sudo -u raizuinu /opt/raizuinu/venv/bin/pip install -r /opt/raizuinu/app/requirements.txt"
 ```
 
+## 他メンバーの予定を読む設定（2026-09-07追加・日程調整機能）
+
+日程調整（「篠田さんと打合せしたい、いつがいい？」）で他のメンバーの予定を見るには、
+本人にトヨクモ スケジューラーの iCal出力URL を出してもらい、`/etc/raizuinu/env` に
+`SCHEDULE_ICS_URL_<ChatworkのaccountID>=<URL>` を1行足して `sudo systemctl restart raizuinu`。
+URLは本人の全予定が読める秘密情報なので、チャットには貼らず、この環境変数だけで持つ。
+未設定の人は `config/config.json` の `schedule.members` の勤務日・勤務時間だけで見る。
+
+| 名前 | account_id | 環境変数 |
+|---|---|---|
+| 篠田 | 9228914 | `SCHEDULE_ICS_URL_9228914` |
+| 福本 | 9763216 | `SCHEDULE_ICS_URL_9763216` |
+| 中浦 | 10622368 | `SCHEDULE_ICS_URL_10622368` |
+| 札葉 | 10675817 | `SCHEDULE_ICS_URL_10675817` |
+| 坂田 | 8681926 | `SCHEDULE_ICS_URL_8681926` |
+| 伊藤 | 9129422 | `SCHEDULE_ICS_URL_9129422` |
+| 奥田 | 9773899 | `SCHEDULE_ICS_URL_9773899` |
+
+Googleカレンダーを共有してもらう場合は、サービスアカウントのメールアドレスに
+「予定の表示」で共有し、`schedule.members[].google_calendar_id` にカレンダーIDを書く。
+
 ## マニュアル更新報告の受付フロー（2026-08-13追加）
 
 メンバーがChatworkで経理財務アシスタントに「◯◯のマニュアルを更新した」とメンションすると：

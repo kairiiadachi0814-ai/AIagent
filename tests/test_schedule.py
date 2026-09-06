@@ -174,11 +174,19 @@ class TestRequestDetection:
             "明日14時から南都銀行と面談、予定に入れといて",
             "8/20の10時に月次会議で予定を登録して",
             "来週火曜終日、出張で予定押さえて",
+            "月曜10時から篠田さんと打合せを入れて",  # 「予定」と言わない頼み方
         ],
     )
     def test_registrations(self, question):
         assert looks_like_schedule_request(question, "足立") is True
         assert is_register_request(question) is True
+
+    @pytest.mark.parametrize(
+        "question",
+        ["会議の議事録を作って", "打合せの資料を追加して", "来週の会議の資料はどこ？"],
+    )
+    def test_meeting_words_alone_are_not_schedule(self, question):
+        assert looks_like_schedule_request(question, "足立") is False
 
     def test_cancel(self):
         assert is_cancel_request("さっきの予定を取り消して") is True

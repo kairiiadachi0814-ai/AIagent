@@ -126,6 +126,16 @@ class RaizuinuHandler:
             from .scheduletask import ScheduleRunner
 
             self._schedule = ScheduleRunner(cfg)
+        # 空き時間の提案と複数人の日程調整（予定機能の上に載る）
+        self._plan = overrides.get("plan")
+        if (
+            self._plan is None
+            and self._schedule is not None
+            and (cfg.schedule.get("proposal") or {}).get("enabled")
+        ):
+            from .scheduleplan import PlanRunner
+
+            self._plan = PlanRunner(cfg)
         self._letterpack = overrides.get("letterpack")
         if self._letterpack is None and cfg.letterpack.get("enabled"):
             from .letterpack import LetterpackRunner
@@ -348,8 +358,20 @@ class RaizuinuHandler:
             )
 
             owner = str(cfg.schedule.get("owner_name", ""))
-            if looks_like_schedule_request(question, owner):
-                writes = is_register_request(question) or is_cancel_request(question)
+            # 空き時間の提案（誰でも聞ける）と、出した候補からの登録（管理者だけ）
+            proposal = picks = False
+            if self._plan is not None:
+                from .scheduleplan import looks_like_proposal_request, pick_number
+
+                proposal = looks_like_proposal_request(question)
+                picks = pick_number(question) is not None and (
+                    self._plan.pending(event.room_id, event.account_id, int(event.send_time))
+                    is not None
+                )
+            if looks_like_schedule_request(question, owner) or proposal or picks:
+                writes = picks or (
+                    not proposal and (is_register_request(question) or is_cancel_request(question))
+                )
                 if writes and event.account_id not in set(cfg.admin_account_ids):
                     self._reply_and_audit(event, question, NOT_ADMIN_MESSAGE, "schedule_denied")
                     return
@@ -617,18 +639,58 @@ class RaizuinuHandler:
             return
 
         state_path = self._config.resolve_path(self._config.state_dir) / "schedule_last.json"
-        if is_cancel_request(question):
+        is_admin = event.account_id in set(self._config.admin_account_ids)
+        send_time = int(event.send_time)
+        plan_pending = None
+        number = None
+        if self._plan is not None:
+            from .scheduleplan import looks_like_proposal_request, pick_number
+
+            number = pick_number(question)
+            if number is not None:
+                plan_pending = self._plan.pending(event.room_id, event.account_id, send_time)
+
+        if plan_pending is not None and number is not None:
+            # 出した候補から番号で選んで登録（管理者だけ。関門は呼び出し側）
+            reply, meta, usage = self._plan.register_pick(plan_pending, number, self._schedule)
+            kind = "schedule_register"
+            if meta.get("registered"):
+                _write_json(state_path, {"registered": meta["registered"]})
+                self._plan.clear(event.room_id, event.account_id)
+        elif is_cancel_request(question):
             last = _read_json(state_path).get("registered") or []
             reply, meta, usage = self._schedule.cancel(last)
             kind = "schedule_cancel"
             if not meta.get("error"):
                 _write_json(state_path, {})
+        elif self._plan is not None and looks_like_proposal_request(question):
+            reply, meta, usage = self._plan.propose(
+                question, requester_id=event.account_id, is_admin=is_admin
+            )
+            kind = "schedule_propose"
+            self._plan.remember(event.room_id, event.account_id, send_time, meta)
         elif is_register_request(question):
-            reply, meta, usage = self._schedule.register(question)
+            # 相手の名前が出ていれば、登録の前にその人の予定と重ならないか確かめる
+            check = (
+                self._plan.conflict_check(question, event.account_id)
+                if self._plan is not None
+                else None
+            )
+            reply, meta, usage = self._schedule.register(question, check=check)
             kind = "schedule_register"
             if meta.get("registered"):
                 # 「さっきの予定を取り消して」で消せるよう直前の1件を覚えておく
                 _write_json(state_path, {"registered": meta["registered"]})
+            elif meta.get("error") == "conflict" and self._plan is not None:
+                # 代わりの候補を覚えておき、「1番で登録して」で選べるようにする
+                last = self._plan.last_check()
+                self._plan.remember(
+                    event.room_id, event.account_id, send_time,
+                    {
+                        "candidates": [c.as_dict() for c in last.get("candidates", [])],
+                        "summary": last.get("summary", ""),
+                    },
+                )
         else:
             reply, meta, usage = self._schedule.answer(question)
             kind = "schedule_answer"

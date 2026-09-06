@@ -105,6 +105,32 @@ _DEFAULTS: dict[str, Any] = {
         "unsynced_note": "（トヨクモ未反映）",
         "register_note": "",
         "greeting": "おはようございます。",
+        # 予定を見に行ける社内メンバー。name（苗字）・account_id・work_days（0=月）・
+        # work_hours・skip_holidays。本人の予定は環境変数 SCHEDULE_ICS_URL_<account_id>
+        # （トヨクモのiCal）か google_calendar_id から読む。無ければ勤務日だけで見る
+        "members": [],
+        # 空き時間の提案と複数人の日程調整。候補の日時はコードで決める
+        "proposal": {
+            "enabled": False,
+            "work_hours": {"start": "09:00", "end": "18:00"},
+            "lunch": {"start": "12:00", "end": "13:00"},
+            # 予定の前後に空ける余白（分）。移動や準備の時間
+            "buffer_minutes": 15,
+            "default_minutes": 60,
+            # 期間の指定が無いときに探す日数
+            "horizon_days": 14,
+            "max_candidates": 3,
+            "per_day": 2,
+            # 祝日を候補から外す（メンバー個別の設定は members[].skip_holidays）
+            "skip_holidays": True,
+            # 終日予定（出張・休暇など）はその日を丸ごと塞ぐ
+            "all_day_blocks": True,
+            # 今から何分後以降を候補にするか
+            "lead_minutes": 60,
+            "grid_minutes": 30,
+            # 出した候補を「1番で登録して」で使える時間（分）
+            "remember_minutes": 1440,
+        },
     },
     # 定型の受け答えに揺らぎを持たせる（社交辞令の部分だけ。回答本文・出典・
     # 免責文・金額などは対象外）。false にすると固定の言い回しに戻る

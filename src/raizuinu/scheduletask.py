@@ -50,6 +50,10 @@ _WHEN_RE = re.compile(
     r"(今日|本日|明日|あした|明後日|あさって|来週|再来週|今週|\d{1,2}\s*[/月]\s*\d{1,2}|"
     r"月曜|火曜|水曜|木曜|金曜|土曜|日曜)"
 )
+# 「予定」と言わずに打合せを入れる頼み方（「月曜10時から篠田さんと打合せを入れて」）。
+# 「会議の議事録を作って」を巻き込まないよう、登録の言葉と日時の手がかりも要る
+_MEETING_RE = re.compile(r"(打合せ|打ち合わせ|打合わせ|会議|ミーティング|MTG)", re.I)
+_TIME_HINT_RE = re.compile(r"\d{1,2}\s*時")
 
 NOT_ADMIN_MESSAGE = (
     "すみません、予定の登録は管理者の方からの依頼だけ受け付けています。"
@@ -75,6 +79,12 @@ def looks_like_schedule_request(question: str, owner_name: str = "") -> bool:
         return False
     if _SCHEDULE_NOUN_RE.search(question) and (
         _QUERY_RE.search(question) or _REGISTER_RE.search(question) or _CANCEL_RE.search(question)
+    ):
+        return True
+    if (
+        _MEETING_RE.search(question)
+        and (_REGISTER_RE.search(question) or _CANCEL_RE.search(question))
+        and (_WHEN_RE.search(question) or _TIME_HINT_RE.search(question))
     ):
         return True
     return bool(owner_name and owner_name in question and _WHEREABOUTS_RE.search(question))
@@ -188,8 +198,14 @@ class ScheduleRunner:
             {},
         )
 
-    def register(self, question: str) -> tuple[str, dict[str, Any], dict[str, int]]:
-        """予定を登録する（Googleカレンダーへ書き、内容を復唱する）。"""
+    def register(
+        self, question: str, check: Any | None = None
+    ) -> tuple[str, dict[str, Any], dict[str, int]]:
+        """予定を登録する（Googleカレンダーへ書き、内容を復唱する）。
+
+        check は登録前の関門（相手の予定との重なり確認など）。文面を返したら
+        登録せずにそれを返信する。
+        """
         writer = build_writer(self._config)
         if writer is None:
             return NO_WRITER_MESSAGE, {"error": "no_writer"}, {}
@@ -208,7 +224,25 @@ class ScheduleRunner:
                 meta,
                 usage,
             )
+        if check is not None:
+            blocked = check(events)
+            if blocked:
+                return blocked, {"error": "conflict", "events": [self._describe(e) for e in events]}, usage
+        reply, meta, _ = self._insert_all(writer, events, fields.get("opening"))
+        return reply, meta, usage
 
+    def register_events(
+        self, events: list[Event], opening: str = ""
+    ) -> tuple[str, dict[str, Any], dict[str, int]]:
+        """組み立て済みの予定をそのまま登録する（候補から選んだときなど。APIは使わない）。"""
+        writer = build_writer(self._config)
+        if writer is None:
+            return NO_WRITER_MESSAGE, {"error": "no_writer"}, {}
+        return self._insert_all(writer, events, opening)
+
+    def _insert_all(
+        self, writer: Any, events: list[Event], opening: Any
+    ) -> tuple[str, dict[str, Any], dict[str, int]]:
         registered: list[dict[str, str]] = []
         for event in events:
             try:
@@ -217,7 +251,7 @@ class ScheduleRunner:
                 return (
                     f"すみません、予定の登録でつまずきました。（{exc}）",
                     {"error": "insert_failed", "detail": str(exc)},
-                    usage,
+                    {},
                 )
             registered.append({"id": event_id, "summary": event.summary})
 
@@ -225,7 +259,7 @@ class ScheduleRunner:
             "registered": registered,
             "events": [self._describe(e) for e in events],
         }
-        return self._registered_reply(fields, events), meta, usage
+        return self._registered_reply(opening, events), meta, {}
 
     def cancel(self, last: list[dict[str, str]]) -> tuple[str, dict[str, Any], dict[str, int]]:
         """直前に登録した予定を取り消す。"""
@@ -343,8 +377,8 @@ class ScheduleRunner:
             f"{event.summary}{location}"
         )
 
-    def _registered_reply(self, fields: dict[str, Any], events: list[Event]) -> str:
-        lines = [_done_opening(fields.get("opening"), self._phrasebook.pick("schedule_done")), ""]
+    def _registered_reply(self, opening: Any, events: list[Event]) -> str:
+        lines = [_done_opening(opening, self._phrasebook.pick("schedule_done")), ""]
         for event in events:
             day = event.start.astimezone(JST)
             weekday = "月火水木金土日"[day.weekday()]
