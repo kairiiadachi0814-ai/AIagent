@@ -412,6 +412,39 @@ class TestOnePersonOneDay:
         assert all(c["start"] < "2026-09-12" for c in meta["candidates"])
 
 
+class TestFollowUpParsing:
+    """「登録して」「14:30で」を、直前の候補の続きとして読むための部品。"""
+
+    @pytest.mark.parametrize("text, expected", [
+        ("登録して", None), ("14:30で登録して", (14, 30)), ("14時半で", (14, 30)), ("14時で", (14, 0)),
+        ("件名は設備資金調達の件、場所は本社事務所ミーティングルーム②", None), ("9/9 14:30〜15:30", (14, 30)),
+    ])
+    def test_time_in(self, text, expected):
+        from raizuinu.scheduleplan import time_in
+
+        assert time_in(text) == expected
+
+    @pytest.mark.parametrize("text, expected", [
+        ("登録して", False), ("9日で登録して", True), ("9/9 14:30で", True), ("来週火曜で", True),
+        ("14:30で登録して", False), ("件名は設備資金調達の件", False),
+    ])
+    def test_has_date(self, text, expected):
+        from raizuinu.scheduleplan import has_date
+
+        assert has_date(text) is expected
+
+    @pytest.mark.parametrize("text, expected", [
+        ("1番で登録して", ""), ("登録して", ""), ("①でお願いします", ""),
+        ("1番で。件名は設備資金調達の件、場所は本社事務所ミーティングルーム②", "件名は設備資金調達の件、場所は本社事務所ミーティングルーム2"),
+        ("その時間で登録して。件名は設備資金調達の件", "件名は設備資金調達の件"),
+        ("16時で登録して", ""), ("14:30〜15:30で登録しといて", ""), ("その時間でお願いします", ""),
+    ])
+    def test_strip_pick(self, text, expected):
+        from raizuinu.scheduleplan import strip_pick
+
+        assert strip_pick(text) == expected
+
+
 class FakeWriter:
     label = "Googleカレンダー"
 
@@ -460,6 +493,127 @@ class TestPickAndRegister:
         plan = runner(tmp_path, WEEK)
         reply, meta, _ = plan.register_pick({"candidates": [{"start": "2026-09-07T13:00:00+09:00", "end": "2026-09-07T14:00:00+09:00"}]}, 5, None)
         assert meta["error"] == "bad_number" and "1件まで" in reply
+
+
+ONE = {"candidates": [{"start": "2026-09-09T14:30:00+09:00", "end": "2026-09-09T15:30:00+09:00"}],
+       "summary": "金融機関との打合せ", "participants": ["足立"]}
+TWO = {"candidates": [{"start": "2026-09-07T13:00:00+09:00", "end": "2026-09-07T14:00:00+09:00"},
+                      {"start": "2026-09-07T16:00:00+09:00", "end": "2026-09-07T17:00:00+09:00"}],
+       "summary": "篠田さんと打合せ", "participants": ["足立", "篠田"]}
+
+
+def counting_schedule(tmp_path, fields=None):
+    """ScheduleRunner。読み取りAPIを何回呼んだかを数える。"""
+    fields = fields or {"events": [], "missing": [], "opening": ""}
+    schedule = ScheduleRunner(make_config(tmp_path), client=fake_client(fields))
+    schedule.calls = 0
+    original = schedule.extract_events
+
+    def counted(text):
+        schedule.calls += 1
+        schedule.last_text = text
+        return original(text)
+
+    schedule.extract_events = counted
+    return schedule
+
+
+class TestRegisterWithoutRepeating:
+    """実例（2026-09-07）: 候補を出した後の「登録して」に、日付・件名・場所・時刻を聞き返した。"""
+
+    def test_just_register_uses_the_only_candidate(self, tmp_path, monkeypatch):
+        writer = FakeWriter()
+        monkeypatch.setattr("raizuinu.scheduletask.build_writer", lambda cfg: writer)
+        schedule = counting_schedule(tmp_path)
+        reply, meta, usage = runner(tmp_path, {}).register_from_pending(ONE, "登録して", schedule)
+        assert writer.inserted[0].summary == "金融機関との打合せ"
+        assert writer.inserted[0].start == datetime(2026, 9, 9, 14, 30, tzinfo=JST)
+        assert "9月9日（水） 14:30〜15:30　金融機関との打合せ" in reply
+        assert schedule.calls == 0  # 何も読み取らずに登録できる（費用も掛けない）
+
+    def test_extra_details_are_taken_without_asking(self, tmp_path, monkeypatch):
+        writer = FakeWriter()
+        monkeypatch.setattr("raizuinu.scheduletask.build_writer", lambda cfg: writer)
+        # 読み取りが日時を間違えて返しても、候補の日時を正とする
+        fields = {"events": [{"summary": "設備資金調達の件", "date": "2026-09-10", "start_time": "10:00",
+                              "end_time": "11:00", "all_day": False, "location": "本社事務所ミーティングルーム2"}],
+                  "missing": [], "opening": "設備資金調達の件ですね。"}
+        schedule = counting_schedule(tmp_path, fields)
+        text = "その時間で登録して。件名は設備資金調達の件、場所は本社事務所ミーティングルーム②"
+        reply, meta, _ = runner(tmp_path, {}).register_from_pending(ONE, text, schedule)
+        event = writer.inserted[0]
+        assert (event.summary, event.location) == ("設備資金調達の件", "本社事務所ミーティングルーム2")
+        assert event.start == datetime(2026, 9, 9, 14, 30, tzinfo=JST)
+        assert "9月9日（水） 14:30〜15:30　設備資金調達の件　＠本社事務所ミーティングルーム2" in reply
+        assert "14:30〜15:30 に「金融機関との打合せ」" in schedule.last_text  # 分かっていることを渡して読ませる
+        assert "教えていただけますか" not in reply
+
+    def test_a_time_picks_the_matching_candidate(self, tmp_path, monkeypatch):
+        writer = FakeWriter()
+        monkeypatch.setattr("raizuinu.scheduletask.build_writer", lambda cfg: writer)
+        schedule = counting_schedule(tmp_path)
+        reply, meta, _ = runner(tmp_path, {}).register_from_pending(TWO, "16時で登録して", schedule)
+        assert writer.inserted[0].start == datetime(2026, 9, 7, 16, 0, tzinfo=JST)
+        assert schedule.calls == 0
+
+    def test_several_candidates_ask_for_the_number_only(self, tmp_path, monkeypatch):
+        writer = FakeWriter()
+        monkeypatch.setattr("raizuinu.scheduletask.build_writer", lambda cfg: writer)
+        schedule = counting_schedule(tmp_path)
+        reply, meta, _ = runner(tmp_path, {}).register_from_pending(TWO, "登録して", schedule)
+        assert not writer.inserted
+        assert reply.startswith("どの時間で登録しましょうか。番号でお知らせください。")
+        assert "1. 9月7日（月）13:00〜14:00" in reply and "2. 9月7日（月）16:00〜17:00" in reply
+        assert "日付" not in reply and "件名" not in reply
+        assert meta["error"] == "which_candidate"
+
+    def test_a_date_in_the_message_means_a_fresh_registration(self, tmp_path):
+        assert runner(tmp_path, {}).register_from_pending(ONE, "9/10 14:30で登録して", None) is None
+        assert runner(tmp_path, {}).register_from_pending(ONE, "15:00で登録して", None) is None  # 候補に無い時刻
+
+    def test_the_single_candidate_reply_invites_a_plain_register(self, tmp_path):
+        reply, _, _ = runner(tmp_path, ONE_DAY, {"足立": [FakeSource(REAL_9TH)]}).propose(
+            "9日に金融機関との打合せ予定1時間取れる？", ADACHI, True
+        )
+        assert "この時間でよければ「登録して」とお知らせください。件名や場所も一緒に書いていただければ、そのまま反映します。" in reply
+        assert "1番で登録して" not in reply
+
+
+class TestContextCarriesOver:
+    """直前の日程の話を引き継ぎ、同じ条件を言わせない。"""
+
+    def test_afternoon_only_keeps_the_same_day(self, tmp_path):
+        plan = runner(tmp_path, {"time_of_day": "pm", "opening": "午後ですね。"}, {"足立": [FakeSource(REAL_9TH)]})
+        context = {"date_from": "2026-09-09", "date_to": "2026-09-09", "duration": 60,
+                   "participants": ["足立"], "summary": "金融機関との打合せ"}
+        reply, meta, _ = plan.propose("午後で", ADACHI, True, context=context)
+        assert "足立さんの空きを9月9日（水）で見ました（60分、午後" in reply
+        assert "1. 9月9日（水）14:30〜15:30" in reply
+        assert meta["summary"] == "金融機関との打合せ"
+
+    def test_what_is_said_now_wins(self, tmp_path):
+        plan = runner(tmp_path, {"date_from": "2026-09-10", "date_to": "2026-09-10", "duration_minutes": 30},
+                      {"足立": [FakeSource(REAL_9TH)]})
+        context = {"date_from": "2026-09-09", "date_to": "2026-09-09", "duration": 60}
+        _, meta, _ = plan.propose("10日に30分なら？", ADACHI, True, context=context)
+        assert meta["duration"] == 30 and meta["candidates"][0]["start"].startswith("2026-09-10")
+
+    def test_context_expires_sooner_than_the_candidates(self, tmp_path):
+        plan = runner(tmp_path, {})
+        plan.remember(1, ADACHI, 1_000, {"candidates": ONE["candidates"], "summary": "x",
+                                          "context": {"date_from": "2026-09-09", "date_to": "2026-09-09", "duration": 60}})
+        assert plan.context_for(1, ADACHI, 1_000 + 3600)["date_from"] == "2026-09-09"
+        assert plan.context_for(1, ADACHI, 1_000 + 3 * 3600) == {}  # 2時間で条件は引き継がない
+        assert plan.pending(1, ADACHI, 1_000 + 3 * 3600) is not None  # 候補は24時間使える
+
+
+class TestMissingFieldsAsked:
+    def test_place_is_never_asked(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("raizuinu.scheduletask.build_writer", lambda cfg: FakeWriter())
+        fields = {"events": [], "missing": ["日付", "件名", "場所", "時刻"], "opening": "予定の登録ですね。"}
+        reply, meta, _ = ScheduleRunner(make_config(tmp_path), client=fake_client(fields)).register("登録して")
+        assert meta["missing"] == ["日付", "件名", "時刻"]
+        assert "場所" not in reply
 
 
 class TestConflictCheckBeforeRegister:
@@ -550,6 +704,62 @@ class TestThroughTheHandler:
         self._send(handler, SHINODA, "1番で登録して", "2", send_time=1757203300)
         assert NOT_ADMIN_MESSAGE in chatwork.sent[1][1]
         assert not writer.inserted
+
+    def test_the_screenshot_flow_registers_without_asking_again(self, tmp_path, monkeypatch):
+        # 「9日に…1時間取れる？」→ 候補1件 → 「登録して」で聞き返さずに登録
+        handler, chatwork, audit, writer = self._handler(
+            tmp_path, monkeypatch, ONE_DAY, sources={"足立": [FakeSource(REAL_9TH)]}
+        )
+        self._send(handler, ADACHI, "9日に金融機関との打合せ予定1時間取れる？", "1")
+        assert "1. 9月9日（水）14:30〜15:30" in chatwork.sent[0][1]
+        self._send(handler, ADACHI, "登録して", "2", send_time=1757203300)
+        assert len(writer.inserted) == 1
+        assert writer.inserted[0].summary == "金融機関との打合せ"
+        assert writer.inserted[0].start == datetime(2026, 9, 9, 14, 30, tzinfo=JST)
+        assert "上記で登録しました。" in chatwork.sent[1][1]
+        assert "教えていただけますか" not in chatwork.sent[1][1]
+
+    def test_details_with_the_register_are_used(self, tmp_path, monkeypatch):
+        register = {"events": [{"summary": "設備資金調達の件", "date": "2026-09-09", "start_time": "14:30",
+                                "end_time": "15:30", "all_day": False, "location": "本社事務所ミーティングルーム2"}],
+                    "missing": [], "opening": "設備資金調達の件ですね。"}
+        handler, chatwork, _, writer = self._handler(
+            tmp_path, monkeypatch, ONE_DAY, register, sources={"足立": [FakeSource(REAL_9TH)]}
+        )
+        self._send(handler, ADACHI, "9日に金融機関との打合せ予定1時間取れる？", "1")
+        self._send(handler, ADACHI, "その時間で登録して。件名は設備資金調達の件、場所は本社事務所ミーティングルーム②", "2",
+                   send_time=1757203300)
+        assert writer.inserted[0].summary == "設備資金調達の件"
+        assert writer.inserted[0].location == "本社事務所ミーティングルーム2"
+        assert writer.inserted[0].start == datetime(2026, 9, 9, 14, 30, tzinfo=JST)
+
+    def test_answering_the_ask_back_registers_instead_of_proposing(self, tmp_path, monkeypatch):
+        # 聞き返しに答えたら登録する。候補の提案（「1番で登録して」）へ戻さない
+        from raizuinu.scheduletask import ScheduleRunner
+        from tests.test_guest import make_handler
+
+        writer = FakeWriter()
+        monkeypatch.setattr("raizuinu.scheduletask.build_writer", lambda cfg: writer)
+        replies = [
+            {"events": [], "missing": ["日付", "件名", "場所", "時刻"], "opening": "予定の登録ですね。"},
+            {"events": [{"summary": "設備資金調達の件", "date": "2026-09-09", "start_time": "14:30",
+                         "end_time": "15:30", "all_day": False, "location": "本社事務所ミーティングルーム2"}],
+             "missing": [], "opening": "承知しました。"},
+        ]
+        client = SimpleNamespace(messages=SimpleNamespace(create=lambda **kw: fake_client(replies.pop(0)).messages.create(**kw)))
+        config = make_config(tmp_path)
+        schedule = ScheduleRunner(config, client=client)
+        plan = runner(tmp_path, {}, {"足立": [FakeSource(REAL_9TH)]})
+        handler, chatwork, _, _ = make_handler(tmp_path, monkeypatch, members=(ADACHI,), schedule=schedule, plan=plan)
+        handler._config.data["admin_account_ids"] = [ADACHI]
+        handler._config.data["schedule"] = config.data["schedule"]
+        self._send(handler, ADACHI, "その予定で登録して", "1")
+        assert "場所" not in chatwork.sent[0][1] and "日付" in chatwork.sent[0][1]
+        self._send(handler, ADACHI, "下記で。\n・日付 9/9\n・件名 設備資金調達の件\n・場所 本社事務所ミーティングルーム②\n・時刻 14:30〜15:30", "2",
+                   send_time=1757203300)
+        assert len(writer.inserted) == 1 and writer.inserted[0].summary == "設備資金調達の件"
+        assert "上記で登録しました。" in chatwork.sent[1][1]
+        assert "1番で登録して" not in chatwork.sent[1][1]
 
     def test_registering_at_a_busy_time_is_stopped_then_picked(self, tmp_path, monkeypatch):
         register = {"events": [{"summary": "篠田さんと打合せ", "date": "2026-09-07", "start_time": "10:00",

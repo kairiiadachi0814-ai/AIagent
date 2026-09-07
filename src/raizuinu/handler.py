@@ -323,7 +323,10 @@ class RaizuinuHandler:
                 self._process_doc_build(event, merged, context, messages)
                 return
             if pending["flow"] == "schedule" and self._schedule is not None:
-                self._process_schedule(event, merged)
+                # 登録の聞き返しへの答えは登録として続ける（候補の提案へ戻さない）
+                self._process_schedule(
+                    event, merged, force_register=(pending.get("mode") == "register")
+                )
                 return
 
         # レターパック手配のやり取りの続き（要否の返事・文面の確認・総務への回答）。
@@ -358,18 +361,20 @@ class RaizuinuHandler:
             )
 
             owner = str(cfg.schedule.get("owner_name", ""))
-            # 空き時間の提案（誰でも聞ける）と、出した候補からの登録（管理者だけ）
-            proposal = picks = False
+            # 空き時間の提案（誰でも聞ける）と、出した候補からの登録（管理者だけ）。
+            # 候補を出した直後の「登録して」「2番で」は、予定の言葉が無くても続きとして扱う
+            proposal = follow_up = False
             if self._plan is not None:
                 from .scheduleplan import looks_like_proposal_request, pick_number
 
                 proposal = looks_like_proposal_request(question)
-                picks = pick_number(question) is not None and (
-                    self._plan.pending(event.room_id, event.account_id, int(event.send_time))
-                    is not None
-                )
-            if looks_like_schedule_request(question, owner) or proposal or picks:
-                writes = picks or (
+                if pick_number(question) is not None or is_register_request(question):
+                    follow_up = (
+                        self._plan.pending(event.room_id, event.account_id, int(event.send_time))
+                        is not None
+                    )
+            if looks_like_schedule_request(question, owner) or proposal or follow_up:
+                writes = follow_up or (
                     not proposal and (is_register_request(question) or is_cancel_request(question))
                 )
                 if writes and event.account_id not in set(cfg.admin_account_ids):
@@ -549,13 +554,20 @@ class RaizuinuHandler:
             return None
         return entry
 
-    def _save_pending(self, event: MentionEvent, flow: str, instruction: str) -> None:
-        """聞き返した依頼を覚えておく（返ってきた答えを元の依頼に足すため）。"""
+    def _save_pending(
+        self, event: MentionEvent, flow: str, instruction: str, mode: str = ""
+    ) -> None:
+        """聞き返した依頼を覚えておく（返ってきた答えを元の依頼に足すため）。
+
+        mode は同じフローの中の段階（予定なら "register"）。答えが返ってきたとき、
+        その段階へまっすぐ戻すために使う。
+        """
         data = _read_json(self._pending_path())
         data[f"{event.room_id}:{event.account_id}"] = {
             "flow": flow,
             "instruction": instruction,
             "ts": int(event.send_time),
+            "mode": mode,
         }
         _write_json(self._pending_path(), data)
 
@@ -627,8 +639,15 @@ class RaizuinuHandler:
         except Exception:
             print("[warn] 部外応対の監査に失敗: " + traceback.format_exc(), flush=True)
 
-    def _process_schedule(self, event: MentionEvent, question: str) -> None:
-        """予定の照会・登録・取り消しを処理して返信する。"""
+    def _process_schedule(
+        self, event: MentionEvent, question: str, force_register: bool = False
+    ) -> None:
+        """予定の照会・登録・取り消し・日程調整を処理して返信する。
+
+        同じことを二度聞かないために、直前に出した候補や条件（PlanRunner が
+        覚えているもの）を先に使う。「登録して」だけなら候補を登録し、
+        「午後で」なら同じ日程の話として候補を出し直す。
+        """
         from .answer import sanitize_for_chatwork
         from .scheduletask import is_cancel_request, is_register_request
 
@@ -643,16 +662,27 @@ class RaizuinuHandler:
         send_time = int(event.send_time)
         plan_pending = None
         number = None
+        proposal = False
         if self._plan is not None:
-            from .scheduleplan import looks_like_proposal_request, pick_number
+            from .scheduleplan import looks_like_proposal_request, pick_number, strip_pick
 
             number = pick_number(question)
-            if number is not None:
-                plan_pending = self._plan.pending(event.room_id, event.account_id, send_time)
+            proposal = looks_like_proposal_request(question) and not force_register
+            plan_pending = self._plan.pending(event.room_id, event.account_id, send_time)
+        registering = force_register or (is_register_request(question) and not proposal)
 
-        if plan_pending is not None and number is not None:
+        handled = None
+        if plan_pending is not None and number is not None and plan_pending.get("candidates"):
             # 出した候補から番号で選んで登録（管理者だけ。関門は呼び出し側）
-            reply, meta, usage = self._plan.register_pick(plan_pending, number, self._schedule)
+            handled = self._plan.register_pick(
+                plan_pending, number, self._schedule, extra=strip_pick(question)
+            )
+        elif plan_pending is not None and registering and not is_cancel_request(question):
+            # 「登録して」「14:30で登録して」を候補で解決する（日付・件名を聞き返さない）
+            handled = self._plan.register_from_pending(plan_pending, question, self._schedule)
+
+        if handled is not None:
+            reply, meta, usage = handled
             kind = "schedule_register"
             if meta.get("registered"):
                 _write_json(state_path, {"registered": meta["registered"]})
@@ -663,13 +693,7 @@ class RaizuinuHandler:
             kind = "schedule_cancel"
             if not meta.get("error"):
                 _write_json(state_path, {})
-        elif self._plan is not None and looks_like_proposal_request(question):
-            reply, meta, usage = self._plan.propose(
-                question, requester_id=event.account_id, is_admin=is_admin
-            )
-            kind = "schedule_propose"
-            self._plan.remember(event.room_id, event.account_id, send_time, meta)
-        elif is_register_request(question):
+        elif registering:
             # 相手の名前が出ていれば、登録の前にその人の予定と重ならないか確かめる
             check = (
                 self._plan.conflict_check(question, event.account_id)
@@ -681,6 +705,8 @@ class RaizuinuHandler:
             if meta.get("registered"):
                 # 「さっきの予定を取り消して」で消せるよう直前の1件を覚えておく
                 _write_json(state_path, {"registered": meta["registered"]})
+                if self._plan is not None:
+                    self._plan.clear(event.room_id, event.account_id)  # 古い候補を残さない
             elif meta.get("error") == "conflict" and self._plan is not None:
                 # 代わりの候補を覚えておき、「1番で登録して」で選べるようにする
                 last = self._plan.last_check()
@@ -691,13 +717,20 @@ class RaizuinuHandler:
                         "summary": last.get("summary", ""),
                     },
                 )
+        elif proposal:
+            reply, meta, usage = self._plan.propose(
+                question, requester_id=event.account_id, is_admin=is_admin,
+                context=self._plan.context_for(event.room_id, event.account_id, send_time),
+            )
+            kind = "schedule_propose"
+            self._plan.remember(event.room_id, event.account_id, send_time, meta)
         else:
             reply, meta, usage = self._schedule.answer(question)
             kind = "schedule_answer"
 
         cost_status = self._add_usage_safely(usage)
         if meta.get("error") == "missing_fields":
-            self._save_pending(event, "schedule", question)
+            self._save_pending(event, "schedule", question, mode="register")
         self._chatwork.send_message(
             event.room_id, _reply_tag(event) + sanitize_for_chatwork(reply)
         )

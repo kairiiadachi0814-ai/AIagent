@@ -210,9 +210,12 @@ class ScheduleRunner:
         if writer is None:
             return NO_WRITER_MESSAGE, {"error": "no_writer"}, {}
 
-        fields, usage = self._extract(question)
-        events = self._to_events(fields)
-        missing = [str(m) for m in fields.get("missing") or []]
+        events, fields, usage = self.extract_events(question)
+        # 聞き返すのは登録に要る項目だけ。場所は無くても登録できるので聞かない
+        missing = [
+            str(m) for m in fields.get("missing") or []
+            if any(key in str(m) for key in ("日", "件名", "時刻", "時間", "開始", "内容"))
+        ]
         if not events:
             if not missing:
                 missing = ["日付", "件名"]
@@ -230,6 +233,11 @@ class ScheduleRunner:
                 return blocked, {"error": "conflict", "events": [self._describe(e) for e in events]}, usage
         reply, meta, _ = self._insert_all(writer, events, fields.get("opening"))
         return reply, meta, usage
+
+    def extract_events(self, question: str) -> tuple[list[Event], dict[str, Any], dict[str, int]]:
+        """依頼文から予定を読み取る（登録はしない）。→ (予定, 読み取り結果, usage)"""
+        fields, usage = self._extract(question)
+        return self._to_events(fields), fields, usage
 
     def register_events(
         self, events: list[Event], opening: str = ""

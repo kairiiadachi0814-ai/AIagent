@@ -62,6 +62,61 @@ def looks_like_proposal_request(question: str) -> bool:
     return bool(_MEETING_RE.search(question) and _PROPOSE_CUE_RE.search(question))
 
 
+# 依頼文に日付・時刻が書かれているか（書かれていなければ直前の候補から補う）
+_DATE_RE = re.compile(
+    r"(\d{1,2}\s*[/月]\s*\d{1,2}|\d{1,2}日|今日|本日|明日|あした|明後日|あさって|来週|再来週|今週|[月火水木金土日]曜)"
+)
+_TIME_RE = re.compile(r"(\d{1,2})\s*[:：時]\s*(\d{2})?\s*(?:分|半)?")
+
+
+def has_date(text: str) -> bool:
+    return bool(_DATE_RE.search(unicodedata.normalize("NFKC", str(text or ""))))
+
+
+def time_in(text: str) -> tuple[int, int] | None:
+    """文中の最初の時刻（時, 分）。「14時半」「14:30」「14時」。無ければ None。"""
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    match = _TIME_RE.search(normalized)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    if hour > 23:
+        return None
+    minute = int(match.group(2) or 0)
+    if "半" in normalized[match.end() - 1: match.end() + 1] and not match.group(2):
+        minute = 30
+    return hour, minute
+
+
+_PICK_HEAD_RE = re.compile(r"^\s*[1-9]\s*(?:番目|番|つ目)?\s*(?:で|に|を|が|の)?")
+_PICK_TAIL_RE = re.compile(
+    r"(登録|お願い|入れ|よろしく|決定|確定|決め|いき|行き|行こ)"
+    r"(しといて|しておいて|して|します|しました|ください|ましょう|ね|で|う)?"
+)
+_TIME_SPAN_RE = re.compile(
+    r"\d{1,2}\s*[:時]\s*(?:\d{2})?\s*(?:分|半)?\s*(?:[〜~\-]|から)?\s*(?:\d{1,2}\s*[:時]\s*(?:\d{2})?\s*(?:分|半)?)?\s*(?:まで)?\s*(?:で|に|から)?"
+)
+_NOISE_RE = re.compile(
+    r"(?:その|この|上記の|さっきの|先ほどの|提案の)?(?:時間|日時|候補|枠|時刻)(?:で|に|を)?|お願いします|ください|ですね|です"
+)
+
+
+def strip_pick(text: str) -> str:
+    """「1番で登録して」「その時間で」「14:30で」を除いた残り（件名や場所の追加指定）。
+
+    残りが無ければ空文字。空なら読み取りを掛けずに候補どおり登録できる。
+    """
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    for mark, digit in _CIRCLED.items():
+        normalized = normalized.replace(mark, digit)
+    rest = _PICK_HEAD_RE.sub("", normalized, count=1)
+    rest = _TIME_SPAN_RE.sub("", rest)
+    rest = _PICK_TAIL_RE.sub("", rest)
+    rest = _NOISE_RE.sub("", rest)
+    rest = re.sub(r"^[\s、。・でにをがの]+|[\s、。・]+$", "", rest).strip()
+    return rest if len(rest) >= 2 else ""
+
+
 def pick_number(text: str) -> int | None:
     """「1番で登録して」「②で」のように候補の番号を選んでいれば、その番号。"""
     normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
@@ -208,6 +263,9 @@ class Settings:
     remember_minutes: int = 1440
     # 空きが見つからなかったとき、日ごとの空きの実態を書く期間の上限（日）
     explain_days: int = 3
+    # 直前のやり取りの条件（日付・相手・所要時間）を次の依頼に引き継ぐ時間（分）。
+    # 「午後で」「30分でいい」のような続きを、同じ日程の話として扱う
+    context_minutes: int = 120
 
 
 def load_settings(config: Any) -> Settings:
@@ -238,6 +296,7 @@ def load_settings(config: Any) -> Settings:
         grid=int(raw.get("grid_minutes", 30)),
         remember_minutes=int(raw.get("remember_minutes", 1440)),
         explain_days=int(raw.get("explain_days", 3)),
+        context_minutes=int(raw.get("context_minutes", 120)),
     )
 
 
@@ -610,10 +669,17 @@ class PlanRunner:
 
     # --- 公開API ---
 
-    def propose(self, question: str, requester_id: int = 0, is_admin: bool = False) -> tuple[str, dict, dict]:
-        """候補を出す。日時が決め打ちなら、その時間の空きを確かめる。"""
+    def propose(
+        self, question: str, requester_id: int = 0, is_admin: bool = False, context: dict | None = None
+    ) -> tuple[str, dict, dict]:
+        """候補を出す。日時が決め打ちなら、その時間の空きを確かめる。
+
+        context は直前のやり取り（remember したもの）。依頼文に無い日付・相手・
+        所要時間・件名はそこから補い、同じことを聞き返さない。
+        """
         members = load_members(self._config)
         fields, usage = self._extract(question, members)
+        fields = self._inherit(fields, context or {})
         participants = self._participants(question, fields, members, requester_id)
         constraints = self._constraints(fields)
         summary = str(fields.get("summary") or "").strip() or self._default_summary(participants, requester_id)
@@ -673,8 +739,32 @@ class PlanRunner:
             "fixed": fixed.isoformat() if fixed else "",
             "conflicts": found,
             "failed_sources": failed,
+            # 次の依頼（「午後で」「30分でいい」）に引き継ぐ条件
+            "context": {
+                "date_from": constraints.date_from.isoformat(),
+                "date_to": constraints.date_to.isoformat(),
+                "duration": constraints.duration,
+                "participants": [m.name for m in participants],
+                "summary": summary,
+            },
         }
         return text, meta, usage
+
+    @staticmethod
+    def _inherit(fields: dict, context: dict) -> dict:
+        """依頼文に無い条件を、直前のやり取りから補う（書いてあるものは上書きしない）。"""
+        merged = dict(fields)
+        if not merged.get("date_from") and not merged.get("date_to") and not merged.get("fixed_start"):
+            if context.get("date_from"):
+                merged["date_from"] = context["date_from"]
+                merged["date_to"] = context.get("date_to") or context["date_from"]
+        if not merged.get("duration_minutes") and context.get("duration"):
+            merged["duration_minutes"] = int(context["duration"])
+        if not merged.get("participants") and context.get("participants"):
+            merged["participants"] = list(context["participants"])
+        if not merged.get("summary") and context.get("summary"):
+            merged["summary"] = context["summary"]
+        return merged
 
     def conflict_check(self, question: str, requester_id: int = 0) -> Callable[[list[Event]], str | None] | None:
         """登録の前に、依頼文に名前の出た人の予定を確かめる関数。誰も出てこなければ None。"""
@@ -711,8 +801,14 @@ class PlanRunner:
     def last_check(self) -> dict:
         return getattr(self, "_last_check", {}) or {}
 
-    def register_pick(self, pending: dict, number: int, schedule_runner: Any) -> tuple[str, dict, dict]:
-        """覚えている候補から番号で1つ選び、管理者のカレンダーへ登録する。"""
+    def register_pick(
+        self, pending: dict, number: int, schedule_runner: Any, extra: str = ""
+    ) -> tuple[str, dict, dict]:
+        """覚えている候補から番号で1つ選び、管理者のカレンダーへ登録する。
+
+        extra に件名や場所の追加指定（「件名は設備資金調達の件、場所は会議室②」）が
+        あれば読み取って使う。日時は候補のものを正とし、読み取りで上書きしない。
+        """
         candidates = pending.get("candidates") or []
         if not 1 <= number <= len(candidates):
             return (
@@ -721,24 +817,70 @@ class PlanRunner:
                 {},
             )
         chosen = candidates[number - 1]
-        event = Event(
-            summary=str(pending.get("summary") or "打合せ"),
-            start=datetime.fromisoformat(chosen["start"]),
-            end=datetime.fromisoformat(chosen["end"]),
-        )
-        return schedule_runner.register_events([event])
+        start, end = datetime.fromisoformat(chosen["start"]), datetime.fromisoformat(chosen["end"])
+        summary = str(pending.get("summary") or "打合せ")
+        location = ""
+        usage: dict = {}
+        opening = ""
+        extra = extra.strip()
+        if extra:
+            text = (
+                f"{jp_date(start.date())} {start:%H:%M}〜{end:%H:%M} に「{summary}」の予定を登録する。"
+                f"次の指定があれば件名・場所に反映する: {extra}"
+            )
+            try:
+                events, fields, usage = schedule_runner.extract_events(text)
+            except Exception:
+                print("[warn] 追加指定の読み取りに失敗: " + traceback.format_exc(), flush=True)
+                events, fields = [], {}
+            if events:
+                summary = events[0].summary or summary
+                location = events[0].location
+                opening = str(fields.get("opening") or "")
+        event = Event(summary=summary, start=start, end=end, location=location)
+        reply, meta, _ = schedule_runner.register_events([event], opening)
+        return reply, meta, usage
 
-    # --- 候補を覚えておく（「1番で登録して」のため） ---
+    def register_from_pending(
+        self, pending: dict, question: str, schedule_runner: Any
+    ) -> tuple[str, dict, dict] | None:
+        """「登録して」「14:30で登録して」を、覚えている候補で解決する。
+
+        日付が依頼文に無いときだけ使う（日付があれば普通の登録として扱う）。
+        候補が1つならそれを登録し、時刻が書かれていれば合う候補を登録する。
+        複数あって決められなければ番号を聞く（日付・件名は聞き返さない）。
+        """
+        candidates = pending.get("candidates") or []
+        if not candidates or has_date(question):
+            return None
+        clock = time_in(question)
+        if clock is not None:
+            for index, candidate in enumerate(candidates, 1):
+                start = datetime.fromisoformat(candidate["start"])
+                if (start.hour, start.minute) == clock:
+                    return self.register_pick(pending, index, schedule_runner, extra=strip_pick(question))
+            return None  # 候補に無い時刻。日付が無いので普通の登録では聞き返しになる
+        if len(candidates) == 1:
+            return self.register_pick(pending, 1, schedule_runner, extra=strip_pick(question))
+        lines = ["どの時間で登録しましょうか。番号でお知らせください。"]
+        for index, candidate in enumerate(candidates, 1):
+            start = datetime.fromisoformat(candidate["start"])
+            end = datetime.fromisoformat(candidate["end"])
+            lines.append(f"{index}. {jp_date(start.date())}{start:%H:%M}〜{end:%H:%M}")
+        return "\n".join(lines), {"error": "which_candidate", "candidates": candidates}, {}
+
+    # --- 候補と条件を覚えておく（「1番で登録して」「午後で」のため） ---
 
     def remember(self, room_id: int, account_id: int, ts: int, meta: dict) -> None:
-        if not meta.get("candidates"):
+        if not meta.get("candidates") and not meta.get("context"):
             return
         data = self._load()
         data[f"{room_id}:{account_id}"] = {
             "ts": int(ts),
-            "candidates": meta["candidates"],
+            "candidates": meta.get("candidates") or [],
             "summary": meta.get("summary", ""),
             "participants": meta.get("participants", []),
+            "context": meta.get("context") or {},
         }
         self._save(data)
 
@@ -749,6 +891,16 @@ class PlanRunner:
         if now_ts - int(entry.get("ts", 0)) > self._settings.remember_minutes * 60:
             return None
         return entry
+
+    def context_for(self, room_id: int, account_id: int, now_ts: int) -> dict:
+        """直前のやり取りの条件（新しいうちだけ）。無ければ空。"""
+        entry = self.pending(room_id, account_id, now_ts)
+        if not entry or now_ts - int(entry.get("ts", 0)) > self._settings.context_minutes * 60:
+            return {}
+        context = dict(entry.get("context") or {})
+        context.setdefault("summary", entry.get("summary", ""))
+        context.setdefault("participants", entry.get("participants", []))
+        return context
 
     def clear(self, room_id: int, account_id: int) -> None:
         data = self._load()
@@ -875,10 +1027,12 @@ class PlanRunner:
         return "、".join(bits)
 
     @staticmethod
-    def _register_hint(is_admin: bool) -> str:
-        if is_admin:
-            return "登録するときは「1番で登録して」のように番号でお知らせください。"
-        return "この中で都合の良い時間を、参加される方と決めてください。"
+    def _register_hint(is_admin: bool, count: int = 2) -> str:
+        if not is_admin:
+            return "この中で都合の良い時間を、参加される方と決めてください。"
+        if count <= 1:
+            return "この時間でよければ「登録して」とお知らせください。件名や場所も一緒に書いていただければ、そのまま反映します。"
+        return "登録するときは「1番で登録して」のように番号でお知らせください。件名や場所も一緒に書いていただければ、そのまま反映します。"
 
     def _proposal_reply(
         self, fields: dict, participants: list[Member], constraints: Constraints,
@@ -906,7 +1060,7 @@ class PlanRunner:
             for index, candidate in enumerate(candidates, 1):
                 lines.append(f"{index}. {candidate.label()}")
             lines.append("")
-            lines.append(self._register_hint(is_admin))
+            lines.append(self._register_hint(is_admin, len(candidates)))
         else:
             lines.append("期間を広げるか、短い時間でよければもう一度お知らせください。")
         for note in notes:
@@ -924,7 +1078,7 @@ class PlanRunner:
         else:
             lines.append(f"{when}は空いています。")
         if is_admin:
-            lines.append("この時間で登録するなら「1番で登録して」とお知らせください。")
+            lines.append(self._register_hint(True, 1))
         for note in notes:
             lines.append(f"※{note}。")
         return "\n".join(lines)
@@ -945,7 +1099,7 @@ class PlanRunner:
                 lines.append(f"{index}. {candidate.label()}")
             lines.append("")
             if is_admin:
-                lines.append("登録するときは「1番で登録して」のように番号でお知らせください。")
+                lines.append(self._register_hint(True, len(candidates)))
         else:
             lines.append("近い日で空いている枠は見つかりませんでした。期間を広げてもう一度お知らせください。")
         for note in notes:

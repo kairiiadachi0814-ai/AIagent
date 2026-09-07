@@ -172,7 +172,8 @@
       "explain_days": 3,
       "lead_minutes": 60,
       "grid_minutes": 30,
-      "remember_minutes": 1440
+      "remember_minutes": 1440,
+      "context_minutes": 120
     }
   },
   "member_account_ids": [
