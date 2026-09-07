@@ -93,7 +93,8 @@ def make_config(tmp_path):
         "enabled": True, "room_id": FAX_ROOM, "notifier_account_id": NOTIFIER,
         "notify_account_ids": [SHINODA, ADACHI], "directory_csv_url": CSV_URL,
         "max_pdf_mb": 15, "max_per_day": 50,
-        "mention_kinds": ["発注書", "注文書", "請求書", "見積書", "納品書"],
+        "mention_kinds": ["注文", "請求", "見積", "納品", "発注書", "注文書", "請求書", "見積書", "納品書"],
+        "order_words": ["注文", "発注", "直送", "申込", "サンプル", "入荷"],
         "notify_window": {"start": "08:30", "end": "19:30"},
         "follow_up": {"enabled": True, "check_time": "09:00", "recheck_time": "12:00",
                       "evening_time": "19:00", "max_open_days": 14},
@@ -140,7 +141,7 @@ def fake_client(payload):
     def create(**kwargs):
         client.kwargs = kwargs
         client.history.append(kwargs)
-        found = {"rotation": 0, "readable": True, **payloads[min(client.calls, len(payloads) - 1)]}
+        found = {"rotation": 0, "readable": True, "category": "その他", **payloads[min(client.calls, len(payloads) - 1)]}
         client.calls += 1
         return SimpleNamespace(
             stop_reason="end_turn",
@@ -167,13 +168,13 @@ BLURRY = {"sender": "", "kind": "その他", "is_order": False, "rotation": 0, "
 
 
 ORDER = {
-    "sender": "光パックス石川", "kind": "発注書", "is_order": True,
+    "sender": "光パックス石川", "kind": "発注書", "category": "注文", "is_order": True,
     "summary": "ダンボール箱2種の発注です。",
     "items": [{"name": "A式ダンボール 60サイズ", "quantity": "200枚", "amount": "24,000円"},
               {"name": "A式ダンボール 80サイズ", "quantity": "100枚", "amount": ""}],
     "due": "9月12日", "notes": "担当: 山本様",
 }
-AD = {"sender": "", "kind": "広告", "is_order": False, "summary": "複合機リースの広告です。",
+AD = {"sender": "", "kind": "広告", "category": "広告", "is_order": False, "summary": "複合機リースの広告です。",
       "items": [], "due": "", "notes": ""}
 
 
@@ -353,22 +354,70 @@ class TestNotifying:
         assert "[To:" not in body  # 広告で呼び出さない（ルームに置くだけ）
         assert body.startswith(f"[rp aid={NOTIFIER} to={FAX_ROOM}-2]\nFAXが届きました")  # 空行を残さない
 
-    @pytest.mark.parametrize("kind", ["請求書", "見積書", "納品書", "注文書"])
-    def test_business_documents_still_call_people(self, tmp_path, kind):
-        payload = {**AD, "kind": kind, "sender": "光パックス石川", "summary": f"{kind}です。"}
+    @pytest.mark.parametrize("kind, category", [("請求書", "請求"), ("御見積書", "見積"), ("納品書", "納品")])
+    def test_business_documents_still_call_people(self, tmp_path, kind, category):
+        payload = {**AD, "kind": kind, "category": category, "sender": "光パックス石川", "summary": f"{kind}です。"}
         w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], payload)
         prime(w)
         w.run_once()
         body = bodies(w)[0]
         assert f"[To:{SHINODA}]" in body and f"[To:{ADACHI}]" in body
         assert f"光パックス石川からFAXが届きました（{kind}）" in body
+        assert ASK_DONE not in body  # 注文ではないので見届けはしない
 
-    @pytest.mark.parametrize("kind", ["案内", "その他"])
-    def test_notices_and_the_rest_are_posted_quietly(self, tmp_path, kind):
-        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], {**AD, "kind": kind})
+    @pytest.mark.parametrize("kind, category", [("新商品のご案内", "案内"), ("その他", "その他"), ("セミナー案内", "広告")])
+    def test_notices_and_the_rest_are_posted_quietly(self, tmp_path, kind, category):
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], {**AD, "kind": kind, "category": category})
         prime(w)
         w.run_once()
         assert "[To:" not in bodies(w)[0]
+
+
+class TestEveryKindOfOrderIsCaught:
+    """実例（2026-09-07）: 過去のFAXを精査すると、発注書・注文書以外の表題で注文が来ていた。
+
+    発注・注文は重要事項なので、モデルの判定・文書の性質・表題の語の3つのどれかで拾う。
+    """
+
+    TITLES = ["直送依頼書", "注文書", "サンプル依頼書", "FAX申込書", "商品注文伝票", "注文表",
+              "【発注・入荷】表", "発注伝票", "注文", "直送"]
+
+    @pytest.mark.parametrize("title", TITLES)
+    def test_real_titles_are_orders_even_if_the_model_hesitates(self, tmp_path, title):
+        # モデルが「その他」と言っても、表題の語で注文として扱う
+        payload = {**AD, "kind": title, "category": "その他", "is_order": False,
+                   "sender": "テスト商店", "summary": "商品の依頼です。",
+                   "items": [{"name": "テスト商品", "quantity": "3", "amount": ""}]}
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], payload)
+        prime(w)
+        w.run_once()
+        body = bodies(w)[0]
+        assert f"テスト商店から{title}が届きました。" in body
+        assert f"[To:{SHINODA}]" in body and f"[To:{ADACHI}]" in body
+        assert "■発注内容" in body and ASK_DONE in body
+        assert len(w._load_state()["open"]) == 1  # 見届けの対象になる
+
+    def test_the_model_can_flag_an_order_under_any_title(self, tmp_path):
+        payload = {**AD, "kind": "ご依頼", "category": "注文", "is_order": False, "sender": "テスト商店"}
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], payload)
+        prime(w)
+        w.run_once()
+        assert "テスト商店からご依頼が届きました。" in bodies(w)[0]
+        assert len(w._load_state()["open"]) == 1
+
+    def test_the_reader_is_told_about_the_real_titles(self):
+        from raizuinu.faxwatch import READ_SCHEMA, READ_SYSTEM
+
+        for title in self.TITLES[:8]:
+            assert title in READ_SYSTEM, title
+        assert "見落としは許されない" in READ_SYSTEM
+        assert READ_SCHEMA["properties"]["category"]["enum"][0] == "注文"
+
+    def test_order_words_are_configurable(self, tmp_path):
+        from raizuinu.faxwatch import looks_like_order
+
+        assert looks_like_order("ＦＡＸ申込書", ("申込",))  # 全角も拾う
+        assert not looks_like_order("新商品のご案内", ("注文", "発注", "直送", "申込", "サンプル", "入荷"))
 
     def test_the_same_fax_is_not_announced_twice(self, tmp_path):
         w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], ORDER)

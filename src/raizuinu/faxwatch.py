@@ -258,12 +258,23 @@ READ_SCHEMA: dict[str, Any] = {
         },
         "kind": {
             "type": "string",
-            "enum": ["発注書", "注文書", "請求書", "見積書", "納品書", "案内", "広告", "その他"],
-            "description": "文書の種類",
+            "description": (
+                "文書の表題をそのまま。例: 発注書／注文書／直送依頼書／サンプル依頼書／FAX申込書／"
+                "商品注文伝票／注文表／【発注・入荷】表／発注伝票／請求書／見積書／納品書。"
+                "表題が無ければ内容を表す短い語（注文／直送／案内／広告 など）"
+            ),
+        },
+        "category": {
+            "type": "string",
+            "enum": ["注文", "請求", "見積", "納品", "案内", "広告", "その他"],
+            "description": (
+                "文書の性質。こちらに商品の発注・注文・直送・サンプル送付などを依頼してきている"
+                "文書は、表題が何であれ「注文」"
+            ),
         },
         "is_order": {
             "type": "boolean",
-            "description": "発注書・注文書など、こちらに何かを発注してきている文書なら true",
+            "description": "category が「注文」なら true（こちらに何かを発注・注文・依頼してきている文書）",
         },
         "summary": {
             "type": "string",
@@ -295,14 +306,31 @@ READ_SCHEMA: dict[str, Any] = {
             "description": "差出人・種類・内容の主要な項目が判読できたら true。逆さま・不鮮明・鏡像などでほとんど読めなければ false",
         },
     },
-    "required": ["sender", "kind", "is_order", "summary", "items", "due", "notes", "rotation", "readable"],
+    "required": [
+        "sender", "kind", "category", "is_order", "summary", "items", "due", "notes", "rotation", "readable",
+    ],
     "additionalProperties": False,
 }
+
+# 表題にこれらの語があれば、モデルの判定に関わらず注文として扱う（見落としを防ぐ保険）。
+# 実例（2026-09-07）: 直送依頼書・サンプル依頼書・FAX申込書・商品注文伝票・注文表・
+# 【発注・入荷】表・発注伝票、それに「注文」「直送」とだけ書かれた伝票で注文が来ていた
+DEFAULT_ORDER_WORDS = ("注文", "発注", "直送", "申込", "サンプル", "入荷")
+
+
+def looks_like_order(title: str, words: tuple[str, ...] | list[str]) -> bool:
+    text = unicodedata.normalize("NFKC", str(title or ""))
+    return any(w and w in text for w in words)
 
 READ_SYSTEM = """あなたは株式会社ライズクリエイション経理財務部のアシスタントです。
 届いたFAXのPDFを読み、差出人と内容を部内へ知らせるために整理します。
 
 厳守すること:
+- 発注・注文の見落としは許されない。表題が「発注書」「注文書」でなくても、
+  直送依頼書・サンプル依頼書・FAX申込書・商品注文伝票・注文表・【発注・入荷】表・
+  発注伝票のように、こちらへ商品の注文・発注・直送・サンプル送付を頼んでいる文書は
+  category を「注文」、is_order を true にする。「注文」「直送」とだけ書かれた
+  手書きの伝票も同じ。kind には表題をそのまま写す
 - 文書に書かれていることだけを使う。書かれていないことを推測で補わない
 - 品名・数量・金額・納期・日付は文書のとおり一字一句正確に写す。丸めない
 - 読み取れない箇所は空文字にする。それらしい値を作らない。様式に金額欄が
@@ -518,8 +546,15 @@ class FaxWatcher:
         else:
             sender, basis = "", ""
 
-        is_order = bool(found.get("is_order")) and readable
-        kind = str(found.get("kind") or "その他") if readable else "不明"
+        kind = str(found.get("kind") or "その他").strip() if readable else "不明"
+        category = str(found.get("category") or "").strip()
+        # 注文かどうかは、モデルの判定・性質・表題の語の3つのどれかで拾う（見落とし防止）
+        order_words = tuple(settings.get("order_words") or DEFAULT_ORDER_WORDS)
+        is_order = readable and (
+            bool(found.get("is_order")) or category == "注文" or looks_like_order(kind, order_words)
+        )
+        if is_order:
+            found = {**found, "is_order": True}
         if readable:
             text = self._compose(found, sender, basis, number, notice, filename, ask_done and is_order)
         else:
@@ -529,8 +564,8 @@ class FaxWatcher:
         reply_tag = f"[rp aid={int(item.get('account_id', 0))} to={room_id}-{item['message_id']}]"
         # 案内・広告などは呼び出さず、ルームに置くだけ（To を付けると通知が鳴る）。
         # 読めなかったものは発注書かもしれないので呼び出す
-        mention_kinds = set(settings.get("mention_kinds") or [])
-        heads = self._heads() if (is_order or not readable or kind in mention_kinds) else ""
+        mention = set(settings.get("mention_kinds") or [])
+        heads = self._heads() if (is_order or not readable or category in mention or kind in mention) else ""
         parts = [reply_tag] + ([heads] if heads else []) + [sanitize_for_chatwork(text)]
         posted_id = self._chatwork.send_message(room_id, "\n".join(parts))
         self._audit(
@@ -542,6 +577,7 @@ class FaxWatcher:
                 "sender": sender,
                 "basis": basis,
                 "kind": kind,
+                "category": category,
                 "is_order": is_order,
                 "readable": readable,
                 "rotated": rotated,
@@ -900,8 +936,8 @@ class FaxWatcher:
             found = json.loads(text)
         except (json.JSONDecodeError, TypeError):
             found = {
-                "sender": "", "kind": "その他", "is_order": False, "summary": "", "items": [],
-                "due": "", "notes": "", "rotation": 0, "readable": False,
+                "sender": "", "kind": "その他", "category": "その他", "is_order": False, "summary": "",
+                "items": [], "due": "", "notes": "", "rotation": 0, "readable": False,
             }
         found["_usage"] = usage
         return found
