@@ -106,8 +106,10 @@ _DEFAULTS: dict[str, Any] = {
         "register_note": "",
         "greeting": "おはようございます。",
         # 予定を見に行ける社内メンバー。name（苗字）・account_id・work_days（0=月）・
-        # work_hours・skip_holidays。本人の予定は環境変数 SCHEDULE_ICS_URL_<account_id>
-        # （トヨクモのiCal）か google_calendar_id から読む。無ければ勤務日だけで見る
+        # work_hours・skip_holidays・any_time（曜日・時間帯の制限なし。まず通常の
+        # 時間帯で探し、無ければ時間外・土日祝へ広げる）。本人の予定は環境変数
+        # SCHEDULE_ICS_URL_<account_id>（トヨクモのiCal）か google_calendar_id から読む。
+        # 無ければ勤務日だけで見る
         "members": [],
         # 空き時間の提案と複数人の日程調整。候補の日時はコードで決める
         "proposal": {

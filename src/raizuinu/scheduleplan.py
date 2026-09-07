@@ -140,6 +140,9 @@ class Member:
     work_start: int | None = None  # 分（9:00 → 540）
     work_end: int | None = None
     skip_holidays: bool = False
+    # 曜日・時間帯の制限なし（土日祝も深夜も可）。候補はまず通常の時間帯で探し、
+    # 無ければ時間外へ広げる。work_days／work_hours は「まず探す範囲」として使う
+    any_time: bool = False
     ics_env: str = ""
     google_calendar_id: str = ""
     aliases: tuple[str, ...] = ()
@@ -147,7 +150,9 @@ class Member:
     def env_name(self) -> str:
         return self.ics_env or f"SCHEDULE_ICS_URL_{self.account_id}"
 
-    def works_on(self, day: date, holidays: set[str]) -> bool:
+    def works_on(self, day: date, holidays: set[str], loose: bool = False) -> bool:
+        if loose and self.any_time:
+            return True
         if day.weekday() not in self.work_days:
             return False
         return not (self.skip_holidays and day.isoformat() in holidays)
@@ -198,6 +203,7 @@ def load_members(config: Any) -> list[Member]:
                 work_start=_hm(hours.get("start"), 0) if hours.get("start") else None,
                 work_end=_hm(hours.get("end"), 0) if hours.get("end") else None,
                 skip_holidays=bool(raw.get("skip_holidays")),
+                any_time=bool(raw.get("any_time")),
                 ics_env=str(raw.get("ics_env", "") or ""),
                 google_calendar_id=str(raw.get("google_calendar_id", "") or ""),
                 aliases=tuple(str(a) for a in (raw.get("aliases") or [])),
@@ -305,29 +311,54 @@ def blocks_day(event: Event, words: tuple[str, ...]) -> bool:
     return event.all_day and any(w and w in event.summary for w in words)
 
 
-def day_reason(day: date, members: list[Member], settings: Settings, holidays: set[str]) -> str:
-    """その日に枠を探せない理由（土日・祝日・誰かの休み）。探せるなら空文字。"""
+def day_reason(
+    day: date, members: list[Member], settings: Settings, holidays: set[str], loose: bool = False
+) -> str:
+    """その日に枠を探せない理由（土日・祝日・誰かの休み）。探せるなら空文字。
+
+    loose なら、制限なしのメンバー（any_time）は数えない。全員が制限なしなら
+    土日祝も探せる。
+    """
+    bound = [m for m in members if not (loose and m.any_time)]
+    if not bound:
+        return ""
     if day.weekday() >= 5:
         return "土日"
     if settings.skip_holidays and day.isoformat() in holidays:
         return "祝日"
-    off = [m.name for m in members if not m.works_on(day, holidays)]
+    off = [m.name for m in bound if not m.works_on(day, holidays)]
     if off:
         return "・".join(off) + "さんの出勤日ではありません"
     return ""
 
 
-def common_window(day: date, members: list[Member], settings: Settings, holidays: set[str]) -> tuple[int, int] | None:
-    """その日に全員が揃える時間帯（分）。誰かの休みなら None。"""
-    if day_reason(day, members, settings, holidays):
+def common_window(
+    day: date, members: list[Member], settings: Settings, holidays: set[str], loose: bool = False
+) -> tuple[int, int] | None:
+    """その日に全員が揃える時間帯（分）。誰かの休みなら None。
+
+    loose なら制限なしのメンバーは 0:00〜24:00 として扱う（まず通常の時間帯で
+    探し、無ければこちらで広げる）。
+    """
+    if day_reason(day, members, settings, holidays, loose):
         return None
+    bound = [m for m in members if not (loose and m.any_time)]
+    if not bound:
+        return (0, 24 * 60)
     start, end = settings.work_start, settings.work_end
-    for member in members:
+    for member in bound:
         if member.work_start is not None:
             start = max(start, member.work_start)
         if member.work_end is not None:
             end = min(end, member.work_end)
     return (start, end) if end > start else None
+
+
+def lunch_for(members: list[Member], settings: Settings, loose: bool = False) -> tuple[int, int] | None:
+    """昼休みを外すか。全員が制限なし（loose）なら外さない。"""
+    if loose and all(m.any_time for m in members):
+        return None
+    return settings.lunch
 
 
 def _minutes_of_day(events: list[Event], day: date) -> list[tuple[int, int, Event]]:
@@ -411,22 +442,32 @@ def free_slots(
     return sorted(slots)
 
 
-def pick_for_day(slots: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    """1日の枠から、勧めやすい順に最大2つ。正時→30分→その他の順に優先し、2つ目は離れた時間帯。"""
+def pick_for_day(
+    slots: list[tuple[int, int]], prefer: tuple[int, int] | None = None
+) -> list[tuple[int, int]]:
+    """1日の枠から、勧めやすい順に最大2つ。
+
+    通常の時間帯（prefer）に近いものを先に、その中で正時→30分→その他の順。
+    2つ目は離れた時間帯から。時間外へ広げたときに深夜0時を勧めないための順位付け。
+    """
     if not slots:
         return []
 
-    def tier(slot: tuple[int, int]) -> int:
-        return 0 if slot[0] % 60 == 0 else (1 if slot[0] % 30 == 0 else 2)
+    def distance(slot: tuple[int, int]) -> int:
+        # 通常の時間帯からはみ出している分（分）。中に収まっていれば 0
+        if prefer is None:
+            return 0
+        return max(0, prefer[0] - slot[0]) + max(0, slot[1] - prefer[1])
 
-    best_tier = min(tier(s) for s in slots)
-    ranked = [s for s in slots if tier(s) == best_tier]
-    first = ranked[0]
+    def key(slot: tuple[int, int]) -> tuple[int, int, int]:
+        tier = 0 if slot[0] % 60 == 0 else (1 if slot[0] % 30 == 0 else 2)
+        return (distance(slot), tier, slot[0])
+
+    first = min(slots, key=key)
     picks = [first]
     later = [s for s in slots if s[0] >= first[1] + 120]
     if later:
-        later_tier = min(tier(s) for s in later)
-        picks.append([s for s in later if tier(s) == later_tier][0])
+        picks.append(min(later, key=key))
     return picks
 
 
@@ -457,15 +498,19 @@ class Constraints:
         return f"{jp_date(self.date_from)}〜{jp_date(self.date_to)}"
 
 
-def _window_for(day: date, members: list[Member], constraints: Constraints, settings: Settings, holidays: set[str]) -> tuple[int, int] | None:
-    window = common_window(day, members, settings, holidays)
+def _window_for(
+    day: date, members: list[Member], constraints: Constraints, settings: Settings, holidays: set[str],
+    loose: bool = False,
+) -> tuple[int, int] | None:
+    window = common_window(day, members, settings, holidays, loose)
     if window is None:
         return None
     start, end = window
-    if constraints.time_of_day == "am" and settings.lunch:
-        end = min(end, settings.lunch[0])
-    elif constraints.time_of_day == "pm" and settings.lunch:
-        start = max(start, settings.lunch[1])
+    noon = settings.lunch or (12 * 60, 13 * 60)
+    if constraints.time_of_day == "am":
+        end = min(end, noon[0])
+    elif constraints.time_of_day == "pm":
+        start = max(start, noon[1])
     if constraints.earliest is not None:
         start = max(start, constraints.earliest)
     if constraints.latest is not None:
@@ -496,17 +541,26 @@ def find_candidates(
     settings: Settings,
     holidays: set[str],
     now: datetime,
+    loose: bool = False,
 ) -> list[Candidate]:
-    """全員が空いている枠を、日を分散させて max_candidates 件まで。"""
+    """全員が空いている枠を、日を分散させて max_candidates 件まで。
+
+    loose なら制限なしのメンバーの時間外・土日祝も探す（通常の時間帯に近い順）。
+    """
     firsts: list[Candidate] = []
     seconds: list[Candidate] = []
+    prefer = (settings.work_start, settings.work_end)
     day = constraints.date_from
     while day <= constraints.date_to:
-        window = _window_for(day, members, constraints, settings, holidays)
+        window = _window_for(day, members, constraints, settings, holidays, loose)
         if window is not None:
             busy = _busy_all(day, members, events_by_member, settings)
-            slots = free_slots(window, busy, constraints.duration, settings.lunch, settings.grid, _not_before(day, now, settings))
-            for index, (s, e) in enumerate(pick_for_day(slots)[: max(1, settings.per_day)]):
+            slots = free_slots(
+                window, busy, constraints.duration, lunch_for(members, settings, loose),
+                settings.grid, _not_before(day, now, settings),
+            )
+            picks = pick_for_day(slots, prefer if loose else None)[: max(1, settings.per_day)]
+            for index, (s, e) in enumerate(picks):
                 candidate = Candidate(
                     start=datetime.combine(day, time(s // 60, s % 60), tzinfo=JST),
                     end=datetime.combine(day, time(e // 60, e % 60), tzinfo=JST),
@@ -515,6 +569,25 @@ def find_candidates(
         day += timedelta(days=1)
     chosen = (firsts + seconds)[: settings.max_candidates]
     return sorted(chosen, key=lambda c: c.start)
+
+
+def search_candidates(
+    members: list[Member],
+    events_by_member: dict[str, list[Event]],
+    constraints: Constraints,
+    settings: Settings,
+    holidays: set[str],
+    now: datetime,
+) -> list[Candidate]:
+    """まず通常の時間帯で探し、無ければ制限なしのメンバーの時間外・土日祝へ広げる。
+
+    → (候補, 広げたか)
+    """
+    found = find_candidates(members, events_by_member, constraints, settings, holidays, now)
+    if found or not any(m.any_time for m in members):
+        return found, False
+    widened = find_candidates(members, events_by_member, constraints, settings, holidays, now, loose=True)
+    return widened, bool(widened)
 
 
 def explain_days(
@@ -573,11 +646,12 @@ def conflicts_at(
     finish = end.astimezone(JST).hour * 60 + end.astimezone(JST).minute
     lines: list[str] = []
     for member in members:
-        if not member.works_on(day, holidays):
+        if not member.works_on(day, holidays, loose=True):
             lines.append(f"{member.name}さんは{jp_date(day)}は出勤日ではありません")
             continue
-        if (member.work_start is not None and begin < member.work_start) or (
-            member.work_end is not None and finish > member.work_end
+        if not member.any_time and (
+            (member.work_start is not None and begin < member.work_start)
+            or (member.work_end is not None and finish > member.work_end)
         ):
             lines.append(f"{member.name}さんの勤務時間（{_fmt(member.work_start or 0)}〜{_fmt(member.work_end or 1440)}）の外です")
             continue
@@ -697,14 +771,18 @@ class PlanRunner:
                 text = self._free_reply(fields, participants, fixed, end, notes, is_admin)
             else:
                 events, more_notes, more_failed = self._gather(participants, constraints)
-                candidates = find_candidates(participants, events, constraints, self._settings, self._holidays, now)
+                candidates, widened = search_candidates(participants, events, constraints, self._settings, self._holidays, now)
+                if widened:
+                    notes.append(self._widened_note(constraints))
                 notes += [n for n in more_notes if n not in notes]
                 failed += more_failed
                 notes += notes_for_days([c.start.date() for c in candidates], participants, events, self._settings)
                 text = self._conflict_reply(fields, participants, fixed, end, found, candidates, notes, is_admin)
         else:
             events, notes, failed = self._gather(participants, constraints)
-            candidates = find_candidates(participants, events, constraints, self._settings, self._holidays, now)
+            candidates, widened = search_candidates(participants, events, constraints, self._settings, self._holidays, now)
+            if widened:
+                notes.append(self._widened_note(constraints))
             explanation: list[str] = []
             alternatives = False
             if not candidates:
@@ -722,7 +800,9 @@ class PlanRunner:
                 )
                 events_ahead, _, more_failed = self._gather(participants, ahead)
                 failed += [f for f in more_failed if f not in failed]
-                candidates = find_candidates(participants, events_ahead, ahead, self._settings, self._holidays, now)
+                candidates, widened = search_candidates(participants, events_ahead, ahead, self._settings, self._holidays, now)
+                if widened:
+                    notes.append(self._widened_note(ahead))
                 alternatives = bool(candidates)
                 events = {
                     name: events.get(name, []) + events_ahead.get(name, [])
@@ -787,7 +867,7 @@ class PlanRunner:
                 gathered, notes, _ = self._gather(participants, span)
                 found = conflicts_at(event.start, event.end, participants, gathered, self._settings, self._holidays)
                 if found:
-                    candidates = find_candidates(participants, gathered, span, self._settings, self._holidays, self._now())
+                    candidates, _ = search_candidates(participants, gathered, span, self._settings, self._holidays, self._now())
                     notes += notes_for_days([c.start.date() for c in candidates], participants, gathered, self._settings)
                     fields = {"opening": "", "summary": event.summary}
                     text = self._conflict_reply(fields, participants, event.start, event.end, found, candidates, notes, True)
@@ -987,15 +1067,17 @@ class PlanRunner:
             sources = self._sources_for(member)
             if not sources:
                 events[member.name] = []
-                notes.append(f"{member.name}さんのカレンダーは未設定のため、{member.hours_label()}として見ています")
+                notes.append(f"{member.name}さんのカレンダーは未設定のため、{member.hours_label()}の前提で確認しています")
                 continue
             schedule = collect(sources, start, end)
             events[member.name] = schedule.events
             if schedule.failed_sources:
                 failed += schedule.failed_sources
                 notes.append(f"{member.name}さんのカレンダーを読み取れなかったため、抜けている予定があるかもしれません")
-            if member.work_start is not None or member.work_end is not None or member.work_days != (0, 1, 2, 3, 4):
-                notes.append(f"{member.name}さんは{member.hours_label()}として見ています")
+            if not member.any_time and (
+                member.work_start is not None or member.work_end is not None or member.work_days != (0, 1, 2, 3, 4)
+            ):
+                notes.append(f"{member.name}さんは{member.hours_label()}の前提で確認しています")
         return events, notes, failed
 
     @staticmethod
@@ -1011,7 +1093,13 @@ class PlanRunner:
             opening = f"{names_of(participants)}の日程ですね。"
         return opening
 
-    def _conditions(self, constraints: Constraints) -> str:
+    def _widened_note(self, constraints: Constraints) -> str:
+        return (
+            f"通常の時間帯（{_fmt(self._settings.work_start)}〜{_fmt(self._settings.work_end)}）に"
+            f"続けて{constraints.duration}分の空きが無かったため、時間外や土日祝も含めて確認しています"
+        )
+
+    def _conditions(self, constraints: Constraints, participants: list[Member]) -> str:
         bits = [f"{constraints.duration}分"]
         if constraints.time_of_day == "am":
             bits.append("午前")
@@ -1021,9 +1109,11 @@ class PlanRunner:
             bits.append(f"{_fmt(constraints.earliest)}以降")
         if constraints.latest is not None:
             bits.append(f"{_fmt(constraints.latest)}まで")
-        bits.append(f"{_fmt(self._settings.work_start)}〜{_fmt(self._settings.work_end)}")
-        if self._settings.lunch:
-            bits.append("昼休みを除く")
+        # 全員が制限なしなら、時間帯や昼休みの但し書きは要らない
+        if not all(m.any_time for m in participants):
+            bits.append(f"{_fmt(self._settings.work_start)}〜{_fmt(self._settings.work_end)}")
+            if self._settings.lunch:
+                bits.append("昼休みを除く")
         return "、".join(bits)
 
     @staticmethod
@@ -1049,13 +1139,16 @@ class PlanRunner:
             for line in explanation or []:
                 lines.append(f"・{line}")
             if explanation:
-                lines.append(f"（予定の前後{self._settings.buffer}分を空けて見ています）")
+                lines.append(f"（予定の前後{self._settings.buffer}分を空けて確認しています）")
         if candidates:
             if alternatives:
                 lines.append("")
                 lines.append("近い日でしたら、次が空いています。")
             else:
-                lines.append(f"{names}の空きを{constraints.span_label()}で見ました（{self._conditions(constraints)}）。")
+                lines.append(
+                    f"{names}の{constraints.span_label()}の空きを確認しました"
+                    f"（{self._conditions(constraints, participants)}）。"
+                )
                 lines.append("")
             for index, candidate in enumerate(candidates, 1):
                 lines.append(f"{index}. {candidate.label()}")

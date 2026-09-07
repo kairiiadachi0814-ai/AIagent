@@ -272,12 +272,12 @@ class TestPropose:
             "篠田さんと来週1時間打合せしたい。いつがいい？", requester_id=ADACHI, is_admin=True
         )
         assert reply.startswith("篠田さんとの打合せの日程ですね。")
-        assert "足立・篠田さんの空きを9月7日（月）〜9月11日（金）で見ました（60分、09:00〜18:00、昼休みを除く）" in reply
+        assert "足立・篠田さんの9月7日（月）〜9月11日（金）の空きを確認しました（60分、09:00〜18:00、昼休みを除く）" in reply
         assert "1. 9月7日（月）13:00〜14:00" in reply
         assert "2. 9月7日（月）16:00〜17:00" in reply
         assert "3. 9月11日（金）09:00〜10:00" in reply
         assert "「1番で登録して」" in reply
-        assert "※篠田さんは月・木・金出勤として見ています。" in reply
+        assert "※篠田さんは月・木・金出勤の前提で確認しています。" in reply
         assert meta["summary"] == "篠田さんと打合せ" and len(meta["candidates"]) == 3
         assert usage["input_tokens"] == 500
 
@@ -304,7 +304,7 @@ class TestPropose:
         reply, _, _ = runner(tmp_path, WEEK, {"足立": [FakeSource([])]}).propose(
             "篠田さんと打合せしたい。いつがいい？", requester_id=ADACHI, is_admin=True
         )
-        assert "※篠田さんのカレンダーは未設定のため、月・木・金出勤として見ています。" in reply
+        assert "※篠田さんのカレンダーは未設定のため、月・木・金出勤の前提で確認しています。" in reply
 
     def test_broken_calendar_is_disclosed(self, tmp_path):
         sources = {"足立": [FakeSource([], "トヨクモ", fail=True)], "篠田": [FakeSource([])]}
@@ -349,7 +349,7 @@ class TestOnePersonOneDay:
             "9日に金融機関との打合せ予定1時間取れる？", ADACHI, True
         )
         assert reply.startswith("金融機関との打合せの日程ですね。")
-        assert "足立さんの空きを9月9日（水）で見ました" in reply  # 1人なら「全員」と言わない、1日なら範囲で書かない
+        assert "足立さんの9月9日（水）の空きを確認しました" in reply  # 1人なら「全員」と言わない、1日なら範囲で書かない
         assert "1. 9月9日（水）14:30〜15:30" in reply  # 14:00の会議の後15分空け、16:00の前15分空けた中
         assert "※9月9日（水）は終日「[予定入力NG]」が入っています。" in reply
         assert "全員" not in reply
@@ -361,7 +361,7 @@ class TestOnePersonOneDay:
         reply, meta, _ = runner(tmp_path, fields, sources).propose("9日に2時間取れる？", ADACHI, True)
         assert "足立さんの9月9日（水）は、続けて空く120分の時間がありませんでした。" in reply
         assert "・9月9日（水）の空き: 14:15〜15:45（90分）、17:15〜18:00（45分）" in reply
-        assert "（予定の前後15分を空けて見ています）" in reply
+        assert "（予定の前後15分を空けて確認しています）" in reply
         assert "近い日でしたら、次が空いています。" in reply
         assert "1. 9月10日（木）10:00〜12:00" in reply  # 9:30の朝会の後15分空けて
         assert "全員" not in reply
@@ -587,7 +587,7 @@ class TestContextCarriesOver:
         context = {"date_from": "2026-09-09", "date_to": "2026-09-09", "duration": 60,
                    "participants": ["足立"], "summary": "金融機関との打合せ"}
         reply, meta, _ = plan.propose("午後で", ADACHI, True, context=context)
-        assert "足立さんの空きを9月9日（水）で見ました（60分、午後" in reply
+        assert "足立さんの9月9日（水）の空きを確認しました（60分、午後" in reply
         assert "1. 9月9日（水）14:30〜15:30" in reply
         assert meta["summary"] == "金融機関との打合せ"
 
@@ -605,6 +605,70 @@ class TestContextCarriesOver:
         assert plan.context_for(1, ADACHI, 1_000 + 3600)["date_from"] == "2026-09-09"
         assert plan.context_for(1, ADACHI, 1_000 + 3 * 3600) == {}  # 2時間で条件は引き継がない
         assert plan.pending(1, ADACHI, 1_000 + 3 * 3600) is not None  # 候補は24時間使える
+
+
+def any_time_runner(tmp_path, fields, sources=None):
+    """足立さんは曜日・時間帯の制限なし（本人の指定: 土日祝・24時間すべて可）。"""
+    plan = runner(tmp_path, fields, sources)
+    plan._config.data["schedule"]["members"][0]["any_time"] = True
+    return plan
+
+
+class TestNoLimitsForTheOwner:
+    """足立さん本人の予定には 9:00〜18:00・昼休み・土日祝の制限を掛けない。
+
+    ただし候補はまず通常の時間帯で探し、無いときだけ時間外・土日祝へ広げる
+    （深夜0時を最初に勧めないため）。
+    """
+
+    def test_no_hours_caveat_in_the_wording(self, tmp_path):
+        reply, _, _ = any_time_runner(tmp_path, ONE_DAY, {"足立": [FakeSource(REAL_9TH)]}).propose(
+            "9日に金融機関との打合せ予定1時間取れる？", ADACHI, True
+        )
+        assert "足立さんの9月9日（水）の空きを確認しました（60分）。" in reply
+        assert "昼休み" not in reply and "09:00〜18:00" not in reply
+        assert "1. 9月9日（水）14:30〜15:30" in reply  # 通常の時間帯に空きがあればそこから
+
+    def test_outside_hours_only_when_normal_hours_are_full(self, tmp_path):
+        fields = {**ONE_DAY, "duration_minutes": 120}
+        reply, meta, _ = any_time_runner(tmp_path, fields, {"足立": [FakeSource(REAL_9TH)]}).propose(
+            "9日に2時間取れる？", ADACHI, True
+        )
+        assert "1. 9月9日（水）07:00〜09:00" in reply  # 9:30の予定の15分前まで。深夜ではなく朝を選ぶ
+        assert "※通常の時間帯（09:00〜18:00）に続けて120分の空きが無かったため、時間外や土日祝も含めて確認しています。" in reply
+        assert len(meta["candidates"]) == 1
+
+    def test_weekends_are_allowed(self, tmp_path):
+        fields = {**ONE_DAY, "date_from": "2026-09-12", "date_to": "2026-09-13"}  # 土日
+        reply, meta, _ = any_time_runner(tmp_path, fields, {"足立": [FakeSource([])]}).propose(
+            "土日に1時間取れる？", ADACHI, True
+        )
+        assert "1. 9月12日（土）09:00〜10:00" in reply
+        assert "2. 9月12日（土）12:00〜13:00" in reply  # 昼休みも外さない
+        assert "3. 9月13日（日）09:00〜10:00" in reply
+
+    def test_a_late_fixed_time_is_free(self, tmp_path):
+        fields = {**ONE_DAY, "fixed_start": "2026-09-08 19:30"}
+        reply, meta, _ = any_time_runner(tmp_path, fields, {"足立": [FakeSource(REAL_9TH)]}).propose(
+            "8日の19時半に1時間取れる？", ADACHI, True
+        )
+        assert "9月8日（火）19:30〜20:30は空いています。" in reply
+        assert meta["conflicts"] == []
+
+    def test_a_partner_with_hours_still_bounds_the_search(self, tmp_path):
+        # 篠田さんは火水が休み。足立さんが制限なしでも、2人の打合せは篠田さんの出勤日から
+        fields = {**WEEK, "date_from": "2026-09-08", "date_to": "2026-09-09"}
+        reply, meta, _ = any_time_runner(tmp_path, fields, {"足立": [FakeSource([])], "篠田": [FakeSource([])]}).propose(
+            "火水で篠田さんと打合せしたい。候補ある？", ADACHI, True
+        )
+        assert "・9月8日（火）: 篠田さんの出勤日ではありません" in reply
+        assert "1. 9月10日（木）09:00〜10:00" in reply
+        assert "時間外" not in reply
+
+    def test_the_default_owner_keeps_the_limits(self, tmp_path):
+        fields = {**ONE_DAY, "date_from": "2026-09-12", "date_to": "2026-09-13"}
+        reply, meta, _ = runner(tmp_path, fields, {"足立": [FakeSource([])]}).propose("土日に1時間取れる？", ADACHI, True)
+        assert "・9月12日（土）: 土日" in reply and "近い日でしたら" in reply
 
 
 class TestMissingFieldsAsked:
