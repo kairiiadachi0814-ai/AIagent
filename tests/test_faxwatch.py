@@ -656,7 +656,7 @@ class TestQuestionsInTheFaxRoom:
          "stage": 0, "check_ids": []},
     ]
 
-    def _handler(self, tmp_path, monkeypatch, state):
+    def _handler(self, tmp_path, monkeypatch, state, now=at(2026, 9, 7, 19, 23)):
         from tests.test_guest import make_handler
 
         handler, chatwork, generator, audit = make_handler(tmp_path, monkeypatch, members=(ADACHI, SHINODA))
@@ -665,7 +665,7 @@ class TestQuestionsInTheFaxRoom:
         (tmp_path / "state" / "faxwatch.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
         from raizuinu.faxwatch import FaxStatus
 
-        handler._fax_status = FaxStatus(handler._config)
+        handler._fax_status = FaxStatus(handler._config, now=lambda: now)
         return handler, chatwork, generator, audit
 
     @staticmethod
@@ -693,11 +693,33 @@ class TestQuestionsInTheFaxRoom:
         assert audit.records[-1]["type"] == "fax_status"
 
     def test_nothing_waiting_is_said_plainly(self, tmp_path, monkeypatch):
+        # 月曜 19:23 → 控えている分は「明日の朝一」
         handler, chatwork, _, _ = self._handler(tmp_path, monkeypatch, {"open": [], "pending": [{"message_id": "7"}]})
         self._ask(handler, SHINODA, "未処理のFAXある？")
         body = chatwork.sent[0][1]
         assert "いま対応待ちのFAXはありません。" in body
-        assert "次の営業時間の頭に知らせる分が1件あります" in body
+        assert "ほかに、対応時間外に届いているFAXが1件あり、こちらは明日の朝一にお知らせいたします。" in body
+
+    def test_on_friday_night_it_says_monday(self, tmp_path, monkeypatch):
+        handler, chatwork, _, _ = self._handler(
+            tmp_path, monkeypatch, {"open": [], "pending": [{"message_id": "7"}, {"message_id": "8"}]},
+            now=at(2026, 9, 4, 20, 0),  # 金曜 20:00
+        )
+        self._ask(handler, ADACHI, "未処理ある？")
+        assert "対応時間外に届いているFAXが2件あり、こちらは来週月曜日の朝一にお知らせいたします。" in chatwork.sent[0][1]
+
+    @pytest.mark.parametrize("now, expected", [
+        (at(2026, 9, 3, 20, 0), "明日の朝一"),        # 木曜夜
+        (at(2026, 9, 4, 20, 0), "来週月曜日の朝一"),   # 金曜夜
+        (at(2026, 9, 5, 10, 0), "来週月曜日の朝一"),   # 土曜
+        (at(2026, 9, 6, 10, 0), "明日の朝一"),         # 日曜
+        (at(2026, 9, 7, 7, 0), "本日08:30"),           # 月曜の早朝
+        (at(2026, 9, 7, 10, 0), "順次"),               # 時間帯の中（上限待ちなど）
+    ])
+    def test_the_timing_follows_the_calendar(self, now, expected):
+        from raizuinu.faxwatch import delivery_phrase
+
+        assert delivery_phrase(now, {"start": "08:30", "end": "19:30"}) == expected
 
     def test_other_questions_are_pointed_to_the_department_room(self, tmp_path, monkeypatch):
         handler, chatwork, generator, _ = self._handler(tmp_path, monkeypatch, {"open": self.OPEN})

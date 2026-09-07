@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 JST = timezone(timedelta(hours=9))
+WEEKDAYS = "月火水木金土日"
 
 # 通知本文から拾う項目
 _FILENAME_RE = re.compile(r"ファイル名[：:]\s*([^\s\[]+\.pdf)", re.I)
@@ -1116,8 +1117,9 @@ class FaxStatus:
         "「未処理のFAXある？」のように聞いてください。ほかのご相談は経理財務部のルームでお願いします。"
     )
 
-    def __init__(self, config: Any) -> None:
+    def __init__(self, config: Any, now: Callable[[], datetime] | None = None) -> None:
         self._config = config
+        self._now = now or (lambda: datetime.now(JST))
         self._state_path = config.resolve_path(config.state_dir) / "faxwatch.json"
 
     def owns(self, room_id: int) -> bool:
@@ -1141,8 +1143,43 @@ class FaxStatus:
         else:
             lines.append("いま対応待ちのFAXはありません。")
         if pending:
-            lines.append(f"ほかに、時間外に届いて次の営業時間の頭に知らせる分が{len(pending)}件あります。")
+            when = delivery_phrase(self._now(), self._config.fax_watch.get("notify_window") or {})
+            timing = "順次お知らせいたします" if when == "順次" else f"{when}にお知らせいたします"
+            lines.append(f"ほかに、対応時間外に届いているFAXが{len(pending)}件あり、こちらは{timing}。")
         return "\n".join(lines)
+
+
+def next_delivery(now: datetime, window: dict) -> datetime:
+    """控えているFAXを次に知らせる時刻（通知の時間帯の頭）。時間帯の中なら今。"""
+    start = parse_clock(window.get("start"), (8, 30))
+    day = now.date()
+    if is_business_day(day):
+        if now < at_clock(day, start):
+            return at_clock(day, start)
+        if in_notify_window(now, window):
+            return now
+    day += timedelta(days=1)
+    while not is_business_day(day):
+        day += timedelta(days=1)
+    return at_clock(day, start)
+
+
+def delivery_phrase(now: datetime, window: dict) -> str:
+    """次に知らせるタイミングの言い方。「明日の朝一」「来週月曜日の朝一」「本日08:30」「順次」。
+
+    金曜の夜に「明日」と言わない（人の会話として日付に則した言い方にする）。
+    """
+    target = next_delivery(now, window)
+    if target <= now:
+        return "順次"
+    today, day = now.date(), target.date()
+    if day == today:
+        return f"本日{target:%H:%M}"
+    if day == today + timedelta(days=1):
+        return "明日の朝一"
+    if day.weekday() == 0:
+        return "来週月曜日の朝一"
+    return f"{WEEKDAYS[day.weekday()]}曜日の朝一"
 
 
 def _account_of(message: dict) -> int:
