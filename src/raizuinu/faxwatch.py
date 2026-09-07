@@ -390,6 +390,7 @@ class FaxWatcher:
         # 週末をまたぐと取りこぼす）。知らせるのは時間帯の中だけ
         self._collect(state, messages, notifier)
         self._close_finished(state, messages, room_id, notifier)
+        self._ack_evening_replies(state, messages, room_id, notifier)
         self._save_state(state)
 
         now = self._now()
@@ -397,6 +398,7 @@ class FaxWatcher:
         if in_notify_window(now, settings.get("notify_window") or {}):
             handled = self._deliver(state, room_id, notifier, now)
             self._follow_up(state, room_id, notifier, now)
+            self._evening_report(state, room_id, now)
             self._save_state(state)
         return handled
 
@@ -583,13 +585,17 @@ class FaxWatcher:
         if not threads:
             return
         me = self._me()
+        # 夕方の一覧への返信は、載っている発注書すべてへの返事として受ける
+        evening_ids = {str(i) for i in state.get("evening_ids") or []}
+        filenames = [str(t.get("filename") or "") for t in threads if t.get("filename")]
         remaining = []
-        thanked: set[str] = set()
+        closers: dict[str, dict] = {}
         for thread in threads:
             ids = {str(thread.get("posted_id")), str(thread.get("pdf_id"))} | {
                 str(c) for c in thread.get("check_ids") or []
-            }
+            } | evening_ids
             since = _as_int(thread.get("posted_id"))
+            filename = str(thread.get("filename") or "")
             closer = None
             for message in messages:
                 mid = int(message.get("message_id", 0))
@@ -601,6 +607,10 @@ class FaxWatcher:
                 targets = reply_targets(body, room_id)
                 if targets and not (targets & ids):
                     continue  # 別のFAXへの返事
+                # ファイル名を挙げて書かれた報告は、そのFAXだけの話として読む
+                named = [f for f in filenames if f and f in body]
+                if named and filename not in named:
+                    continue
                 if is_completion(body):
                     closer = message
                     break
@@ -617,26 +627,116 @@ class FaxWatcher:
                     "stage": int(thread.get("stage", 0)),
                 }
             )
-            # 報告には一言返す。1つの「完了」で複数の発注書が閉じても、お礼は1回
-            closer_id = str(closer.get("message_id"))
-            if closer_id not in thanked:
-                thanked.add(closer_id)
-                self._thank(room_id, closer)
+            closers.setdefault(str(closer.get("message_id")), closer)
         state["open"] = remaining
+        # 報告には一言返す。1つの「完了」で複数の発注書が閉じても、お礼は1回。
+        # そのとき、まだ対応待ちのFAXがあれば一緒に示す（月曜朝にまとめて届いた
+        # 分の処理漏れを防ぐ）
+        for closer in closers.values():
+            self._thank(room_id, closer, remaining)
 
-    def _thank(self, room_id: int, message: dict) -> None:
-        """完了の報告に、相手のメッセージへの返信で礼を言う（黙って閉じない）。"""
+    def _thank(self, room_id: int, message: dict, remaining: list[dict]) -> None:
+        """完了の報告に、相手のメッセージへの返信で礼を言い、残りを添える（黙って閉じない）。"""
         try:
             if self._phrasebook is None:
                 from .phrasing import build
 
                 self._phrasebook = build(self._config)
             tag = f"[rp aid={_account_of(message)} to={room_id}-{message.get('message_id')}]"
-            self._chatwork.send_message(
-                room_id, f"{tag}\n{self._phrasebook.pick('fax_done_thanks', scope=str(room_id))}"
-            )
+            lines = [self._phrasebook.pick("fax_done_thanks", scope=str(room_id))]
+            lines += self._remaining_lines(remaining)
+            self._chatwork.send_message(room_id, f"{tag}\n" + "\n".join(lines))
         except Exception:
             print("[warn] 完了報告への返事に失敗: " + traceback.format_exc(), flush=True)
+
+    @staticmethod
+    def _thread_line(thread: dict) -> str:
+        """対応待ちのFAX1件の短い説明。「9/5 17:55 有限会社珍味屋 発注書（4955_001.pdf）」"""
+        received = str(thread.get("received_at") or "")
+        when = ""
+        for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+            try:
+                at = datetime.strptime(received, fmt)
+                when = f"{at.month}/{at.day} {at:%H:%M} "
+                break
+            except ValueError:
+                continue
+        sender = str(thread.get("sender") or "").strip() or "差出人不明"
+        kind = str(thread.get("kind") or "FAX")
+        return f"{when}{sender} {kind}（{thread.get('filename', '')}）"
+
+    def _remaining_lines(self, remaining: list[dict]) -> list[str]:
+        if not remaining:
+            return ["対応待ちのFAXは、これでありません。"]
+        lines = [f"対応待ちのFAXは、あと{len(remaining)}件です。"]
+        lines += ["・" + self._thread_line(t) for t in remaining]
+        return lines
+
+    def _evening_report(self, state: dict, room_id: int, now: datetime) -> None:
+        """業務終了の時刻に、対応完了の返信がないFAXの一覧を出して確認を求める（1日1回）。"""
+        settings = self._config.fax_watch.get("follow_up") or {}
+        clock_text = settings.get("evening_time")
+        if not clock_text or not settings.get("enabled", True):
+            return
+        today = now.strftime("%Y%m%d")
+        if state.get("evening_reported") == today or not is_business_day(now.date()):
+            return
+        if now < at_clock(now.date(), parse_clock(clock_text, (19, 0))):
+            return
+        state["evening_reported"] = today  # 残りが無い日も「今日は済み」にする
+        open_threads = state.get("open") or []
+        if not open_threads:
+            return
+        lines = [
+            f"お疲れさまです。{now:%H:%M}時点で、対応完了の返信をいただいていないFAXが{len(open_threads)}件あります。"
+        ]
+        lines += ["・" + self._thread_line(t) for t in open_threads]
+        lines.append(
+            "対応済みでしたら「対応完了」とご返信ください（このメッセージへの返信で、まとめてで構いません）。"
+        )
+        lines.append("未対応のままで問題ないかもあわせてご確認ください。残っている分は翌営業日にもお知らせします。")
+        try:
+            mid = self._chatwork.send_message(room_id, f"{self._heads()}\n" + "\n".join(lines))
+        except Exception:
+            print("[warn] 夕方の一覧の投稿に失敗: " + traceback.format_exc(), flush=True)
+            return
+        ids = [str(i) for i in state.get("evening_ids") or []] + [str(mid or "")]
+        state["evening_ids"] = [i for i in ids if i][-10:]
+        self._audit(
+            {
+                "type": "fax_evening_report",
+                "room_id": room_id,
+                "count": len(open_threads),
+                "filenames": [t.get("filename") for t in open_threads],
+            }
+        )
+
+    def _ack_evening_replies(self, state: dict, messages: list[dict], room_id: int, notifier: int) -> None:
+        """夕方の一覧への「問題なし」「明日対応します」のような返事に、一言返す（完了以外）。"""
+        evening_ids = {str(i) for i in state.get("evening_ids") or []}
+        if not evening_ids:
+            return
+        acked = [str(i) for i in state.get("acked") or []]
+        me = self._me()
+        for message in messages:
+            mid = str(message.get("message_id", ""))
+            if mid in acked or _account_of(message) in (notifier, me):
+                continue
+            body = str(message.get("body", ""))
+            if _OWN_MARK in body or not (reply_targets(body, room_id) & evening_ids):
+                continue
+            if is_completion(body):
+                continue  # 完了の報告は _close_finished がお礼を返す
+            acked.append(mid)
+            try:
+                tag = f"[rp aid={_account_of(message)} to={room_id}-{mid}]"
+                self._chatwork.send_message(
+                    room_id,
+                    f"{tag}\n承知しました。残っている分は、対応完了の返信をいただくまで翌営業日にもお知らせします。",
+                )
+            except Exception:
+                print("[warn] 夕方の一覧への返事に失敗: " + traceback.format_exc(), flush=True)
+        state["acked"] = acked[-50:]
 
     def _follow_up(self, state: dict, room_id: int, notifier: int, now: datetime) -> None:
         """返事の無い発注書を、翌営業日の朝と昼に一度ずつ聞く。"""
@@ -651,10 +751,17 @@ class FaxWatcher:
         if gap <= timedelta(0):
             gap = timedelta(hours=3)
 
+        max_open_days = int(settings.get("max_open_days", 14))
         remaining = []
         for thread in state.get("open") or []:
             stage = int(thread.get("stage", 0))
             posted_at = _parse_iso(thread.get("posted_at")) or now
+            if now - posted_at >= timedelta(days=max_open_days):
+                # いつまでも一覧に載せ続けない。外したことは記録に残す
+                self._audit(
+                    {"type": "fax_expired", "room_id": room_id, "filename": thread.get("filename")}
+                )
+                continue
             if stage == 0:
                 due = at_clock(next_business_day(posted_at.date()), check_clock)
                 if now >= due:
@@ -670,7 +777,12 @@ class FaxWatcher:
                     due = checked_at + gap
                 if now >= due:
                     self._post_check(room_id, notifier, thread, now, first=False)
-                    continue  # 2度目で打ち切り。以後は人に任せる
+                    # 催促は2度で打ち切るが、対応待ちとしては残す（夕方の一覧と
+                    # お礼の返信で示し続け、完了の返事で外れる）
+                    thread["stage"] = 2
+                    thread["rechecked_at"] = now.isoformat()
+                remaining.append(thread)
+            else:
                 remaining.append(thread)
         state["open"] = remaining
 

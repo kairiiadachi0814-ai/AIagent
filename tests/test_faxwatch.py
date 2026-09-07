@@ -95,7 +95,8 @@ def make_config(tmp_path):
         "max_pdf_mb": 15, "max_per_day": 50,
         "mention_kinds": ["発注書", "注文書", "請求書", "見積書", "納品書"],
         "notify_window": {"start": "08:30", "end": "19:30"},
-        "follow_up": {"enabled": True, "check_time": "09:00", "recheck_time": "12:00"},
+        "follow_up": {"enabled": True, "check_time": "09:00", "recheck_time": "12:00",
+                      "evening_time": "19:00", "max_open_days": 14},
     }
     config.data["state_dir"] = str(tmp_path / "state")
     config.data["audit_log_dir"] = str(tmp_path / "logs")
@@ -421,6 +422,122 @@ class TestNotifying:
         assert w.run_once() == 0
 
 
+class TestNothingSlipsThrough:
+    """月曜朝にまとめて届いた分の処理漏れを防ぐ。お礼に残りを添え、19時に一覧を出す。"""
+
+    def two_orders(self, tmp_path, now=THU):
+        msgs = [
+            bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT),
+            bot(3, NOTICE_NO_SENDER.replace("4950", "4960").replace("19:10:09", "19:40:00")),
+            bot(4, ATTACHMENT.replace("4950", "4960")),
+        ]
+        w = watcher(tmp_path, msgs, ORDER, now=now)
+        prime(w)
+        assert w.run_once() == 2  # 通知は 9000, 9001
+        return w
+
+    def test_thanks_lists_what_is_still_waiting(self, tmp_path):
+        w = self.two_orders(tmp_path)
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]対応完了です。"))
+        w.run_once()
+        thanks = bodies(w)[2]
+        assert thanks.split("\n")[1] in BANKS["fax_done_thanks"]
+        assert "対応待ちのFAXは、あと1件です。" in thanks
+        assert "・9/4 19:40 光パックス石川 発注書（4960_001.pdf）" in thanks
+        assert "4950_001.pdf" not in thanks
+        # 最後の1件が済んだら、もう無いと言う
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9001]こちらも対応完了です。"))
+        w.run_once()
+        assert "対応待ちのFAXは、これでありません。" in bodies(w)[3]
+        assert w._load_state()["open"] == []
+
+    def test_a_report_naming_a_file_closes_only_that_one(self, tmp_path):
+        w = self.two_orders(tmp_path)
+        w._chatwork.messages.append(human(9500, "4960_001.pdf は対応完了です"))
+        w.run_once()
+        assert [t["filename"] for t in w._load_state()["open"]] == ["4950_001.pdf"]
+
+    def test_the_evening_report_lists_the_rest_once_a_day(self, tmp_path):
+        w = self.two_orders(tmp_path)
+        w.clock.now = at(2026, 9, 3, 18, 55)
+        w.run_once()
+        assert len(w._chatwork.sent) == 2
+        w.clock.now = at(2026, 9, 3, 19, 0)
+        w.run_once()
+        assert len(w._chatwork.sent) == 3
+        body = bodies(w)[2]
+        assert body.startswith(
+            f"[To:{SHINODA}] [To:{ADACHI}]\nお疲れさまです。19:00時点で、対応完了の返信をいただいていないFAXが2件あります。"
+        )
+        assert "・9/4 19:10 光パックス石川 発注書（4950_001.pdf）" in body
+        assert "・9/4 19:40 光パックス石川 発注書（4960_001.pdf）" in body
+        assert "「対応完了」とご返信ください" in body and "問題ないか" in body
+        w.clock.now = at(2026, 9, 3, 19, 10)
+        w.run_once()
+        assert len(w._chatwork.sent) == 3  # 同じ日に二度は出さない
+        assert w._load_state()["evening_ids"] == ["9002"]
+
+    def test_no_report_when_nothing_is_waiting(self, tmp_path):
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], AD)
+        prime(w)
+        w.run_once()
+        w.clock.now = at(2026, 9, 3, 19, 0)
+        w.run_once()
+        assert len(w._chatwork.sent) == 1
+
+    def test_replying_done_to_the_evening_report_closes_everything(self, tmp_path):
+        w = self.two_orders(tmp_path)
+        w.clock.now = at(2026, 9, 3, 19, 0)
+        w.run_once()  # 一覧は 9002
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9002]2件とも対応完了です"))
+        w.clock.now = at(2026, 9, 3, 19, 5)
+        w.run_once()
+        assert w._load_state()["open"] == []
+        assert "対応待ちのFAXは、これでありません。" in bodies(w)[3]
+        assert len(w._chatwork.sent) == 4  # お礼は1回
+
+    def test_an_answer_other_than_done_gets_an_acknowledgement(self, tmp_path):
+        w = self.two_orders(tmp_path)
+        w.clock.now = at(2026, 9, 3, 19, 0)
+        w.run_once()
+        w._chatwork.messages.append(
+            human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9002]問題なしです。明日対応します。")
+        )
+        w.clock.now = at(2026, 9, 3, 19, 5)
+        w.run_once()
+        assert len(w._load_state()["open"]) == 2  # 閉じない
+        ack = bodies(w)[3]
+        assert ack.startswith(f"[rp aid={SHINODA} to={FAX_ROOM}-9500]\n承知しました。")
+        assert "翌営業日にもお知らせします" in ack
+        w.run_once()
+        assert len(w._chatwork.sent) == 4  # 同じ返事に二度は返さない
+
+    def test_reminded_twice_it_still_stays_on_the_list(self, tmp_path):
+        w = self.two_orders(tmp_path)
+        for when in (at(2026, 9, 4, 9, 0), at(2026, 9, 4, 12, 0)):
+            w.clock.now = when
+            w.run_once()
+        assert all(t["stage"] == 2 for t in w._load_state()["open"])
+        w.clock.now = at(2026, 9, 4, 19, 0)
+        w.run_once()
+        assert "FAXが2件あります" in bodies(w)[-1]
+        # 次の営業日、催促は増えないが夕方の一覧は続く
+        w.clock.now = at(2026, 9, 7, 9, 0)
+        w.run_once()
+        w.clock.now = at(2026, 9, 7, 12, 0)
+        w.run_once()
+        count = len(w._chatwork.sent)
+        w.clock.now = at(2026, 9, 7, 19, 0)
+        w.run_once()
+        assert len(w._chatwork.sent) == count + 1
+
+    def test_very_old_ones_drop_off_the_list(self, tmp_path):
+        w = self.two_orders(tmp_path)
+        w.clock.now = at(2026, 9, 18, 9, 0)  # 15日後
+        w.run_once()
+        assert w._load_state()["open"] == []
+
+
 class TestUpsideDown:
     """実例（2026-09-05）: 珍味屋の天津栗発注書が逆さまに届き、「その他」で流れかけた。"""
 
@@ -548,12 +665,12 @@ class TestFollowUp:
         assert "たびたび失礼します。" in body
         assert "確認漏れになっていないでしょうか" in body
         assert "9月4日に光パックス石川から届いた発注書（4950_001.pdf）" in body
-        # 3度目は無い（以後は人に任せる）
+        # 3度目の催促は無い。ただし対応待ちとしては残る（夕方の一覧に載る）
         for later in (at(2026, 9, 4, 15, 0), at(2026, 9, 7, 9, 0), at(2026, 9, 8, 12, 0)):
             w.clock.now = later
             w.run_once()
         assert len(w._chatwork.sent) == 3
-        assert w._load_state()["open"] == []
+        assert [t["stage"] for t in w._load_state()["open"]] == [2]
 
     def test_a_friday_order_is_checked_on_monday(self, tmp_path):
         w = self.order(tmp_path, now=at(2026, 9, 4, 15, 0))  # 金
@@ -576,7 +693,8 @@ class TestFollowUp:
         assert w._load_state()["open"] == []
         thanks = bodies(w)[1]
         assert thanks.startswith(f"[rp aid={SHINODA} to={FAX_ROOM}-9500]\n")  # 相手の報告に返す
-        assert thanks.split("\n", 1)[1] in BANKS["fax_done_thanks"]
+        assert thanks.split("\n")[1] in BANKS["fax_done_thanks"]
+        assert thanks.split("\n")[2] == "対応待ちのFAXは、これでありません。"
 
     def test_a_plain_done_message_also_counts(self, tmp_path):
         # 返信タグ無しで「確認完了しました」と書かれても済んだと読む

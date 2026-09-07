@@ -112,7 +112,7 @@
     "max_pdf_mb": 15,
     "max_per_day": 50,
     "notify_window": { "start": "08:30", "end": "19:30" },
-    "follow_up": { "enabled": true, "check_time": "09:00", "recheck_time": "12:00" }
+    "follow_up": { "enabled": true, "check_time": "09:00", "recheck_time": "12:00", "evening_time": "19:00", "max_open_days": 14 }
   },
   "chat_archive": {
     "enabled": true,

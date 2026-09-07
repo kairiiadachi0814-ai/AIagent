@@ -205,8 +205,16 @@ _DEFAULTS: dict[str, Any] = {
         # 土日は流さない。祝日は平日と同じに扱う（祝日も業務があるため）
         "notify_window": {"start": "08:30", "end": "19:30"},
         # 発注書・注文書の見届け。「対応完了」の返事が無ければ翌営業日の check_time に
-        # 済んだかを聞き、それにも返事が無ければ recheck_time にもう一度だけ聞く
-        "follow_up": {"enabled": True, "check_time": "09:00", "recheck_time": "12:00"},
+        # 済んだかを聞き、それにも返事が無ければ recheck_time にもう一度だけ聞く。
+        # evening_time には対応待ちの一覧を出して確認を求める（残りが無ければ出さない）。
+        # 完了の返事が無いまま max_open_days 経ったものは一覧から外す
+        "follow_up": {
+            "enabled": True,
+            "check_time": "09:00",
+            "recheck_time": "12:00",
+            "evening_time": "19:00",
+            "max_open_days": 14,
+        },
     },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {
