@@ -168,7 +168,8 @@
       "max_candidates": 3,
       "per_day": 2,
       "skip_holidays": true,
-      "all_day_blocks": true,
+      "all_day_block_words": ["休", "出張", "外出", "不在", "旅行", "研修", "欠勤", "有給", "年休", "帰省"],
+      "explain_days": 3,
       "lead_minutes": 60,
       "grid_minutes": 30,
       "remember_minutes": 1440

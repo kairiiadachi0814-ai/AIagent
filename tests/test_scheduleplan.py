@@ -186,11 +186,27 @@ class TestSlots:
         fukumoto = Member("福本", skip_holidays=True)
         assert common_window(date(2026, 9, 21), [fukumoto], settings, {"2026-09-21"}) is None
 
-    def test_busy_adds_buffer_and_blocks_all_day(self):
-        busy = busy_of([ev(7, "10:00", "11:00"), ev(8, "14:00", "15:00")], date(2026, 9, 7), 15, True)
+    def test_busy_adds_buffer_and_blocks_absences_only(self):
+        words = Settings().all_day_block_words
+        busy = busy_of([ev(7, "10:00", "11:00"), ev(8, "14:00", "15:00")], date(2026, 9, 7), 15, words)
         assert busy == [(585, 675)]  # 前後15分
-        assert busy_of([ev(7, all_day=True, summary="出張")], date(2026, 9, 7), 15, True) == [(0, 1440)]
-        assert busy_of([ev(7, all_day=True)], date(2026, 9, 7), 15, False) == []
+        assert busy_of([ev(7, all_day=True, summary="出張")], date(2026, 9, 7), 15, words) == [(0, 1440)]
+        assert busy_of([ev(7, all_day=True, summary="夏季休暇")], date(2026, 9, 7), 15, words) == [(0, 1440)]
+        # 覚え書きの終日予定は塞がない（実例: 「[予定入力NG]」が入った日に打合せを取りたい）
+        assert busy_of([ev(7, all_day=True, summary="[予定入力NG]")], date(2026, 9, 7), 15, words) == []
+        assert busy_of([ev(7, all_day=True, summary="出張")], date(2026, 9, 7), 15, ()) == []
+
+    def test_free_gaps_show_the_real_picture(self):
+        from raizuinu.scheduleplan import free_gaps
+
+        gaps = free_gaps((540, 1080), [(585, 675), (765, 855), (945, 1035)], (720, 780))
+        assert gaps == [(540, 585), (675, 720), (855, 945), (1035, 1080)]
+
+    def test_a_gap_start_off_the_grid_is_still_a_slot(self):
+        # 14:15〜15:45 の空きに60分を入れる: 14:30（切りの良い方）と14:15（区間の頭）
+        slots = free_slots((540, 1080), [(0, 855), (945, 1440)], 60, None, 30)
+        assert slots == [(855, 915), (870, 930)]
+        assert pick_for_day(slots) == [(870, 930)]  # 30分刻みを優先
 
     def test_free_slots_skip_busy_and_lunch(self):
         slots = free_slots((540, 1080), [(585, 675)], 60, (720, 780), 30)
@@ -296,12 +312,65 @@ class TestPropose:
         assert "足立さんのカレンダーを読み取れなかった" in reply
         assert meta["failed_sources"] == ["トヨクモ"]
 
-    def test_no_slot_is_said_plainly(self, tmp_path):
+    def test_no_slot_explains_why_and_looks_ahead(self, tmp_path):
         fields = {**WEEK, "date_from": "2026-09-08", "date_to": "2026-09-09"}  # 篠田の休みだけ
         reply, meta, _ = runner(tmp_path, fields, {"足立": [FakeSource([])], "篠田": [FakeSource([])]}).propose(
             "火水で篠田さんと打合せしたい。候補ある？", ADACHI, True
         )
-        assert "見つかりませんでした" in reply and meta["candidates"] == []
+        assert "足立・篠田さんの9月8日（火）〜9月9日（水）は、全員が揃う60分の時間がありませんでした。" in reply
+        assert "・9月8日（火）: 篠田さんの出勤日ではありません" in reply
+        assert "近い日でしたら、次が空いています。" in reply
+        assert "1. 9月10日（木）09:00〜10:00" in reply
+        assert len(meta["candidates"]) == 3
+
+
+REAL_9TH = [  # 2026-09-09 の足立さんの実際の予定（トヨクモ）
+    ev(9, all_day=True, summary="[予定入力NG]"),
+    ev(9, "09:30", "10:00", "[外出]移動"), ev(9, "09:30", "10:00", "登録制アルバイト処理確認他"),
+    ev(9, "10:00", "11:00", "[会議（リアル）]【仮】京都中央信用金庫"), ev(9, "11:00", "12:00", "[外出]三十三銀行訪問"),
+    ev(9, "12:00", "12:30", "[外出]移動"), ev(9, "13:00", "14:00", "[会議（リアル）]京都中央信用金庫 澤田様・白樫様来社"),
+    ev(9, "16:00", "17:00", "タスク実行時間調整"),
+    Event(summary="㈱HEATtireservise 平岡様（時間調整中）", start=datetime(2026, 9, 9, 19, 15, tzinfo=JST),
+          end=datetime(2026, 9, 10, 0, 15, tzinfo=JST)),
+]
+ONE_DAY = {"participants": [], "duration_minutes": 60, "date_from": "2026-09-09", "date_to": "2026-09-09",
+           "summary": "金融機関との打合せ", "opening": "金融機関との打合せの日程ですね。"}
+
+
+class TestOnePersonOneDay:
+    """実例（2026-09-07）: 「9日に金融機関との打合せ予定1時間取れる？」。
+
+    本人1人の空きなのに「全員が揃う枠が見つかりませんでした」と返した。
+    終日の「[予定入力NG]」で日を塞いでいたのが原因。
+    """
+
+    def test_the_memo_does_not_block_and_the_gap_is_found(self, tmp_path):
+        reply, meta, _ = runner(tmp_path, ONE_DAY, {"足立": [FakeSource(REAL_9TH)]}).propose(
+            "9日に金融機関との打合せ予定1時間取れる？", ADACHI, True
+        )
+        assert reply.startswith("金融機関との打合せの日程ですね。")
+        assert "足立さんの空きを9月9日（水）で見ました" in reply  # 1人なら「全員」と言わない、1日なら範囲で書かない
+        assert "1. 9月9日（水）14:30〜15:30" in reply  # 14:00の会議の後15分空け、16:00の前15分空けた中
+        assert "※9月9日（水）は終日「[予定入力NG]」が入っています。" in reply
+        assert "全員" not in reply
+        assert meta["summary"] == "金融機関との打合せ" and len(meta["candidates"]) == 1
+
+    def test_when_the_day_is_full_the_gaps_are_shown_and_next_days_offered(self, tmp_path):
+        fields = {**ONE_DAY, "duration_minutes": 120}
+        sources = {"足立": [FakeSource(REAL_9TH + [ev(10, "09:00", "09:30", "朝会")])]}
+        reply, meta, _ = runner(tmp_path, fields, sources).propose("9日に2時間取れる？", ADACHI, True)
+        assert "足立さんの9月9日（水）は、続けて空く120分の時間がありませんでした。" in reply
+        assert "・9月9日（水）の空き: 14:15〜15:45（90分）、17:15〜18:00（45分）" in reply
+        assert "（予定の前後15分を空けて見ています）" in reply
+        assert "近い日でしたら、次が空いています。" in reply
+        assert "1. 9月10日（木）10:00〜12:00" in reply  # 9:30の朝会の後15分空けて
+        assert "全員" not in reply
+
+    def test_a_fixed_time_for_one_person(self, tmp_path):
+        fields = {**ONE_DAY, "fixed_start": "2026-09-09 14:30"}
+        reply, _, _ = runner(tmp_path, fields, {"足立": [FakeSource(REAL_9TH)]}).propose("9日14時半に1時間取れる？", ADACHI, True)
+        assert "9月9日（水）14:30〜15:30は空いています。" in reply
+        assert "とも空いています" not in reply
 
     def test_defaults_when_nothing_is_specified(self, tmp_path):
         fields = {"participants": ["篠田"], "opening": "はい、探しますね。"}

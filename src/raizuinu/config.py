@@ -123,8 +123,11 @@ _DEFAULTS: dict[str, Any] = {
             "per_day": 2,
             # 祝日を候補から外す（メンバー個別の設定は members[].skip_holidays）
             "skip_holidays": True,
-            # 終日予定（出張・休暇など）はその日を丸ごと塞ぐ
-            "all_day_blocks": True,
+            # 終日予定のうち、その日を丸ごと塞ぐとみなす言葉（本人が居ない予定）。
+            # 「[予定入力NG]」のような覚え書きは塞がず、候補に注記として添える
+            "all_day_block_words": ["休", "出張", "外出", "不在", "旅行", "研修", "欠勤", "有給", "年休", "帰省"],
+            # 空きが無かったとき、日ごとの空きの実態を書く期間の上限（日）
+            "explain_days": 3,
             # 今から何分後以降を候補にするか
             "lead_minutes": 60,
             "grid_minutes": 30,
