@@ -587,6 +587,59 @@ class TestNothingSlipsThrough:
         assert w._load_state()["open"] == []
 
 
+COMBINED = (
+    "[To:7777]\n[info][title]FAX受信通知[/title]受信日時：2026/09/07 18:55:46\n"
+    "送信元番号なしのFAXです\nRJOBNUM：8531\nファイル名：4971_001.pdf\n"
+    "PDFは添付ファイルをご確認ください[/info]\n"
+    "[info][title][dtext:file_uploaded][/title][download:2154500001]4971_001.pdf (40.0 KB)[/download][/info]"
+)
+
+
+class TestRepostsAndCombinedNotices:
+    """実例（2026-09-07）: 通知と添付が1通にまとまって届き、受信日時が拾えなかった。
+    同じファイル（4962_001.pdf）が3回投稿され、3回とも読んで知らせた。"""
+
+    def test_a_combined_message_keeps_the_received_time(self, tmp_path):
+        w = watcher(tmp_path, [bot(5, COMBINED)], ORDER)
+        prime(w)
+        assert w.run_once() == 1
+        assert "受信 2026/09/07 18:55:46" in bodies(w)[0]
+        assert w._load_state()["open"][0]["received_at"] == "2026/09/07 18:55:46"
+
+    def test_a_late_notice_fills_in_a_held_fax(self, tmp_path):
+        # 土曜に添付だけ見え、通知本文は次の巡回で見えた場合
+        w = watcher(tmp_path, [bot(2, ATTACHMENT)], ORDER, now=at(2026, 9, 5, 10, 0))
+        prime(w)
+        w.run_once()
+        assert w._load_state()["pending"][0]["notice"] == {}
+        w._chatwork.messages.append(bot(1, NOTICE_NO_SENDER))
+        w.run_once()
+        assert w._load_state()["pending"][0]["notice"]["received_at"] == "2026/09/04 19:10:09"
+
+    def test_a_repost_of_a_read_fax_is_not_read_again(self, tmp_path):
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], ORDER)
+        prime(w)
+        assert w.run_once() == 1
+        w._chatwork.messages.append(bot(6, ATTACHMENT.replace("2153301583", "2153309999")))  # 同じ名前の再投稿
+        w.clock.now = at(2026, 9, 3, 10, 20)
+        assert w.run_once() == 0
+        assert w._client.calls == 1  # 読み直さない
+        note = bodies(w)[1]
+        assert note.startswith(f"[rp aid={NOTIFIER} to={FAX_ROOM}-6]\nこのFAX（4950_001.pdf）は10:00に知らせた分と同じファイル名のため")
+        assert "[To:" not in note
+        assert len(w._load_state()["open"]) == 1  # 見届けも二重にしない
+
+    def test_a_resend_after_an_unreadable_one_is_read_again(self, tmp_path):
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], [BLURRY, BLURRY, ORDER])
+        prime(w)
+        w.run_once()
+        assert "読み取れませんでした" in bodies(w)[0]
+        w._chatwork.messages.append(bot(6, ATTACHMENT.replace("2153301583", "2153309999")))
+        w.clock.now = at(2026, 9, 3, 10, 20)
+        assert w.run_once() == 1
+        assert "光パックス石川から発注書が届きました" in bodies(w)[1]
+
+
 class TestUpsideDown:
     """実例（2026-09-05）: 珍味屋の天津栗発注書が逆さまに届き、「その他」で流れかけた。"""
 

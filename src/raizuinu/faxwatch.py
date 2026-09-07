@@ -454,20 +454,33 @@ class FaxWatcher:
         newest = last_seen
         pending = state.setdefault("pending", [])
         known = {str(p.get("message_id")) for p in pending} | set(state.get("done") or [])
+        # 先に控えた分で通知本文が取れていなければ、今回見えた通知で埋める
+        for item in pending:
+            if not (item.get("notice") or {}).get("received_at"):
+                found = notices.get(str(item["attachment"].get("filename", "")).lower())
+                if found:
+                    item["notice"] = found
         for message in messages:
             mid = int(message.get("message_id", 0))
             newest = max(newest, mid)
             if mid <= last_seen or _account_of(message) != notifier:
                 continue
-            attachment = parse_attachment(message.get("body", ""))
+            body = str(message.get("body", ""))
+            attachment = parse_attachment(body)
             if attachment is None or str(mid) in known:
                 continue
+            notice = notices.get(attachment["filename"].lower()) or {}
+            if not notice.get("received_at"):
+                # 通知本文と添付が1通にまとまっている形式（実例 2026-09-07 の 4971_001.pdf）
+                own = parse_notice(body)
+                if own.get("received_at") or own.get("filename"):
+                    notice = own
             pending.append(
                 {
                     "message_id": str(mid),
                     "account_id": notifier,
                     "attachment": attachment,
-                    "notice": notices.get(attachment["filename"].lower(), {}),
+                    "notice": notice,
                 }
             )
         if len(pending) > MAX_PENDING:
@@ -485,14 +498,23 @@ class FaxWatcher:
         follow = (settings.get("follow_up") or {}).get("enabled", True)
 
         handled = 0
+        seen = state.setdefault("handled", {})  # ファイル名 → 直近の処理（同じFAXの再投稿を二度読まない）
         for item in sorted(list(state.get("pending") or []), key=lambda p: int(p["message_id"])):
             if state["count"] >= limit:
                 print(f"[warn] FAXの1日の処理上限（{limit}件）に達しました。残りは明日知らせます", flush=True)
                 break
-            state["count"] += 1
+            state["pending"] = [p for p in state["pending"] if p["message_id"] != item["message_id"]]
             state.setdefault("done", []).append(item["message_id"])
             state["done"] = state["done"][-500:]
-            state["pending"] = [p for p in state["pending"] if p["message_id"] != item["message_id"]]
+            filename = str(item["attachment"].get("filename", "")).lower()
+            prior = seen.get(filename) or {}
+            if prior.get("readable") and now.timestamp() - float(prior.get("ts", 0)) < 24 * 3600:
+                # 同じファイル名を読めた直後の再投稿。読み直さず、その旨だけ静かに置く
+                # （読めなかった分の再送は読み直す）
+                self._save_state(state)
+                self._note_duplicate(room_id, item, prior)
+                continue
+            state["count"] += 1
             self._save_state(state)  # 呼ぶ前に数える（失敗しても消費は起きるため）
             try:
                 result = self._handle(room_id, item, follow)
@@ -501,6 +523,15 @@ class FaxWatcher:
                 print("[error] FAXの処理に失敗: " + traceback.format_exc(), flush=True)
                 self._report_failure(room_id, item)
                 continue
+            seen[filename] = {
+                "ts": now.timestamp(),
+                "readable": bool(result.get("readable")),
+                "message_id": item["message_id"],
+                "at": now.strftime("%H:%M"),
+            }
+            if len(seen) > 300:
+                for key in sorted(seen, key=lambda k: float(seen[k].get("ts", 0)))[: len(seen) - 300]:
+                    seen.pop(key, None)
             if follow and result.get("is_order"):
                 state.setdefault("open", []).append(
                     {
@@ -1004,6 +1035,21 @@ class FaxWatcher:
         if ask_done:
             lines.append(ASK_DONE)
         return "\n".join(lines)
+
+    def _note_duplicate(self, room_id: int, item: dict, prior: dict) -> None:
+        """同じファイル名の再投稿に、読み直していないことだけ書く（To は付けない）。"""
+        filename = (item.get("attachment") or {}).get("filename", "")
+        try:
+            tag = f"[rp aid={int(item.get('account_id', 0))} to={room_id}-{item['message_id']}]"
+            self._chatwork.send_message(
+                room_id,
+                f"{tag}\nこのFAX（{filename}）は{prior.get('at', '先ほど')}に知らせた分と同じファイル名のため、改めては読んでいません。",
+            )
+        except Exception:
+            print("[warn] 重複の知らせに失敗: " + traceback.format_exc(), flush=True)
+        self._audit(
+            {"type": "fax_duplicate", "room_id": room_id, "message_id": str(item["message_id"]), "filename": filename}
+        )
 
     def _report_failure(self, room_id: int, item: dict) -> None:
         """読めなかったことは黙らずに知らせる（届いたのに気づかれないのを防ぐ）。"""
