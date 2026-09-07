@@ -656,7 +656,7 @@ class TestQuestionsInTheFaxRoom:
          "stage": 0, "check_ids": []},
     ]
 
-    def _handler(self, tmp_path, monkeypatch, state, now=at(2026, 9, 7, 19, 23)):
+    def _handler(self, tmp_path, monkeypatch, state, now=at(2026, 9, 7, 19, 45)):  # 月曜、時間帯の後
         from tests.test_guest import make_handler
 
         handler, chatwork, generator, audit = make_handler(tmp_path, monkeypatch, members=(ADACHI, SHINODA))
@@ -693,7 +693,7 @@ class TestQuestionsInTheFaxRoom:
         assert audit.records[-1]["type"] == "fax_status"
 
     def test_nothing_waiting_is_said_plainly(self, tmp_path, monkeypatch):
-        # 月曜 19:23 → 控えている分は「明日の朝一」
+        # 月曜 19:45（時間帯の後）→ 控えている分は「明日の朝一」
         handler, chatwork, _, _ = self._handler(tmp_path, monkeypatch, {"open": [], "pending": [{"message_id": "7"}]})
         self._ask(handler, SHINODA, "未処理のFAXある？")
         body = chatwork.sent[0][1]
