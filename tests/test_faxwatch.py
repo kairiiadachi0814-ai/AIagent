@@ -640,6 +640,95 @@ class TestRepostsAndCombinedNotices:
         assert "光パックス石川から発注書が届きました" in bodies(w)[1]
 
 
+class TestQuestionsInTheFaxRoom:
+    """実例（2026-09-07 19:23）: FAXルームで「未処理の注文書残ってる？」と聞かれ、無言だった。
+
+    FAXルームは許可ルームに入れていない（社内ナレッジを流さないため）。対応状況の
+    問い合わせにだけ、見張りの状態から答える。
+    """
+
+    OPEN = [
+        {"posted_id": "9000", "pdf_id": "2", "filename": "4958_001.pdf", "sender": "株式会社髙島屋 泉北店",
+         "kind": "発注書", "received_at": "2026/09/06 18:21:18", "posted_at": "2026-09-07T08:30:00+09:00",
+         "stage": 0, "check_ids": []},
+        {"posted_id": "9001", "pdf_id": "4", "filename": "4971_001.pdf", "sender": "㈱髙島屋 大阪店",
+         "kind": "発注書", "received_at": "2026/09/07 18:55:46", "posted_at": "2026-09-07T19:00:00+09:00",
+         "stage": 0, "check_ids": []},
+    ]
+
+    def _handler(self, tmp_path, monkeypatch, state):
+        from tests.test_guest import make_handler
+
+        handler, chatwork, generator, audit = make_handler(tmp_path, monkeypatch, members=(ADACHI, SHINODA))
+        handler._config.data["fax_watch"] = {**make_config(tmp_path).data["fax_watch"]}
+        (tmp_path / "state").mkdir(exist_ok=True)
+        (tmp_path / "state" / "faxwatch.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        from raizuinu.faxwatch import FaxStatus
+
+        handler._fax_status = FaxStatus(handler._config)
+        return handler, chatwork, generator, audit
+
+    @staticmethod
+    def _ask(handler, account_id, text, message_id="1"):
+        from tests.test_handler import sign
+
+        raw = json.dumps({
+            "webhook_event_type": "mention_to_me",
+            "webhook_event": {"from_account_id": account_id, "to_account_id": 999, "room_id": FAX_ROOM,
+                              "message_id": message_id, "body": f"[To:999] {text}", "send_time": 1757240580},
+        }).encode()
+        return handler.handle_webhook(raw, sign(raw))
+
+    def test_the_open_list_is_answered_from_state(self, tmp_path, monkeypatch):
+        handler, chatwork, generator, audit = self._handler(tmp_path, monkeypatch, {"open": self.OPEN, "pending": []})
+        result = self._ask(handler, ADACHI, "今、未処理の注文書や発注書残ってる？")
+        assert result.status == 200
+        body = chatwork.sent[0][1]
+        assert body.startswith(f"[rp aid={ADACHI} to={FAX_ROOM}-1]")
+        assert "いま対応完了の返信をいただいていないのは2件です。" in body
+        assert "・9/6 18:21 株式会社髙島屋 泉北店 発注書（4958_001.pdf）" in body
+        assert "・9/7 18:55 ㈱髙島屋 大阪店 発注書（4971_001.pdf）" in body
+        assert "「対応完了」とお知らせください" in body
+        assert not generator.calls  # ハンドブックは使わない
+        assert audit.records[-1]["type"] == "fax_status"
+
+    def test_nothing_waiting_is_said_plainly(self, tmp_path, monkeypatch):
+        handler, chatwork, _, _ = self._handler(tmp_path, monkeypatch, {"open": [], "pending": [{"message_id": "7"}]})
+        self._ask(handler, SHINODA, "未処理のFAXある？")
+        body = chatwork.sent[0][1]
+        assert "いま対応待ちのFAXはありません。" in body
+        assert "次の営業時間の頭に知らせる分が1件あります" in body
+
+    def test_other_questions_are_pointed_to_the_department_room(self, tmp_path, monkeypatch):
+        handler, chatwork, generator, _ = self._handler(tmp_path, monkeypatch, {"open": self.OPEN})
+        self._ask(handler, ADACHI, "経費精算の締め日は？")
+        assert "FAXの対応状況だけお答えしています" in chatwork.sent[0][1]
+        assert not generator.calls  # 社内ナレッジはこのルームへ流さない
+
+    def test_the_notifier_bot_gets_no_reply(self, tmp_path, monkeypatch):
+        handler, chatwork, _, _ = self._handler(tmp_path, monkeypatch, {"open": self.OPEN})
+        self._ask(handler, NOTIFIER, "未処理ある？")
+        assert chatwork.sent == []
+
+    def test_other_rooms_outside_the_list_stay_silent(self, tmp_path, monkeypatch):
+        from tests.test_handler import sign
+
+        handler, chatwork, _, _ = self._handler(tmp_path, monkeypatch, {"open": self.OPEN})
+        raw = json.dumps({
+            "webhook_event_type": "mention_to_me",
+            "webhook_event": {"from_account_id": ADACHI, "to_account_id": 999, "room_id": 345854487,
+                              "message_id": "2", "body": "[To:999] 未処理ある？", "send_time": 1757240580},
+        }).encode()
+        handler.handle_webhook(raw, sign(raw))
+        assert chatwork.sent == []
+
+    def test_the_same_message_is_answered_once(self, tmp_path, monkeypatch):
+        handler, chatwork, _, _ = self._handler(tmp_path, monkeypatch, {"open": self.OPEN})
+        self._ask(handler, ADACHI, "未処理ある？", "5")
+        self._ask(handler, ADACHI, "未処理ある？", "5")
+        assert len(chatwork.sent) == 1
+
+
 class TestUpsideDown:
     """実例（2026-09-05）: 珍味屋の天津栗発注書が逆さまに届き、「その他」で流れかけた。"""
 

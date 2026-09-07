@@ -716,21 +716,7 @@ class FaxWatcher:
         except Exception:
             print("[warn] 完了報告への返事に失敗: " + traceback.format_exc(), flush=True)
 
-    @staticmethod
-    def _thread_line(thread: dict) -> str:
-        """対応待ちのFAX1件の短い説明。「9/5 17:55 有限会社珍味屋 発注書（4955_001.pdf）」"""
-        received = str(thread.get("received_at") or "")
-        when = ""
-        for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
-            try:
-                at = datetime.strptime(received, fmt)
-                when = f"{at.month}/{at.day} {at:%H:%M} "
-                break
-            except ValueError:
-                continue
-        sender = str(thread.get("sender") or "").strip() or "差出人不明"
-        kind = str(thread.get("kind") or "FAX")
-        return f"{when}{sender} {kind}（{thread.get('filename', '')}）"
+    _thread_line = staticmethod(lambda thread: thread_line(thread))
 
     def _remaining_lines(self, remaining: list[dict]) -> list[str]:
         if not remaining:
@@ -1092,6 +1078,71 @@ class FaxWatcher:
             self._state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
         except OSError:
             print("[warn] FAX巡回の状態を保存できませんでした", flush=True)
+
+
+def thread_line(thread: dict) -> str:
+    """対応待ちのFAX1件の短い説明。「9/5 17:55 有限会社珍味屋 発注書（4955_001.pdf）」"""
+    received = str(thread.get("received_at") or "")
+    when = ""
+    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+        try:
+            at = datetime.strptime(received, fmt)
+            when = f"{at.month}/{at.day} {at:%H:%M} "
+            break
+        except ValueError:
+            continue
+    sender = str(thread.get("sender") or "").strip() or "差出人不明"
+    kind = str(thread.get("kind") or "FAX")
+    return f"{when}{sender} {kind}（{thread.get('filename', '')}）"
+
+
+# 「未処理の注文書残ってる？」のような、対応状況を尋ねる言い方
+_STATUS_RE = re.compile(
+    r"(未処理|未対応|残って|残り|対応待ち|溜まって|たまって|一覧|状況|何件|ある[？?]|あります|抱えて|どれ)"
+)
+
+
+class FaxStatus:
+    """FAXルームでのメンションに、対応状況だけを答える（ハンドブックは使わない）。
+
+    FAXルームは許可ルーム（Q&A）に入れていない（他部署のルームへ社内ナレッジが
+    流れる経路を作らないため）。それでも「未処理の注文書残ってる？」と聞かれて
+    無言なのは不親切なので、見張りの状態ファイルから対応待ちの一覧だけを返す。
+    実例（2026-09-07 19:23）: 足立さんの問いに返事が無かった。
+    """
+
+    GUIDE = (
+        "このルームではFAXの対応状況だけお答えしています。"
+        "「未処理のFAXある？」のように聞いてください。ほかのご相談は経理財務部のルームでお願いします。"
+    )
+
+    def __init__(self, config: Any) -> None:
+        self._config = config
+        self._state_path = config.resolve_path(config.state_dir) / "faxwatch.json"
+
+    def owns(self, room_id: int) -> bool:
+        settings = self._config.fax_watch
+        return bool(settings.get("enabled")) and int(room_id) == int(settings.get("room_id", 0) or 0)
+
+    def reply(self, question: str) -> str:
+        if not _STATUS_RE.search(str(question or "")):
+            return self.GUIDE
+        try:
+            state = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            state = {}
+        open_threads = state.get("open") or []
+        pending = state.get("pending") or []
+        lines: list[str] = []
+        if open_threads:
+            lines.append(f"いま対応完了の返信をいただいていないのは{len(open_threads)}件です。")
+            lines += ["・" + thread_line(t) for t in open_threads]
+            lines.append("対応済みでしたら、それぞれの通知への返信で「対応完了」とお知らせください。")
+        else:
+            lines.append("いま対応待ちのFAXはありません。")
+        if pending:
+            lines.append(f"ほかに、時間外に届いて次の営業時間の頭に知らせる分が{len(pending)}件あります。")
+        return "\n".join(lines)
 
 
 def _account_of(message: dict) -> int:

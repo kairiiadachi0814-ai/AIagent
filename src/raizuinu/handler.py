@@ -157,6 +157,12 @@ class RaizuinuHandler:
             from .guest import GuestResponder
 
             self._guest = GuestResponder(cfg)
+        # FAXルーム（許可ルーム外）での「未処理のFAXある？」にだけ答える
+        self._fax_status = overrides.get("fax_status")
+        if self._fax_status is None and (cfg.fax_watch or {}).get("enabled"):
+            from .faxwatch import FaxStatus
+
+            self._fax_status = FaxStatus(cfg)
         self._dedupe_lock = threading.Lock()
         self._processed_ids: dict[str, None] = {}  # 挿入順を保つLRU代替
         self._dedupe_path = cfg.resolve_path(cfg.state_dir) / "processed_messages.json"
@@ -186,8 +192,14 @@ class RaizuinuHandler:
         if event is None:
             return WebhookResult(200, "対象外イベント")
 
-        # 許可ルーム制限（FR-05）: リスト外は無応答
+        # 許可ルーム制限（FR-05）: リスト外は無応答。
+        # FAXルームだけは例外で、対応状況の問い合わせに限って答える（ハンドブックは使わない）
         if event.room_id not in set(self._config.allowed_room_ids):
+            if self._fax_status is not None and self._fax_status.owns(event.room_id):
+                if not self._mark_processed(event.message_id):
+                    return WebhookResult(200, "処理済みメッセージ")
+                self._process_fax_status(event)
+                return WebhookResult(200, "FAXの対応状況を返答")
             return WebhookResult(200, f"許可外ルーム: {event.room_id}")
 
         # 再送による二重応答の防止
@@ -516,6 +528,20 @@ class RaizuinuHandler:
                 + traceback.format_exc(),
                 flush=True,
             )
+
+    def _process_fax_status(self, event: MentionEvent) -> None:
+        """FAXルームでの問い合わせに、対応待ちの一覧だけを返す（部のメンバーからのものだけ）。"""
+        question = event.question
+        if not question or not self._is_member(event):
+            return  # 通知ボット等のメンションには応じない
+        try:
+            self._reply_and_audit(event, question, self._fax_status.reply(question), "fax_status")
+        except Exception:
+            print("[error] FAXの対応状況の返答に失敗: " + traceback.format_exc(), flush=True)
+            try:
+                self._chatwork.send_message(event.room_id, _reply_tag(event) + FAILURE_MESSAGE)
+            except Exception:
+                print("[error] 失敗通知の送信にも失敗", flush=True)
 
     def _reply_and_audit(
         self, event: MentionEvent, question: str, text: str, record_type: str
