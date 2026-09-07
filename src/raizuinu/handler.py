@@ -163,6 +163,12 @@ class RaizuinuHandler:
             from .faxwatch import FaxStatus
 
             self._fax_status = FaxStatus(cfg)
+        # 通知管理くんのメンションを合図に、その場でFAXを読みに行く（5分の巡回を待たない）
+        self._fax_watch_factory = overrides.get("fax_watch_factory")
+        if self._fax_watch_factory is None and (cfg.fax_watch or {}).get("enabled"):
+            from .faxwatch import FaxWatcher
+
+            self._fax_watch_factory = lambda: FaxWatcher(cfg, self._chatwork, cost=self._cost)
         self._dedupe_lock = threading.Lock()
         self._processed_ids: dict[str, None] = {}  # 挿入順を保つLRU代替
         self._dedupe_path = cfg.resolve_path(cfg.state_dir) / "processed_messages.json"
@@ -535,9 +541,13 @@ class RaizuinuHandler:
         対応状況の問い合わせは一覧で、「了解です」のような会話は会話で返す。
         ハンドブックは使わない（このルームは許可ルーム外）。
         """
+        cfg = self._config.fax_watch
+        if int(event.account_id) == int(cfg.get("notifier_account_id", 0) or 0):
+            self._run_fax_watch_now(event)  # 通知管理くんの合図。返事はしない
+            return
         question = event.question
         if not question or not self._is_member(event):
-            return  # 通知ボット等のメンションには応じない
+            return  # 部外のメンションには応じない
         try:
             text, usage = self._fax_status.reply(question, replied_to=self._replied_text(event))
             cost_status = self._add_usage_safely(usage) if usage else None
@@ -550,6 +560,36 @@ class RaizuinuHandler:
                 self._chatwork.send_message(event.room_id, _reply_tag(event) + FAILURE_MESSAGE)
             except Exception:
                 print("[error] 失敗通知の送信にも失敗", flush=True)
+
+    def _run_fax_watch_now(self, event: MentionEvent) -> None:
+        """FAXの通知が来たら、巡回を待たずに読みに行く。
+
+        通知本文とPDFが別々の投稿で届くことがあるため、少し待ってから見る。
+        何も新しいものが無ければ、もう一度だけ待って見直す。
+        """
+        import time
+
+        settings = (self._config.fax_watch.get("on_mention") or {})
+        if not settings.get("enabled", True) or self._fax_watch_factory is None:
+            return
+        handled = 0
+        try:
+            time.sleep(float(settings.get("delay_seconds", 5)))
+            watcher = self._fax_watch_factory()
+            handled = watcher.run_once()
+            if handled == 0 and not watcher.has_pending():
+                time.sleep(float(settings.get("retry_seconds", 10)))
+                handled = watcher.run_once()
+        except Exception:
+            print("[error] メンション起点のFAX処理に失敗（次の巡回で拾う）: " + traceback.format_exc(), flush=True)
+        self._audit_safely(
+            {
+                "type": "fax_mention_trigger",
+                "room_id": event.room_id,
+                "message_id": event.message_id,
+                "handled": handled,
+            }
+        )
 
     def _replied_text(self, event: MentionEvent) -> str:
         """相手が返信しているこちらの発言（会話の文脈として渡す）。無ければ空。"""

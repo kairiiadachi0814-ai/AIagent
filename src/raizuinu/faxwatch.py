@@ -394,10 +394,41 @@ class FaxWatcher:
     # --- 公開API ---
 
     def run_once(self) -> int:
-        """新しいFAXを処理する。→ 知らせた件数。"""
+        """新しいFAXを処理する。→ 知らせた件数。
+
+        5分ごとの巡回と、通知管理くんのメンションを合図にした即時処理（webhook側）の
+        両方から呼ばれる。別プロセス同士が同時に走ると二重に知らせるため、状態ファイル
+        の隣のロックで直列にする。
+        """
         settings = self._config.fax_watch
         if not settings.get("enabled"):
             return 0
+        with self._locked():
+            return self._run_once_locked(settings)
+
+    def _locked(self):
+        """状態ファイルのロック（Linuxの flock。無い環境では何もしない）。"""
+        import contextlib
+
+        try:
+            import fcntl
+        except ImportError:  # Windows（テスト環境）
+            return contextlib.nullcontext()
+
+        @contextlib.contextmanager
+        def lock():
+            path = self._state_path.with_suffix(".lock")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+
+        return lock()
+
+    def _run_once_locked(self, settings: dict) -> int:
         room_id = int(settings.get("room_id", 0))
         notifier = int(settings.get("notifier_account_id", 0))
         if not room_id or not notifier:
@@ -430,6 +461,10 @@ class FaxWatcher:
             self._evening_report(state, room_id, now)
             self._save_state(state)
         return handled
+
+    def has_pending(self) -> bool:
+        """時間外などで控えている分があるか（メンション起点の処理で、見直すかの判断に使う）。"""
+        return bool(self._load_state().get("pending"))
 
     # --- 内部 ---
 

@@ -201,6 +201,9 @@ _DEFAULTS: dict[str, Any] = {
         "mention_kinds": ["注文", "請求", "見積", "納品", "発注書", "注文書", "請求書", "見積書", "納品書"],
         # 表題にこの語があれば、モデルの判定に関わらず注文として扱う（見落とし防止の保険）
         "order_words": ["注文", "発注", "直送", "申込", "サンプル", "入荷"],
+        # 通知管理くんのメンションを合図に、その場で読みに行く（5分の巡回を待たない）。
+        # 通知本文とPDFが別々に届くことがあるので delay_seconds 待ってから見る
+        "on_mention": {"enabled": True, "delay_seconds": 5, "retry_seconds": 10},
         # FAX番号→取引先名の台帳（Googleスプレッドシートの公開CSV書き出し）
         "directory_csv_url": "",
         "max_pdf_mb": 15,

@@ -115,6 +115,7 @@
     "notify_account_ids": [9228914, 9763216, 10622368, 10675817],
     "mention_kinds": ["注文", "請求", "見積", "納品", "発注書", "注文書", "請求書", "見積書", "納品書"],
     "order_words": ["注文", "発注", "直送", "申込", "サンプル", "入荷"],
+    "on_mention": { "enabled": true, "delay_seconds": 5, "retry_seconds": 10 },
     "directory_csv_url": "https://docs.google.com/spreadsheets/d/1cOIYTuhBV3Je9PZtl8gz4DIbNKES0hrtBn-5nOQgO9M/export?format=csv",
     "max_pdf_mb": 15,
     "max_per_day": 50,

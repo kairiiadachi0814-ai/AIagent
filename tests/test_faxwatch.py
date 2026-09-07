@@ -785,8 +785,73 @@ class TestQuestionsInTheFaxRoom:
 
     def test_the_notifier_bot_gets_no_reply(self, tmp_path, monkeypatch):
         handler, chatwork, _, _ = self._handler(tmp_path, monkeypatch, {"open": self.OPEN})
+        handler._fax_watch_factory = None  # 即時処理は別テストで見る
         self._ask(handler, NOTIFIER, "未処理ある？")
         assert chatwork.sent == []
+
+    def test_the_notifiers_mention_triggers_an_immediate_run(self, tmp_path, monkeypatch):
+        # 通知管理くんのメンションを合図に、巡回を待たずに読みに行く
+        import time
+
+        naps = []
+        monkeypatch.setattr(time, "sleep", lambda s: naps.append(s))
+        handler, chatwork, _, audit = self._handler(tmp_path, monkeypatch, {"open": []})
+
+        class FakeRun:
+            calls = 0
+
+            def run_once(self):
+                FakeRun.calls += 1
+                return 1
+
+            def has_pending(self):
+                return False
+
+        handler._fax_watch_factory = lambda: FakeRun()
+        self._ask(handler, NOTIFIER, "[info][title]FAX受信通知[/title]…[/info]")
+        assert FakeRun.calls == 1
+        assert naps == [5]  # 本文とPDFが別々に届く場合に備えて少し待つ
+        assert chatwork.sent == []  # 合図に返事はしない
+        assert audit.records[-1]["type"] == "fax_mention_trigger" and audit.records[-1]["handled"] == 1
+
+    def test_if_nothing_arrived_yet_it_looks_again_once(self, tmp_path, monkeypatch):
+        import time
+
+        naps = []
+        monkeypatch.setattr(time, "sleep", lambda s: naps.append(s))
+        handler, chatwork, _, _ = self._handler(tmp_path, monkeypatch, {"open": []})
+
+        class FakeRun:
+            calls = 0
+
+            def run_once(self):
+                FakeRun.calls += 1
+                return 0
+
+            def has_pending(self):
+                return False
+
+        handler._fax_watch_factory = lambda: FakeRun()
+        self._ask(handler, NOTIFIER, "FAX受信通知")
+        assert FakeRun.calls == 2 and naps == [5, 10]
+
+    def test_a_failure_in_the_immediate_run_is_left_to_the_timer(self, tmp_path, monkeypatch):
+        import time
+
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        handler, chatwork, _, audit = self._handler(tmp_path, monkeypatch, {"open": []})
+
+        class Exploding:
+            def run_once(self):
+                raise RuntimeError("boom")
+
+            def has_pending(self):
+                return False
+
+        handler._fax_watch_factory = lambda: Exploding()
+        self._ask(handler, NOTIFIER, "FAX受信通知")
+        assert chatwork.sent == []  # ルームに失敗を流さない（次の巡回で拾う）
+        assert audit.records[-1]["handled"] == 0
 
     def test_other_rooms_outside_the_list_stay_silent(self, tmp_path, monkeypatch):
         from tests.test_handler import sign
