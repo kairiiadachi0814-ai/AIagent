@@ -1126,11 +1126,19 @@ class FaxStatus:
 
 相手のメッセージに、同僚として自然に短く（1〜2文、です・ます調）返してください。
 - 「了解です」「ありがとう」「お疲れさま」のような一言には、一言で返す。説明や案内を足さない
+- 相手の言葉をそのまま返さない。「了解です」に「了解です」と返すのは会話になっていない。
+  相手の一言を受けて、こちらからの一言（「はい、また届いたらお知らせします」
+  「こちらこそ確認ありがとうございます」など）を返す
 - 業務の手順・金額・社内ルールなど知識を求める質問には答えず、「経理財務部のルームで聞いてほしい」と
   一言添える（このルームでは答えられないため）
 - FAXの対応状況の問い合わせはプログラム側が答えるので、ここでは扱わない
 - 値・日付・件数を作らない。同じ言い回しを続けない。「お待たせしました」のような、
   待たせていないのに詫びる言い方はしない
+
+例:
+- こちら「いま対応待ちのFAXはありません。」→ 相手「了解です。」→「はい。また届いたらお知らせしますね。」
+- 相手「ありがとう」→「こちらこそ、ご確認ありがとうございます。」
+- 相手「お疲れさまです」→「お疲れさまです。今日も何かあればお知らせください。」
 """
 
     def __init__(
@@ -1195,10 +1203,21 @@ class FaxStatus:
                 (b.text for b in getattr(response, "content", []) if getattr(b, "type", "") == "text"), ""
             )
             reply = str(json.loads(text).get("reply") or "").strip()
-            return (reply or self.GUIDE), usage
+            if not reply or is_parrot(question, reply):
+                # 実例（2026-09-07 20:22）: 「了解です。」に「了解です。」と返した。
+                # 繰り返しは会話になっていないので、こちらからの一言に差し替える
+                reply = self._phrasebook().pick("fax_room_ack", scope=str(self._config.fax_watch.get("room_id", "")))
+            return reply, usage
         except Exception:
             print("[warn] FAXルームでの会話の返答に失敗: " + traceback.format_exc(), flush=True)
             return self.GUIDE, {}
+
+    def _phrasebook(self) -> Any:
+        if getattr(self, "_book", None) is None:
+            from .phrasing import build
+
+            self._book = build(self._config)
+        return self._book
 
     def _status(self) -> str:
         try:
@@ -1219,6 +1238,22 @@ class FaxStatus:
             timing = "順次お知らせいたします" if when == "順次" else f"{when}にお知らせいたします"
             lines.append(f"ほかに、対応時間外に届いているFAXが{len(pending)}件あり、こちらは{timing}。")
         return "\n".join(lines)
+
+
+_PUNCT_RE = re.compile(r"[\s、。．,.!！?？~〜ー…・「」『』()（）]+")
+
+
+def is_parrot(question: str, reply: str) -> bool:
+    """返事が相手の言葉の繰り返しか（「了解です」に「了解です」）。"""
+    q = _PUNCT_RE.sub("", unicodedata.normalize("NFKC", str(question or ""))).lower()
+    r = _PUNCT_RE.sub("", unicodedata.normalize("NFKC", str(reply or ""))).lower()
+    if not q or not r:
+        return False
+    if q == r:
+        return True
+    shorter, longer = (q, r) if len(q) <= len(r) else (r, q)
+    # 短い方が長い方にそのまま含まれていて、足されているのが数文字だけなら繰り返し
+    return shorter in longer and len(longer) - len(shorter) <= 4
 
 
 def next_delivery(now: datetime, window: dict) -> datetime:

@@ -755,6 +755,29 @@ class TestQuestionsInTheFaxRoom:
         assert not generator.calls
         assert audit.records[-1]["type"] == "fax_status"
 
+    def test_a_parroted_reply_is_replaced(self, tmp_path, monkeypatch):
+        # 実例（2026-09-07 20:22）: 「了解です。」に「了解です。」と返した
+        handler, chatwork, _, _ = self._handler(tmp_path, monkeypatch, {"open": self.OPEN}, chat_reply="了解です。")
+        self._ask(handler, ADACHI, "了解です。")
+        body = chatwork.sent[0][1].split("\n", 1)[1]
+        assert body != "了解です。"
+        assert body in BANKS["fax_room_ack"]
+        system = handler._fax_status._client.kwargs["system"]
+        assert "相手の言葉をそのまま返さない" in system and "また届いたらお知らせしますね" in system
+
+    @pytest.mark.parametrize("question, reply, expected", [
+        ("了解です。", "了解です。", True),
+        ("了解です", "了解です！", True),
+        ("OKです", "はい、OKです。", True),
+        ("了解です。", "はい。また届いたらお知らせしますね。", False),
+        ("ありがとう", "こちらこそ、ご確認ありがとうございます。", False),
+        ("", "了解です", False),
+    ])
+    def test_is_parrot(self, question, reply, expected):
+        from raizuinu.faxwatch import is_parrot
+
+        assert is_parrot(question, reply) is expected
+
     def test_the_model_is_not_used_for_the_status_list(self, tmp_path, monkeypatch):
         handler, chatwork, _, _ = self._handler(tmp_path, monkeypatch, {"open": self.OPEN})
         self._ask(handler, ADACHI, "未処理ある？")
