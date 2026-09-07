@@ -103,10 +103,16 @@
   "webhook_max_queue": 10,
   "fax_watch": {
     "enabled": true,
-    "_note": "room_id は許可ルームに入れない（巡回と投稿だけ）。台帳は「リンクを知っている全員が閲覧可」の共有が必要。2026-09-04時点は導入テスト中で宛先は篠田・足立。テスト完了後は notify_account_ids を篠田・福本・中浦・札葉 [9228914, 9763216, 10622368, 10675817] へ差し替える予定",
+    "_note": "room_id は許可ルームに入れない（巡回と投稿だけ）。台帳は「リンクを知っている全員が閲覧可」の共有が必要。2026-09-07 テスト完了により宛先を篠田・福本・中浦・札葉へ切替（足立は外れる）。To は各自の勤務日（work_days 0=月）にだけ付ける。通知管理くんは 2026-09-07 からアシスタントへメンション付きで流すが、処理は従来どおり5分ごとの巡回",
     "room_id": 446282163,
     "notifier_account_id": 10294683,
-    "notify_account_ids": [9228914, 6945415],
+    "notify_recipients": [
+      { "account_id": 9228914, "name": "篠田", "work_days": [0, 3, 4] },
+      { "account_id": 9763216, "name": "福本", "work_days": [0, 1, 2, 3, 4] },
+      { "account_id": 10622368, "name": "中浦", "work_days": [0, 1, 2] },
+      { "account_id": 10675817, "name": "札葉", "work_days": [0, 1, 2, 3, 4] }
+    ],
+    "notify_account_ids": [9228914, 9763216, 10622368, 10675817],
     "mention_kinds": ["注文", "請求", "見積", "納品", "発注書", "注文書", "請求書", "見積書", "納品書"],
     "order_words": ["注文", "発注", "直送", "申込", "サンプル", "入荷"],
     "directory_csv_url": "https://docs.google.com/spreadsheets/d/1cOIYTuhBV3Je9PZtl8gz4DIbNKES0hrtBn-5nOQgO9M/export?format=csv",

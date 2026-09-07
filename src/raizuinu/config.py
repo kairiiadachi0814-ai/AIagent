@@ -192,7 +192,9 @@ _DEFAULTS: dict[str, Any] = {
         "room_id": 0,
         # 通知ボット（通知管理くん）のアカウントID。この発言だけを見る
         "notifier_account_id": 0,
-        # 知らせる相手
+        # 知らせる相手。notify_recipients（account_id・name・work_days 0=月）があれば
+        # 勤務日の人にだけ To を付ける。無ければ notify_account_ids に毎日 To を付ける
+        "notify_recipients": [],
         "notify_account_ids": [],
         # To を付けて呼び出す文書の性質（category）または表題。注文は常に To 付き。
         # 案内・広告・その他は To 無しでルームに置くだけ

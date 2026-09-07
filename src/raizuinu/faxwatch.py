@@ -750,7 +750,7 @@ class FaxWatcher:
         )
         lines.append("未対応のままで問題ないかもあわせてご確認ください。残っている分は翌営業日にもお知らせします。")
         try:
-            mid = self._chatwork.send_message(room_id, f"{self._heads()}\n" + "\n".join(lines))
+            mid = self._chatwork.send_message(room_id, f"{self._heads(now)}\n" + "\n".join(lines))
         except Exception:
             print("[warn] 夕方の一覧の投稿に失敗: " + traceback.format_exc(), flush=True)
             return
@@ -860,7 +860,7 @@ class FaxWatcher:
             )
         reply_tag = f"[rp aid={notifier} to={room_id}-{thread.get('pdf_id')}]"
         mid = self._chatwork.send_message(
-            room_id, f"{reply_tag}\n{self._heads()}\n" + sanitize_for_chatwork(text)
+            room_id, f"{reply_tag}\n{self._heads(now)}\n" + sanitize_for_chatwork(text)
         )
         self._audit(
             {
@@ -889,9 +889,27 @@ class FaxWatcher:
 
     # --- 部品 ---
 
-    def _heads(self) -> str:
-        recipients = self._config.fax_watch.get("notify_account_ids") or []
-        return " ".join(f"[To:{int(a)}]" for a in recipients)
+    def _recipients(self, now: datetime | None = None) -> list[int]:
+        """その日に呼び出す相手。勤務日でない人には To を付けない（休みの日に鳴らさない）。
+
+        notify_recipients（account_id・name・work_days 0=月）があればそれを使い、
+        無ければ notify_account_ids を毎日の相手として使う。誰も勤務日でない日は全員。
+        """
+        settings = self._config.fax_watch
+        detailed = settings.get("notify_recipients") or []
+        if not detailed:
+            return [int(a) for a in (settings.get("notify_account_ids") or [])]
+        weekday = (now or self._now()).weekday()
+        everyone = [int(r.get("account_id", 0)) for r in detailed if r.get("account_id")]
+        working = [
+            int(r["account_id"])
+            for r in detailed
+            if r.get("account_id") and weekday in {int(d) for d in (r.get("work_days") or range(5))}
+        ]
+        return working or everyone
+
+    def _heads(self, now: datetime | None = None) -> str:
+        return " ".join(f"[To:{a}]" for a in self._recipients(now))
 
     def _me(self) -> int:
         try:

@@ -807,6 +807,67 @@ class TestQuestionsInTheFaxRoom:
         assert len(chatwork.sent) == 1
 
 
+FUKUMOTO, NAKAURA, FUDABA = 9763216, 10622368, 10675817
+RECIPIENTS = [
+    {"account_id": SHINODA, "name": "篠田", "work_days": [0, 3, 4]},
+    {"account_id": FUKUMOTO, "name": "福本", "work_days": [0, 1, 2, 3, 4]},
+    {"account_id": NAKAURA, "name": "中浦", "work_days": [0, 1, 2]},
+    {"account_id": FUDABA, "name": "札葉", "work_days": [0, 1, 2, 3, 4]},
+]
+
+
+class TestRecipientsByWorkDay:
+    """2026-09-07 テスト完了: 宛先を篠田・福本・中浦・札葉に切替。To はその人の勤務日だけ。"""
+
+    def _watcher(self, tmp_path, now, payload=ORDER):
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], payload, now=now)
+        w._config.data["fax_watch"]["notify_recipients"] = RECIPIENTS
+        w._config.data["fax_watch"]["notify_account_ids"] = [SHINODA, FUKUMOTO, NAKAURA, FUDABA]
+        return w
+
+    def _to(self, body):
+        import re
+
+        return [int(x) for x in re.findall(r"\[To:(\d+)\]", body.split("\n")[1])]
+
+    def test_thursday_leaves_out_nakaura(self, tmp_path):
+        w = self._watcher(tmp_path, THU)  # 木曜
+        prime(w)
+        w.run_once()
+        assert self._to(bodies(w)[0]) == [SHINODA, FUKUMOTO, FUDABA]
+        assert ADACHI not in self._to(bodies(w)[0])  # 足立さんは外れる
+
+    def test_tuesday_leaves_out_shinoda(self, tmp_path):
+        w = self._watcher(tmp_path, at(2026, 9, 8, 10, 0))  # 火曜
+        prime(w)
+        w.run_once()
+        assert self._to(bodies(w)[0]) == [FUKUMOTO, NAKAURA, FUDABA]
+
+    def test_monday_calls_everyone(self, tmp_path):
+        w = self._watcher(tmp_path, at(2026, 9, 7, 10, 0))
+        prime(w)
+        w.run_once()
+        assert self._to(bodies(w)[0]) == [SHINODA, FUKUMOTO, NAKAURA, FUDABA]
+
+    def test_reminders_and_the_evening_list_follow_the_day(self, tmp_path):
+        w = self._watcher(tmp_path, at(2026, 9, 7, 10, 0))  # 月曜に通知
+        prime(w)
+        w.run_once()
+        w.clock.now = at(2026, 9, 8, 9, 0)  # 火曜の確認 → 篠田さんは休み
+        w.run_once()
+        assert self._to(bodies(w)[1]) == [FUKUMOTO, NAKAURA, FUDABA]
+        w.clock.now = at(2026, 9, 10, 19, 0)  # 木曜の夕方の一覧 → 中浦さんは休み
+        w.run_once()
+        evening = bodies(w)[-1]
+        assert evening.startswith(f"[To:{SHINODA}] [To:{FUKUMOTO}] [To:{FUDABA}]\nお疲れさまです。")
+
+    def test_without_the_detailed_list_everyone_is_called_daily(self, tmp_path):
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], ORDER, now=at(2026, 9, 8, 10, 0))
+        prime(w)
+        w.run_once()
+        assert self._to(bodies(w)[0]) == [SHINODA, ADACHI]
+
+
 class TestUpsideDown:
     """実例（2026-09-05）: 珍味屋の天津栗発注書が逆さまに届き、「その他」で流れかけた。"""
 
