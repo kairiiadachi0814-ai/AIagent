@@ -561,6 +561,19 @@ class TestNothingSlipsThrough:
         w.run_once()
         assert len(w._chatwork.sent) == 4  # 同じ返事に二度は返さない
 
+    def test_a_mentioned_answer_is_left_to_the_webhook_side(self, tmp_path):
+        # メンション付きの返事は webhook 側が会話として返すので、巡回側は二重に返さない
+        w = self.two_orders(tmp_path)
+        w.clock.now = at(2026, 9, 3, 19, 0)
+        w.run_once()
+        w._chatwork.messages.append(
+            human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9002][To:{AGENT}] 問題なしです。")
+        )
+        w.clock.now = at(2026, 9, 3, 19, 5)
+        w.run_once()
+        assert len(w._chatwork.sent) == 3
+        assert "9500" in w._load_state()["acked"]
+
     def test_reminded_twice_it_still_stays_on_the_list(self, tmp_path):
         w = self.two_orders(tmp_path)
         for when in (at(2026, 9, 4, 9, 0), at(2026, 9, 4, 12, 0)):
@@ -656,7 +669,8 @@ class TestQuestionsInTheFaxRoom:
          "stage": 0, "check_ids": []},
     ]
 
-    def _handler(self, tmp_path, monkeypatch, state, now=at(2026, 9, 7, 19, 45)):  # 月曜、時間帯の後
+    def _handler(self, tmp_path, monkeypatch, state, now=at(2026, 9, 7, 19, 45),  # 月曜、時間帯の後
+                 chat_reply="はい、よろしくお願いします。"):
         from tests.test_guest import make_handler
 
         handler, chatwork, generator, audit = make_handler(tmp_path, monkeypatch, members=(ADACHI, SHINODA))
@@ -665,7 +679,7 @@ class TestQuestionsInTheFaxRoom:
         (tmp_path / "state" / "faxwatch.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
         from raizuinu.faxwatch import FaxStatus
 
-        handler._fax_status = FaxStatus(handler._config, now=lambda: now)
+        handler._fax_status = FaxStatus(handler._config, now=lambda: now, client=fake_client({"reply": chat_reply}))
         return handler, chatwork, generator, audit
 
     @staticmethod
@@ -722,10 +736,29 @@ class TestQuestionsInTheFaxRoom:
         assert delivery_phrase(now, {"start": "08:30", "end": "19:30"}) == expected
 
     def test_other_questions_are_pointed_to_the_department_room(self, tmp_path, monkeypatch):
-        handler, chatwork, generator, _ = self._handler(tmp_path, monkeypatch, {"open": self.OPEN})
+        pointer = "すみません、このルームでは答えられないので、経理財務部のルームで聞いていただけますか。"
+        handler, chatwork, generator, _ = self._handler(tmp_path, monkeypatch, {"open": self.OPEN}, chat_reply=pointer)
         self._ask(handler, ADACHI, "経費精算の締め日は？")
-        assert "FAXの対応状況だけお答えしています" in chatwork.sent[0][1]
+        assert pointer in chatwork.sent[0][1]
         assert not generator.calls  # 社内ナレッジはこのルームへ流さない
+        system = handler._fax_status._client.kwargs["system"]
+        assert "経理財務部のルームで聞いてほしい" in system and "知識を求める質問には答えず" in system
+
+    def test_small_talk_gets_small_talk_back(self, tmp_path, monkeypatch):
+        # 実例（2026-09-07 20:07）: 「了解です。」に案内文を返してしまった
+        handler, chatwork, generator, audit = self._handler(tmp_path, monkeypatch, {"open": self.OPEN})
+        self._ask(handler, ADACHI, "了解です。")
+        body = chatwork.sent[0][1]
+        assert body.endswith("はい、よろしくお願いします。")
+        assert "このルームでは" not in body
+        assert "相手のメッセージ:\n了解です。" in handler._fax_status._client.kwargs["messages"][0]["content"]
+        assert not generator.calls
+        assert audit.records[-1]["type"] == "fax_status"
+
+    def test_the_model_is_not_used_for_the_status_list(self, tmp_path, monkeypatch):
+        handler, chatwork, _, _ = self._handler(tmp_path, monkeypatch, {"open": self.OPEN})
+        self._ask(handler, ADACHI, "未処理ある？")
+        assert handler._fax_status._client.kwargs is None  # 一覧はコードで作る（数字を作文させない）
 
     def test_the_notifier_bot_gets_no_reply(self, tmp_path, monkeypatch):
         handler, chatwork, _, _ = self._handler(tmp_path, monkeypatch, {"open": self.OPEN})

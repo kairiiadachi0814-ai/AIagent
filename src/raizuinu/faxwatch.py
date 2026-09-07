@@ -781,6 +781,9 @@ class FaxWatcher:
                 continue
             if is_completion(body):
                 continue  # 完了の報告は _close_finished がお礼を返す
+            if me and f"[To:{me}]" in body:
+                acked.append(mid)
+                continue  # メンション付きなら webhook 側（FaxStatus）が会話として返している
             acked.append(mid)
             try:
                 tag = f"[rp aid={_account_of(message)} to={room_id}-{mid}]"
@@ -1117,18 +1120,87 @@ class FaxStatus:
         "「未処理のFAXある？」のように聞いてください。ほかのご相談は経理財務部のルームでお願いします。"
     )
 
-    def __init__(self, config: Any, now: Callable[[], datetime] | None = None) -> None:
+    CHAT_SYSTEM = """あなたは株式会社ライズクリエイション経理財務部のアシスタント「{agent_name}」です。
+いまいるのはFAX受信通知のルームで、相手は経理財務部のメンバーです。
+このルームでは、届いたFAXの通知と、その対応状況のやり取りだけをしています。
+
+相手のメッセージに、同僚として自然に短く（1〜2文、です・ます調）返してください。
+- 「了解です」「ありがとう」「お疲れさま」のような一言には、一言で返す。説明や案内を足さない
+- 業務の手順・金額・社内ルールなど知識を求める質問には答えず、「経理財務部のルームで聞いてほしい」と
+  一言添える（このルームでは答えられないため）
+- FAXの対応状況の問い合わせはプログラム側が答えるので、ここでは扱わない
+- 値・日付・件数を作らない。同じ言い回しを続けない。「お待たせしました」のような、
+  待たせていないのに詫びる言い方はしない
+"""
+
+    def __init__(
+        self,
+        config: Any,
+        now: Callable[[], datetime] | None = None,
+        client: Any | None = None,
+    ) -> None:
         self._config = config
         self._now = now or (lambda: datetime.now(JST))
+        self._client = client
         self._state_path = config.resolve_path(config.state_dir) / "faxwatch.json"
 
     def owns(self, room_id: int) -> bool:
         settings = self._config.fax_watch
         return bool(settings.get("enabled")) and int(room_id) == int(settings.get("room_id", 0) or 0)
 
-    def reply(self, question: str) -> str:
-        if not _STATUS_RE.search(str(question or "")):
-            return self.GUIDE
+    def reply(self, question: str, replied_to: str = "") -> tuple[str, dict]:
+        """→ (返信, usage)。対応状況の問い合わせはコードで、それ以外の会話はモデルで返す。"""
+        if _STATUS_RE.search(str(question or "")):
+            return self._status(), {}
+        return self._chat(question, replied_to)
+
+    def _chat(self, question: str, replied_to: str) -> tuple[str, dict]:
+        """「了解です」「ありがとう」のような一般の会話に、同僚として短く返す。
+
+        実例（2026-09-07 20:07）: 「了解です。」に「このルームでは…」と案内を返して
+        しまった。会話の範疇のものは会話で返す。
+        """
+        from .answer import _call_with_continuation
+
+        try:
+            if self._client is None:
+                import anthropic
+
+                self._client = anthropic.Anthropic()
+            cfg = self._config
+            kwargs = {
+                "model": cfg.model,
+                "max_tokens": int(cfg.max_tokens),
+                "output_config": {
+                    "effort": "low",
+                    "format": {
+                        "type": "json_schema",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"reply": {"type": "string", "description": "相手への返事。1〜2文"}},
+                            "required": ["reply"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "system": self.CHAT_SYSTEM.format(agent_name=cfg.agent_name),
+            }
+            prompt = f"相手のメッセージ:\n{question}"
+            if replied_to:
+                prompt = f"こちらの直前の発言（相手はこれに返信している）:\n{replied_to}\n\n" + prompt
+            response, usage, _ = _call_with_continuation(
+                self._client.messages.create, kwargs, [{"role": "user", "content": prompt}]
+            )
+            text = next(
+                (b.text for b in getattr(response, "content", []) if getattr(b, "type", "") == "text"), ""
+            )
+            reply = str(json.loads(text).get("reply") or "").strip()
+            return (reply or self.GUIDE), usage
+        except Exception:
+            print("[warn] FAXルームでの会話の返答に失敗: " + traceback.format_exc(), flush=True)
+            return self.GUIDE, {}
+
+    def _status(self) -> str:
         try:
             state = json.loads(self._state_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):

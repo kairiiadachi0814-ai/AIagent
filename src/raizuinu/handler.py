@@ -530,18 +530,42 @@ class RaizuinuHandler:
             )
 
     def _process_fax_status(self, event: MentionEvent) -> None:
-        """FAXルームでの問い合わせに、対応待ちの一覧だけを返す（部のメンバーからのものだけ）。"""
+        """FAXルームでのメンションに答える（部のメンバーからのものだけ）。
+
+        対応状況の問い合わせは一覧で、「了解です」のような会話は会話で返す。
+        ハンドブックは使わない（このルームは許可ルーム外）。
+        """
         question = event.question
         if not question or not self._is_member(event):
             return  # 通知ボット等のメンションには応じない
         try:
-            self._reply_and_audit(event, question, self._fax_status.reply(question), "fax_status")
+            text, usage = self._fax_status.reply(question, replied_to=self._replied_text(event))
+            cost_status = self._add_usage_safely(usage) if usage else None
+            self._reply_and_audit(event, question, text, "fax_status")
+            if cost_status is not None:
+                self._maybe_alert(cost_status)
         except Exception:
-            print("[error] FAXの対応状況の返答に失敗: " + traceback.format_exc(), flush=True)
+            print("[error] FAXルームでの返答に失敗: " + traceback.format_exc(), flush=True)
             try:
                 self._chatwork.send_message(event.room_id, _reply_tag(event) + FAILURE_MESSAGE)
             except Exception:
                 print("[error] 失敗通知の送信にも失敗", flush=True)
+
+    def _replied_text(self, event: MentionEvent) -> str:
+        """相手が返信しているこちらの発言（会話の文脈として渡す）。無ければ空。"""
+        try:
+            from .doctask import reply_target
+            from .webhook import strip_chatwork_tags
+
+            target = reply_target(event.body or "")
+            if not target:
+                return ""
+            for message in self._chatwork.get_recent_messages(event.room_id, limit=100):
+                if str(message.get("message_id")) == str(target):
+                    return strip_chatwork_tags(str(message.get("body", "")))[:400]
+        except Exception:
+            print("[warn] 返信元の取得に失敗: " + traceback.format_exc(), flush=True)
+        return ""
 
     def _reply_and_audit(
         self, event: MentionEvent, question: str, text: str, record_type: str
