@@ -163,6 +163,12 @@ class RaizuinuHandler:
             from .faxwatch import FaxStatus
 
             self._fax_status = FaxStatus(cfg)
+        # 管理者の確認を経て別ルームへ流すお知らせ（announce.py。控えが無ければ何もしない）
+        self._announcer = overrides.get("announcer")
+        if self._announcer is None and cfg.admin_room_id:
+            from .announce import Announcer
+
+            self._announcer = Announcer(cfg, self._chatwork)
         # 通知管理くんのメンションを合図に、その場でFAXを読みに行く（5分の巡回を待たない）
         self._fax_watch_factory = overrides.get("fax_watch_factory")
         if self._fax_watch_factory is None and (cfg.fax_watch or {}).get("enabled"):
@@ -345,6 +351,13 @@ class RaizuinuHandler:
                 self._process_schedule(
                     event, merged, force_register=(pending.get("mode") == "register")
                 )
+                return
+
+        # お知らせの下書きへの「送信」「取りやめ」（管理者ルームだけ。控えが無ければ素通り）
+        if self._announcer is not None:
+            handled = self._announcer.handle(event.room_id, event.account_id, question)
+            if handled is not None:
+                self._reply_and_audit(event, question, handled, "announce")
                 return
 
         # レターパック手配のやり取りの続き（要否の返事・文面の確認・総務への回答）。
