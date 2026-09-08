@@ -561,6 +561,15 @@ class RaizuinuHandler:
         question = event.question
         if not question or not self._is_member(event):
             return  # 部外のメンションには応じない
+        from .faxwatch import is_completion
+
+        if is_completion(question) and self._fax_watch_factory is not None:
+            # 「対応完了」の報告は巡回側の処理（閉じて、お礼と残りを1通で返す）に任せる。
+            # 実例（2026-09-08）: 会話の返事とお礼が別々に2通届いて分かりにくかった。
+            # 巡回を待たずその場で回し、閉じるものが無かったときだけ会話として返す
+            watcher = self._run_fax_watch_now(event, reason="completion")
+            if watcher is not None and getattr(watcher, "closed_last_run", []):
+                return
         try:
             text, usage = self._fax_status.reply(question, replied_to=self._replied_text(event))
             cost_status = self._add_usage_safely(usage) if usage else None
@@ -574,35 +583,42 @@ class RaizuinuHandler:
             except Exception:
                 print("[error] 失敗通知の送信にも失敗", flush=True)
 
-    def _run_fax_watch_now(self, event: MentionEvent) -> None:
-        """FAXの通知が来たら、巡回を待たずに読みに行く。
+    def _run_fax_watch_now(self, event: MentionEvent, reason: str = "notice") -> Any:
+        """FAXの通知や完了の報告が来たら、巡回を待たずに見に行く。→ 使った見張り（失敗時 None）
 
-        通知本文とPDFが別々の投稿で届くことがあるため、少し待ってから見る。
-        何も新しいものが無ければ、もう一度だけ待って見直す。
+        通知（reason="notice"）は本文とPDFが別々の投稿で届くことがあるため、少し待ってから
+        見て、何も新しいものが無ければもう一度だけ見直す。完了の報告（"completion"）は
+        待たずに1回だけ回す。
         """
         import time
 
         settings = (self._config.fax_watch.get("on_mention") or {})
         if not settings.get("enabled", True) or self._fax_watch_factory is None:
-            return
+            return None
         handled = 0
+        watcher = None
         try:
-            time.sleep(float(settings.get("delay_seconds", 5)))
+            if reason == "notice":
+                time.sleep(float(settings.get("delay_seconds", 5)))
             watcher = self._fax_watch_factory()
             handled = watcher.run_once()
-            if handled == 0 and not watcher.has_pending():
+            if reason == "notice" and handled == 0 and not watcher.has_pending():
                 time.sleep(float(settings.get("retry_seconds", 10)))
                 handled = watcher.run_once()
         except Exception:
             print("[error] メンション起点のFAX処理に失敗（次の巡回で拾う）: " + traceback.format_exc(), flush=True)
+            watcher = None
         self._audit_safely(
             {
                 "type": "fax_mention_trigger",
                 "room_id": event.room_id,
                 "message_id": event.message_id,
+                "reason": reason,
                 "handled": handled,
+                "closed": [t.get("filename") for t in getattr(watcher, "closed_last_run", []) or []],
             }
         )
+        return watcher
 
     def _replied_text(self, event: MentionEvent) -> str:
         """相手が返信しているこちらの発言（会話の文脈として渡す）。無ければ空。"""

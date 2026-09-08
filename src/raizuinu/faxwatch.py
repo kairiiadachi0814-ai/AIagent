@@ -377,6 +377,8 @@ class FaxWatcher:
         self._cost = cost
         self._now = now or (lambda: datetime.now(JST))
         self._phrasebook = phrasebook
+        # 直前の run_once で「対応完了」により閉じた発注書（webhook側が二重に返さないための目印）
+        self.closed_last_run: list[dict] = []
         if http_get is None:
             import requests
 
@@ -684,6 +686,7 @@ class FaxWatcher:
 
     def _close_finished(self, state: dict, messages: list[dict], room_id: int, notifier: int) -> None:
         """「対応完了」の返事があった発注書を、見届けの対象から外す。"""
+        self.closed_last_run = []
         threads = state.get("open") or []
         if not threads:
             return
@@ -731,6 +734,7 @@ class FaxWatcher:
                 }
             )
             closers.setdefault(str(closer.get("message_id")), closer)
+            self.closed_last_run.append(thread)
         state["open"] = remaining
         # 報告には一言返す。1つの「完了」で複数の発注書が閉じても、お礼は1回。
         # そのとき、まだ対応待ちのFAXがあれば一緒に示す（月曜朝にまとめて届いた

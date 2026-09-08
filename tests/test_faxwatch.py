@@ -489,6 +489,7 @@ class TestNothingSlipsThrough:
         w = self.two_orders(tmp_path)
         w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]対応完了です。"))
         w.run_once()
+        assert [t["filename"] for t in w.closed_last_run] == ["4950_001.pdf"]  # webhook側が二重に返さない目印
         thanks = bodies(w)[2]
         assert thanks.split("\n")[1] in BANKS["fax_done_thanks"]
         assert "対応待ちのFAXは、あと1件です。" in thanks
@@ -653,6 +654,9 @@ class TestRepostsAndCombinedNotices:
         assert "光パックス石川から発注書が届きました" in bodies(w)[1]
 
 
+NAKAURA_ID = 10622368
+
+
 class TestQuestionsInTheFaxRoom:
     """実例（2026-09-07 19:23）: FAXルームで「未処理の注文書残ってる？」と聞かれ、無言だった。
 
@@ -673,7 +677,9 @@ class TestQuestionsInTheFaxRoom:
                  chat_reply="はい、よろしくお願いします。"):
         from tests.test_guest import make_handler
 
-        handler, chatwork, generator, audit = make_handler(tmp_path, monkeypatch, members=(ADACHI, SHINODA))
+        handler, chatwork, generator, audit = make_handler(
+            tmp_path, monkeypatch, members=(ADACHI, SHINODA, NAKAURA_ID)
+        )
         handler._config.data["fax_watch"] = {**make_config(tmp_path).data["fax_watch"]}
         (tmp_path / "state").mkdir(exist_ok=True)
         (tmp_path / "state" / "faxwatch.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
@@ -834,6 +840,53 @@ class TestQuestionsInTheFaxRoom:
         handler._fax_watch_factory = lambda: FakeRun()
         self._ask(handler, NOTIFIER, "FAX受信通知")
         assert FakeRun.calls == 2 and naps == [5, 10]
+
+    def test_a_done_report_gets_one_reply_from_the_watcher_side(self, tmp_path, monkeypatch):
+        # 実例（2026-09-08）: 「対応完了」に会話の返事とお礼が別々に2通届いた。
+        # 完了の報告は巡回側の処理をその場で回し、そちらの1通（お礼＋残り）だけにする
+        import time
+
+        naps = []
+        monkeypatch.setattr(time, "sleep", lambda s: naps.append(s))
+        handler, chatwork, _, audit = self._handler(tmp_path, monkeypatch, {"open": self.OPEN})
+
+        class FakeRun:
+            calls = 0
+            closed_last_run = [{"filename": "4958_001.pdf"}]
+
+            def run_once(self):
+                FakeRun.calls += 1
+                chatwork.sent.append((FAX_ROOM, "ご対応ありがとうございます。\n対応待ちのFAXは、これでありません。"))
+                return 0
+
+            def has_pending(self):
+                return False
+
+        handler._fax_watch_factory = lambda: FakeRun()
+        self._ask(handler, NAKAURA_ID, "対応完了")
+        assert FakeRun.calls == 1 and naps == []  # 待たずに1回だけ
+        assert len(chatwork.sent) == 1  # 会話の返事は重ねない
+        assert handler._fax_status._client.kwargs is None
+        assert audit.records[-1]["type"] == "fax_mention_trigger" and audit.records[-1]["closed"] == ["4958_001.pdf"]
+
+    def test_a_done_report_that_closes_nothing_is_answered_as_talk(self, tmp_path, monkeypatch):
+        import time
+
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        handler, chatwork, _, _ = self._handler(tmp_path, monkeypatch, {"open": []}, chat_reply="ありがとうございます。承知しました。")
+
+        class FakeRun:
+            closed_last_run = []
+
+            def run_once(self):
+                return 0
+
+            def has_pending(self):
+                return False
+
+        handler._fax_watch_factory = lambda: FakeRun()
+        self._ask(handler, ADACHI, "対応完了です")
+        assert len(chatwork.sent) == 1 and "ありがとうございます。承知しました。" in chatwork.sent[0][1]
 
     def test_a_failure_in_the_immediate_run_is_left_to_the_timer(self, tmp_path, monkeypatch):
         import time
