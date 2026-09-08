@@ -566,12 +566,40 @@ class RaizuinuHandler:
         if is_completion(question) and self._fax_watch_factory is not None:
             # 「対応完了」の報告は巡回側の処理（閉じて、お礼と残りを1通で返す）に任せる。
             # 実例（2026-09-08）: 会話の返事とお礼が別々に2通届いて分かりにくかった。
-            # 巡回を待たずその場で回し、閉じるものが無かったときだけ会話として返す
+            # 巡回を待たずその場で回し、閉じるものが無かったときだけ先へ進む
             watcher = self._run_fax_watch_now(event, reason="completion")
             if watcher is not None and getattr(watcher, "closed_last_run", []):
                 return
         try:
-            text, usage = self._fax_status.reply(question, replied_to=self._replied_text(event))
+            if self._fax_status.is_status_question(question):
+                text, usage = self._fax_status.reply(question)
+            else:
+                # アシスタント宛の文は内容を読んで返す。済んだ報告と読めたら（長い文でも）
+                # 発注書を閉じ、お礼と残りを1通で返す
+                text, usage, done = self._fax_status.converse(
+                    question, replied_to=self._replied_text(event)
+                )
+                if (done.get("all") or done.get("filenames")) and self._fax_watch_factory is not None:
+                    closed = self._fax_watch_factory().close_manually(
+                        event.room_id,
+                        {"account": {"account_id": event.account_id}, "message_id": event.message_id},
+                        filenames=done.get("filenames") or None,
+                        everything=bool(done.get("all")),
+                    )
+                    if closed:
+                        self._add_usage_safely(usage) if usage else None
+                        self._audit_safely(
+                            {
+                                "type": "fax_status",
+                                "room_id": event.room_id,
+                                "account_id": event.account_id,
+                                "message_id": event.message_id,
+                                "question": question,
+                                "answer": f"（閉じた: {closed}件）",
+                                "usage": usage,
+                            }
+                        )
+                        return
             cost_status = self._add_usage_safely(usage) if usage else None
             self._reply_and_audit(event, question, text, "fax_status")
             if cost_status is not None:

@@ -528,6 +528,18 @@ class TestNothingSlipsThrough:
         w.run_once()
         assert w._load_state()["open"] == []
 
+    def test_close_manually_thanks_once_with_the_rest(self, tmp_path):
+        w = self.two_orders(tmp_path)
+        message = {"account": {"account_id": SHINODA}, "message_id": "9500"}
+        assert w.close_manually(FAX_ROOM, message, filenames=["4950_001.pdf"]) == 1
+        thanks = bodies(w)[2]
+        assert thanks.startswith(f"[rp aid={SHINODA} to={FAX_ROOM}-9500]\n")
+        assert "対応待ちのFAXは、あと1件です。" in thanks and "4960_001.pdf" in thanks
+        assert [t["filename"] for t in w._load_state()["open"]] == ["4960_001.pdf"]
+        assert w.close_manually(FAX_ROOM, message, filenames=["nope.pdf"]) == 0
+        assert w.close_manually(FAX_ROOM, message, everything=True) == 1
+        assert w._load_state()["open"] == [] and "これでありません" in bodies(w)[-1]
+
     def test_a_report_naming_a_file_closes_only_that_one(self, tmp_path):
         w = self.two_orders(tmp_path)
         w._chatwork.messages.append(human(9500, "4960_001.pdf は対応完了です"))
@@ -811,6 +823,18 @@ class TestQuestionsInTheFaxRoom:
 
         assert is_parrot(question, reply) is expected
 
+    @pytest.mark.parametrize("text, expected", [
+        ("今、未処理の注文書や発注書残ってる？", True),
+        ("未処理のFAXある？", True),
+        ("対応待ち件数を確認したい", True),
+        ("いま何件抱えてますか", True),
+        ("対応完了に対する返信と対応待ちFAXの共有が分かれてしまっていた件、修正しております。", False),
+        ("了解です。", False),
+    ])
+    def test_status_questions_are_told_apart_from_notes(self, tmp_path, monkeypatch, text, expected):
+        handler, _, _, _ = self._handler(tmp_path, monkeypatch, {"open": []})
+        assert handler._fax_status.is_status_question(text) is expected
+
     def test_the_model_is_not_used_for_the_status_list(self, tmp_path, monkeypatch):
         handler, chatwork, _, _ = self._handler(tmp_path, monkeypatch, {"open": self.OPEN})
         self._ask(handler, ADACHI, "未処理ある？")
@@ -895,6 +919,63 @@ class TestQuestionsInTheFaxRoom:
         assert len(chatwork.sent) == 1  # 会話の返事は重ねない
         assert handler._fax_status._client.kwargs is None
         assert audit.records[-1]["type"] == "fax_mention_trigger" and audit.records[-1]["closed"] == ["4958_001.pdf"]
+
+    def test_a_long_mentioned_report_is_read_and_closed_in_one_reply(self, tmp_path, monkeypatch):
+        # メンション付きの長めの報告は、内容を読んで済んだと分かれば閉じ、お礼と残りを1通で返す
+        import time
+
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        handler, chatwork, _, audit = self._handler(tmp_path, monkeypatch, {"open": self.OPEN})
+        handler._fax_status._client = fake_client(
+            {"reply": "ご対応ありがとうございます。", "done_all": False, "done_filenames": ["4958_001.pdf"]}
+        )
+        calls = []
+
+        class FakeRun:
+            closed_last_run = []
+
+            def run_once(self):
+                return 0
+
+            def has_pending(self):
+                return False
+
+            def close_manually(self, room_id, message, filenames=None, everything=False):
+                calls.append((filenames, everything, message["message_id"]))
+                chatwork.sent.append((room_id, "ご対応ありがとうございます。\n対応待ちのFAXは、あと1件です。\n・9/7 18:55 ㈱髙島屋 大阪店 発注書（4971_001.pdf）"))
+                return 1
+
+        handler._fax_watch_factory = lambda: FakeRun()
+        self._ask(handler, ADACHI, "髙島屋泉北店の発注書ですが、先ほど処理を終えましたので対応完了しております。ありがとうございました。", "7")
+        assert calls == [(["4958_001.pdf"], False, "7")]
+        assert len(chatwork.sent) == 1 and "対応待ちのFAXは、あと1件です。" in chatwork.sent[0][1]
+        assert "4958_001.pdf" in handler._fax_status._client.kwargs["system"]  # 一覧を渡して選ばせる
+        assert audit.records[-1]["type"] == "fax_status" and "閉じた: 1件" in audit.records[-1]["answer"]
+
+    def test_an_operational_note_with_a_mention_gets_a_plain_reply(self, tmp_path, monkeypatch):
+        import time
+
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        handler, chatwork, _, _ = self._handler(
+            tmp_path, monkeypatch, {"open": self.OPEN},
+            chat_reply="承知しました。修正ありがとうございます。",
+        )
+
+        class FakeRun:
+            closed_last_run = []
+
+            def run_once(self):
+                return 0
+
+            def has_pending(self):
+                return False
+
+            def close_manually(self, *args, **kwargs):
+                raise AssertionError("運用の連絡で発注書を閉じてはいけない")
+
+        handler._fax_watch_factory = lambda: FakeRun()
+        self._ask(handler, ADACHI, "対応完了に対する返信と対応待ちFAXの共有が分かれてしまっていた件、修正しております。", "8")
+        assert len(chatwork.sent) == 1 and "承知しました。修正ありがとうございます。" in chatwork.sent[0][1]
 
     def test_a_done_report_that_closes_nothing_is_answered_as_talk(self, tmp_path, monkeypatch):
         import time

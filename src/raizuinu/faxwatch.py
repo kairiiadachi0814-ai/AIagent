@@ -484,6 +484,44 @@ class FaxWatcher:
         """時間外などで控えている分があるか（メンション起点の処理で、見直すかの判断に使う）。"""
         return bool(self._load_state().get("pending"))
 
+    def close_manually(
+        self, room_id: int, message: dict, filenames: list[str] | None = None, everything: bool = False
+    ) -> int:
+        """アシスタント宛の文で「済んだ」と読めたものを閉じ、お礼と残りを1通で返す。→ 閉じた件数
+
+        巡回の規則（返信・ファイル名・短い一言）に当たらない長めの報告でも、
+        メンション付きで内容が済んだ報告なら、モデルの読み取りを信じて閉じる。
+        """
+        wanted = {str(f).strip().lower() for f in (filenames or []) if str(f).strip()}
+        if not everything and not wanted:
+            return 0
+        with self._locked():
+            state = self._load_state()
+            closed = [
+                t for t in state.get("open") or []
+                if everything or str(t.get("filename", "")).lower() in wanted
+            ]
+            if not closed:
+                return 0
+            remaining = [t for t in state.get("open") or [] if t not in closed]
+            state["open"] = remaining
+            self._save_state(state)
+        for thread in closed:
+            self._audit(
+                {
+                    "type": "fax_done",
+                    "room_id": room_id,
+                    "message_id": str(thread.get("pdf_id")),
+                    "filename": thread.get("filename"),
+                    "by": _account_of(message),
+                    "stage": int(thread.get("stage", 0)),
+                    "via": "mention",
+                }
+            )
+        self.closed_last_run = closed
+        self._thank(room_id, message, remaining)
+        return len(closed)
+
     # --- 内部 ---
 
     @staticmethod
@@ -1183,6 +1221,8 @@ def thread_line(thread: dict) -> str:
 _STATUS_RE = re.compile(
     r"(未処理|未対応|残って|残り|対応待ち|溜まって|たまって|一覧|状況|何件|ある[？?]|あります|抱えて|どれ)"
 )
+# 尋ねている手がかり（長い文でこれが無ければ、連絡や説明として読む）
+_ASKING_RE = re.compile(r"(\?|？|ますか|ある$|残ってる|残ってます|教えて|確認したい|知りたい|何件|どれ)")
 
 
 class FaxStatus:
@@ -1213,11 +1253,19 @@ class FaxStatus:
 - FAXの対応状況の問い合わせはプログラム側が答えるので、ここでは扱わない
 - 値・日付・件数を作らない。同じ言い回しを続けない。「お待たせしました」のような、
   待たせていないのに詫びる言い方はしない
+- 相手が「このFAXの対応が済んだ」と報告していれば、done_all（全部済んだ）か
+  done_filenames（済んだPDF名。下の一覧から）で示す。運用の連絡や説明
+  （「〜の件、修正しました」「〜に変更しました」など）は報告ではないので示さない。
+  報告のときの reply は短いお礼だけでよい（残りの一覧はプログラム側が添える）
+
+いま対応待ちのFAX（PDF名 / 差出人 / 種類）:
+{open_list}
 
 例:
 - こちら「いま対応待ちのFAXはありません。」→ 相手「了解です。」→「はい。また届いたらお知らせしますね。」
 - 相手「ありがとう」→「こちらこそ、ご確認ありがとうございます。」
 - 相手「お疲れさまです」→「お疲れさまです。今日も何かあればお知らせください。」
+- 相手「4987の件、対応完了しました。ありがとうございました。」→ done_filenames に 4987_001.pdf、reply「ご対応ありがとうございます。」
 """
 
     def __init__(
@@ -1235,26 +1283,48 @@ class FaxStatus:
         settings = self._config.fax_watch
         return bool(settings.get("enabled")) and int(room_id) == int(settings.get("room_id", 0) or 0)
 
+    def is_status_question(self, question: str) -> bool:
+        """対応状況を尋ねる文か。長い連絡文に「対応待ち」とあるだけでは尋ねていない。"""
+        text = str(question or "")
+        if not _STATUS_RE.search(text):
+            return False
+        return len(strip_tags(text).strip()) <= 30 or bool(_ASKING_RE.search(text))
+
+    def open_threads(self) -> list[dict]:
+        try:
+            state = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        return list(state.get("open") or [])
+
     def reply(self, question: str, replied_to: str = "") -> tuple[str, dict]:
         """→ (返信, usage)。対応状況の問い合わせはコードで、それ以外の会話はモデルで返す。"""
-        if _STATUS_RE.search(str(question or "")):
+        if self.is_status_question(question):
             return self._status(), {}
-        return self._chat(question, replied_to)
+        text, usage, _ = self.converse(question, replied_to)
+        return text, usage
 
-    def _chat(self, question: str, replied_to: str) -> tuple[str, dict]:
-        """「了解です」「ありがとう」のような一般の会話に、同僚として短く返す。
+    def converse(self, question: str, replied_to: str = "") -> tuple[str, dict, dict]:
+        """アシスタント宛の文を読んで返す。→ (返信, usage, 済んだと読めた報告)
 
-        実例（2026-09-07 20:07）: 「了解です。」に「このルームでは…」と案内を返して
-        しまった。会話の範疇のものは会話で返す。
+        済んだ報告は {"all": bool, "filenames": [...]}。呼び出し側がそれで発注書を閉じ、
+        お礼と残りを1通で返す（そのとき返信文は使わない）。
+        「了解です」「ありがとう」のような一般の会話には同僚として短く返す。
+        実例（2026-09-07 20:07）: 「了解です。」に「このルームでは…」と案内を返してしまった。
         """
         from .answer import _call_with_continuation
 
+        done = {"all": False, "filenames": []}
         try:
             if self._client is None:
                 import anthropic
 
                 self._client = anthropic.Anthropic()
             cfg = self._config
+            open_list = "\n".join(
+                f"- {t.get('filename', '')} / {t.get('sender') or '差出人不明'} / {t.get('kind', '')}"
+                for t in self.open_threads()
+            ) or "（なし）"
             kwargs = {
                 "model": cfg.model,
                 "max_tokens": int(cfg.max_tokens),
@@ -1264,13 +1334,21 @@ class FaxStatus:
                         "type": "json_schema",
                         "schema": {
                             "type": "object",
-                            "properties": {"reply": {"type": "string", "description": "相手への返事。1〜2文"}},
-                            "required": ["reply"],
+                            "properties": {
+                                "reply": {"type": "string", "description": "相手への返事。1〜2文"},
+                                "done_all": {"type": "boolean", "description": "対応待ち全部が済んだという報告なら true"},
+                                "done_filenames": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "済んだと報告されたPDF名（一覧にあるものだけ）。無ければ空",
+                                },
+                            },
+                            "required": ["reply", "done_all", "done_filenames"],
                             "additionalProperties": False,
                         },
                     },
                 },
-                "system": self.CHAT_SYSTEM.format(agent_name=cfg.agent_name),
+                "system": self.CHAT_SYSTEM.format(agent_name=cfg.agent_name, open_list=open_list),
             }
             prompt = f"相手のメッセージ:\n{question}"
             if replied_to:
@@ -1281,15 +1359,21 @@ class FaxStatus:
             text = next(
                 (b.text for b in getattr(response, "content", []) if getattr(b, "type", "") == "text"), ""
             )
-            reply = str(json.loads(text).get("reply") or "").strip()
+            found = json.loads(text)
+            reply = str(found.get("reply") or "").strip()
+            known = {str(t.get("filename", "")).lower() for t in self.open_threads()}
+            done = {
+                "all": bool(found.get("done_all")),
+                "filenames": [str(f) for f in (found.get("done_filenames") or []) if str(f).lower() in known],
+            }
             if not reply or is_parrot(question, reply):
                 # 実例（2026-09-07 20:22）: 「了解です。」に「了解です。」と返した。
                 # 繰り返しは会話になっていないので、こちらからの一言に差し替える
                 reply = self._phrasebook().pick("fax_room_ack", scope=str(self._config.fax_watch.get("room_id", "")))
-            return reply, usage
+            return reply, usage, done
         except Exception:
             print("[warn] FAXルームでの会話の返答に失敗: " + traceback.format_exc(), flush=True)
-            return self.GUIDE, {}
+            return self.GUIDE, {}, done
 
     def _phrasebook(self) -> Any:
         if getattr(self, "_book", None) is None:
