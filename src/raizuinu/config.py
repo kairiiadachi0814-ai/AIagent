@@ -224,6 +224,18 @@ _DEFAULTS: dict[str, Any] = {
             "max_open_days": 14,
         },
     },
+    # 期日の進捗確認（資料の修正期限・アポの期日など）。使うのは room_id の1ルームだけ。
+    # 営業日（平日・祝日除く）で数え、check_days_before の各営業日前と当日の check_time に
+    # 担当者へ進捗を尋ねる。期日を過ぎたら overdue_days 営業日は毎朝尋ねる
+    "deadline": {
+        "enabled": False,
+        "room_id": 0,
+        "check_days_before": [3, 1, 0],
+        "check_time": "09:00",
+        "overdue_days": 3,
+        # 済んだ・取り消した控えを残す日数
+        "remember_days": 60,
+    },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {
         "enabled": False,

@@ -163,6 +163,12 @@ class RaizuinuHandler:
             from .faxwatch import FaxStatus
 
             self._fax_status = FaxStatus(cfg)
+        # 期日の進捗確認（部の業務共有チャットだけ）
+        self._deadline = overrides.get("deadline")
+        if self._deadline is None and (cfg.deadline or {}).get("enabled"):
+            from .deadline import DeadlineRunner
+
+            self._deadline = DeadlineRunner(cfg, self._chatwork)
         # 管理者の確認を経て別ルームへ流すお知らせ（announce.py。控えが無ければ何もしない）
         self._announcer = overrides.get("announcer")
         if self._announcer is None and cfg.admin_room_id:
@@ -381,6 +387,17 @@ class RaizuinuHandler:
                 self._reply_and_audit(event, question, handled, "letterpack")
                 return
 
+        # 期日の控えと進捗確認（部の業務共有チャットだけ）。「アポ期日」のように予定の語を
+        # 含むことがあるので、予定の振り分けより先に見る
+        if self._deadline is not None and self._deadline.owns(event.room_id):
+            from .doctask import reply_target
+
+            replied = reply_target(event.body or "")
+            if self._deadline.looks_related(question, replied) and self._process_deadline(
+                event, question, replied, messages
+            ):
+                return  # 期日の話でなければ、そのまま通常の振り分けへ進む
+
         # 予定の照会・登録・取り消し → 専用フロー。
         # 登録は管理者アカウントからの依頼だけ受け付ける（ルーム制限とは別に効かせる）
         if self._schedule is not None:
@@ -547,6 +564,51 @@ class RaizuinuHandler:
                 + traceback.format_exc(),
                 flush=True,
             )
+
+    def _process_deadline(
+        self, event: MentionEvent, question: str, replied: str, messages: list
+    ) -> bool:
+        """期日の登録・報告・照会に答える。→ 扱ったら True（この機能の話でなければ False）。"""
+        from .answer import sanitize_for_chatwork
+
+        status = self._cost.status()
+        if status.over_limit:
+            self._notify_stopped_once(status)
+            self._chatwork.send_message(event.room_id, _reply_tag(event) + STOPPED_MESSAGE)
+            return True
+        result = self._deadline.handle(
+            event.room_id, event.account_id, question, replied,
+            display_name=_display_name(messages, event.account_id),
+        )
+        if result is None:
+            return False  # 期日の話ではなかった。通常の流れ（予定・書類・Q&A）へ
+        reply, meta, usage = result
+        posted = self._chatwork.send_message(event.room_id, _reply_tag(event) + sanitize_for_chatwork(reply))
+        try:
+            self._deadline.remember_message(meta, posted)
+        except Exception:
+            print("[warn] 期日の投稿IDの控えに失敗: " + traceback.format_exc(), flush=True)
+        cost_status = self._add_usage_safely(usage) if usage else None
+        try:
+            if cost_status is not None:
+                self._maybe_alert(cost_status)
+            self._audit_safely(
+                {
+                    "type": "deadline",
+                    "room_id": event.room_id,
+                    "account_id": event.account_id,
+                    "message_id": event.message_id,
+                    "question": question,
+                    "detail": meta,
+                    "answer": reply[:2000],
+                    "model": self._config.model,
+                    "usage": usage,
+                    "cost_jpy": round(self._cost.estimate_cost_jpy(usage), 3) if usage else 0.0,
+                }
+            )
+        except Exception:
+            print("[warn] 期日の監査に失敗（返信自体は成功）: " + traceback.format_exc(), flush=True)
+        return True
 
     def _process_fax_status(self, event: MentionEvent) -> None:
         """FAXルームでのメンションに答える（部のメンバーからのものだけ）。

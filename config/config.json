@@ -128,6 +128,15 @@
     "retention_days": 730,
     "max_hits": 8
   },
+  "deadline": {
+    "enabled": true,
+    "_note": "期日の進捗確認は経理財務部業務共有チャットだけ。営業日は平日・祝日除く（FAXの規則とは別）",
+    "room_id": 384793683,
+    "check_days_before": [3, 1, 0],
+    "check_time": "09:00",
+    "overdue_days": 3,
+    "remember_days": 60
+  },
   "discussion_watch": {
     "enabled": true,
     "room_ids": [

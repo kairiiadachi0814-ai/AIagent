@@ -366,6 +366,12 @@ def main() -> None:
         FaxWatcher(config, chatwork).run_once()
     except Exception:
         print("[error] FAXの見張りに失敗: " + traceback.format_exc(), flush=True)
+    try:
+        from .deadline import DeadlineFollower
+
+        DeadlineFollower(config, chatwork).run_once()
+    except Exception:
+        print("[error] 期日の進捗確認に失敗: " + traceback.format_exc(), flush=True)
     DiscussionWatcher(config, chatwork=chatwork).run_once()
 
 
