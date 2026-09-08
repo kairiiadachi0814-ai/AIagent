@@ -501,6 +501,33 @@ class TestNothingSlipsThrough:
         assert "対応待ちのFAXは、これでありません。" in bodies(w)[3]
         assert w._load_state()["open"] == []
 
+    def test_an_announcement_to_members_is_not_a_report(self, tmp_path):
+        # 実例（2026-09-08 13:58）: 足立さんのメンバー宛の周知文（返信ではない）に
+        # 「対応完了に対する返信…」とあり、開いていた発注書を閉じてお礼を返した
+        w = self.two_orders(tmp_path)
+        w._chatwork.messages.append(human(
+            9500,
+            f"[To:{SHINODA}][To:{FUKUMOTO}][To:{NAKAURA}][To:{FUDABA}]\n"
+            "対応完了に対する返信と対応待ちFAXの共有がチャットが分かれてしまっていた件、修正しております。\n"
+            "新たにFAX届いた際に確認よろしくお願いいたします。",
+            ADACHI,
+        ))
+        w.run_once()
+        assert len(w._load_state()["open"]) == 2  # 閉じない
+        assert len(w._chatwork.sent) == 2  # お礼も返さない
+
+    def test_a_long_plain_message_is_not_a_report_either(self, tmp_path):
+        w = self.two_orders(tmp_path)
+        w._chatwork.messages.append(human(9500, "先ほどの件は対応完了しましたので、以降の分も同じ流れでよろしくお願いいたします。"))
+        w.run_once()
+        assert len(w._load_state()["open"]) == 2
+
+    def test_a_short_plain_report_still_counts(self, tmp_path):
+        w = self.two_orders(tmp_path)
+        w._chatwork.messages.append(human(9500, "2件とも対応完了です"))
+        w.run_once()
+        assert w._load_state()["open"] == []
+
     def test_a_report_naming_a_file_closes_only_that_one(self, tmp_path):
         w = self.two_orders(tmp_path)
         w._chatwork.messages.append(human(9500, "4960_001.pdf は対応完了です"))

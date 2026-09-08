@@ -139,6 +139,22 @@ def reply_targets(body: str, room_id: int) -> set[str]:
     return {mid for room, mid in _RP_RE.findall(str(body or "")) if int(room) == int(room_id)}
 
 
+_TO_RE = re.compile(r"\[To:(\d+)\]")
+SHORT_REPORT_CHARS = 20
+
+
+def is_short_report(body: str, me: int = 0) -> bool:
+    """返信でもファイル名指定でもない文を、完了の報告として受けてよいか。
+
+    「2件とも対応完了です」のような短い一言だけ。誰か（自分以外）へのメンションが
+    付いた文や長い文は、周知や別の話なので受けない。
+    """
+    others = [int(a) for a in _TO_RE.findall(str(body or "")) if int(a) != int(me or 0)]
+    if others:
+        return False
+    return len(strip_tags(body).strip()) <= SHORT_REPORT_CHARS
+
+
 # --- 時間の扱い ---
 
 
@@ -717,9 +733,15 @@ class FaxWatcher:
                 named = [f for f in filenames if f and f in body]
                 if named and filename not in named:
                     continue
-                if is_completion(body):
-                    closer = message
-                    break
+                if not is_completion(body):
+                    continue
+                # 返信でもファイル名指定でもない文は、短い報告（「2件とも対応完了です」）だけを
+                # 完了と読む。実例（2026-09-08）: メンバー宛の周知文に「対応完了に対する返信…」
+                # とあり、開いていた発注書を閉じてお礼を返してしまった
+                if not targets and not named and not is_short_report(body, me):
+                    continue
+                closer = message
+                break
             if closer is None:
                 remaining.append(thread)
                 continue
