@@ -173,7 +173,8 @@
       { "name": "札葉", "account_id": 10675817, "work_days": [0, 1, 2, 3, 4], "skip_holidays": true },
       { "name": "坂田", "account_id": 8681926, "work_days": [0, 1, 2, 3, 4], "skip_holidays": true },
       { "name": "伊藤", "account_id": 9129422, "work_days": [3, 4] },
-      { "name": "奥田", "account_id": 9773899, "work_days": [0, 1, 2], "skip_holidays": true }
+      { "name": "奥田", "account_id": 9773899, "work_days": [0, 1, 2], "skip_holidays": true },
+      { "name": "岩永", "account_id": 11481620, "work_days": [0, 1, 2, 3, 4] }
     ],
     "proposal": {
       "enabled": true,
@@ -201,7 +202,8 @@
     9763216,
     9773899,
     10622368,
-    10675817
+    10675817,
+    11481620
   ],
   "guest_followup_minutes": 30
 }
