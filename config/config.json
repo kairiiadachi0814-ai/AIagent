@@ -115,6 +115,11 @@
     "notify_account_ids": [9228914, 9763216, 10622368, 10675817],
     "mention_kinds": ["注文", "請求", "見積", "納品", "発注書", "注文書", "請求書", "見積書", "納品書"],
     "order_words": ["注文", "発注", "直送", "申込", "サンプル", "入荷"],
+    "_quiet_note": "quiet_rules: 差出人（sender）と表題（title）が部分一致したFAXは、注文でも To と対応完了の確認を付けずに置くだけにする。reason は通知に添える理由。既に届いた発注書の確認書や毎日の定例表が対象。増えたらここに1件足す",
+    "quiet_rules": [
+      { "sender": "G7ジャパンフードサービス", "title": "情報確認表", "reason": "既にFAXで届いた発注書の確認書" },
+      { "sender": "キヨスクデリバリーサービス", "title": "棚卸残数日計表", "reason": "毎日夕方に届く定例の日計表" }
+    ],
     "on_mention": { "enabled": true, "delay_seconds": 5, "retry_seconds": 10 },
     "directory_csv_url": "https://docs.google.com/spreadsheets/d/1cOIYTuhBV3Je9PZtl8gz4DIbNKES0hrtBn-5nOQgO9M/export?format=csv",
     "max_pdf_mb": 15,

@@ -339,6 +339,32 @@ def looks_like_order(title: str, words: tuple[str, ...] | list[str]) -> bool:
     text = unicodedata.normalize("NFKC", str(title or ""))
     return any(w and w in text for w in words)
 
+
+def _loose(text: Any) -> str:
+    """差出人・表題の照合用。全角半角・空白・大文字小文字の違いを無視する。"""
+    return "".join(unicodedata.normalize("NFKC", str(text or "")).split()).lower()
+
+
+def quiet_rule_for(sender: str, title: str, rules: list[dict] | None) -> dict | None:
+    """静かに置くだけにする規則（`fax_watch.quiet_rules`）に当たれば、その規則を返す。
+
+    実例（2026-09-10）: G7ジャパンフードサービスの「発注書 情報確認表」は、既にFAXで
+    届いた発注書の確認書なので、To と対応完了の確認は要らない（キヨスクの
+    「棚卸残数日計表」と同じ扱い）。規則は差出人と表題の両方（書いてある方だけ）が
+    含まれるときに当たる。表題だけの規則は差出人を問わない。
+    """
+    s, t = _loose(sender), _loose(title)
+    for rule in rules or []:
+        want_sender, want_title = _loose(rule.get("sender")), _loose(rule.get("title"))
+        if not want_sender and not want_title:
+            continue
+        if want_sender and want_sender not in s:
+            continue
+        if want_title and want_title not in t:
+            continue
+        return rule
+    return None
+
 READ_SYSTEM = """あなたは株式会社ライズクリエイション経理財務部のアシスタントです。
 届いたFAXのPDFを読み、差出人と内容を部内へ知らせるために整理します。
 
@@ -676,10 +702,16 @@ class FaxWatcher:
         is_order = readable and (
             bool(found.get("is_order")) or category == "注文" or looks_like_order(kind, order_words)
         )
-        if is_order:
-            found = {**found, "is_order": True}
+        # 読めた文書で、差出人と表題が「静かに置くだけ」の規則に当たれば、注文扱いも To も外す
+        # （既に届いた発注書の確認書・毎日の定例表など。読めなかった分は規則を当てない）
+        quiet = quiet_rule_for(sender, kind, settings.get("quiet_rules")) if readable else None
+        if quiet:
+            is_order = False
+        found = {**found, "is_order": is_order}
         if readable:
             text = self._compose(found, sender, basis, number, notice, filename, ask_done and is_order)
+            if quiet and str(quiet.get("reason") or "").strip():
+                text += f"\n※{str(quiet['reason']).strip()}のため、呼び出し（To）と対応完了の確認は省いています。"
         else:
             text = self._compose_unreadable(found, notice, filename)
         from .answer import sanitize_for_chatwork
@@ -688,7 +720,8 @@ class FaxWatcher:
         # 案内・広告などは呼び出さず、ルームに置くだけ（To を付けると通知が鳴る）。
         # 読めなかったものは発注書かもしれないので呼び出す
         mention = set(settings.get("mention_kinds") or [])
-        heads = self._heads() if (is_order or not readable or category in mention or kind in mention) else ""
+        wants_heads = is_order or not readable or category in mention or kind in mention
+        heads = self._heads() if (wants_heads and not quiet) else ""
         parts = [reply_tag] + ([heads] if heads else []) + [sanitize_for_chatwork(text)]
         posted_id = self._chatwork.send_message(room_id, "\n".join(parts))
         self._audit(
@@ -702,6 +735,7 @@ class FaxWatcher:
                 "kind": kind,
                 "category": category,
                 "is_order": is_order,
+                "quiet": bool(quiet),
                 "readable": readable,
                 "rotated": rotated,
                 "usage": usage,

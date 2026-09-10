@@ -373,6 +373,88 @@ class TestNotifying:
         assert "[To:" not in bodies(w)[0]
 
 
+G7 = "株式会社G7ジャパンフードサービス こだわり食品事業本部"
+CONFIRMATION = {
+    "sender": G7, "kind": "発注書 情報確認表", "category": "注文", "is_order": True,
+    "summary": "発注書一覧の送信確認。着荷予定日9月16日の発注書2件(No.59,60)が送信済み、未着なら連絡依頼。",
+    "items": [{"name": "2026年9月16日 得意先:JAわかやま Aコープ クックガーデン", "quantity": "1行", "amount": ""}],
+    "due": "2026年9月16日", "notes": "問い合わせは受発注担当まで",
+}
+QUIET_RULES = [
+    {"sender": "G7ジャパンフードサービス", "title": "情報確認表", "reason": "既にFAXで届いた発注書の確認書"},
+    {"sender": "キヨスクデリバリーサービス", "title": "棚卸残数日計表"},
+]
+
+
+def quiet_watcher(tmp_path, payload):
+    w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], payload)
+    w._config.data["fax_watch"]["quiet_rules"] = QUIET_RULES
+    prime(w)
+    return w
+
+
+class TestQuietRules:
+    """実例（2026-09-10）: G7ジャパンフードサービスの「発注書 情報確認表」は、既にFAXで届いた
+    発注書の確認書。モデルは注文と読むが、To と対応完了の確認は要らない（キヨスクの
+    「棚卸残数日計表」と同じ扱い）。差出人と表題の組で `quiet_rules` に登録する。
+    """
+
+    def test_a_confirmation_sheet_is_posted_without_to_or_follow_up(self, tmp_path):
+        w = quiet_watcher(tmp_path, CONFIRMATION)
+        w.run_once()
+        body = bodies(w)[0]
+        assert "[To:" not in body
+        assert f"{G7}からFAXが届きました（発注書 情報確認表）。" in body
+        assert "■発注内容" not in body and ASK_DONE not in body
+        assert "※既にFAXで届いた発注書の確認書のため、呼び出し（To）と対応完了の確認は省いています。" in body
+        assert w._load_state()["open"] == []  # 見届けの対象にしない
+        w.clock.now = at(2026, 9, 4, 9, 0)
+        w.run_once()
+        assert len(w._chatwork.sent) == 1  # 翌朝の催促も無い
+
+    def test_a_real_order_from_the_same_sender_is_still_an_order(self, tmp_path):
+        w = quiet_watcher(tmp_path, {**CONFIRMATION, "kind": "発注書"})
+        w.run_once()
+        body = bodies(w)[0]
+        assert f"[To:{SHINODA}]" in body and "■発注内容" in body and ASK_DONE in body
+        assert len(w._load_state()["open"]) == 1
+
+    def test_the_same_title_from_another_sender_is_still_an_order(self, tmp_path):
+        w = quiet_watcher(tmp_path, {**CONFIRMATION, "sender": "テスト商店"})
+        w.run_once()
+        assert f"[To:{SHINODA}]" in bodies(w)[0]
+        assert len(w._load_state()["open"]) == 1
+
+    def test_a_rule_without_a_reason_adds_no_note(self, tmp_path):
+        # モデルが注文と読んでも規則が勝つ。理由が無ければ一言も添えない
+        kiosk = {**CONFIRMATION, "sender": "キヨスクデリバリーサービス(株)", "kind": "棚卸残数日計表"}
+        w = quiet_watcher(tmp_path, kiosk)
+        w.run_once()
+        body = bodies(w)[0]
+        assert "[To:" not in body and "省いています" not in body
+        assert "キヨスクデリバリーサービス(株)からFAXが届きました（棚卸残数日計表）。" in body
+        assert w._load_state()["open"] == []
+
+    def test_an_unreadable_fax_is_never_quieted(self, tmp_path):
+        # 読めなかったものは差出人も表題も当てにならないので、規則を当てずに人へ渡す
+        w = quiet_watcher(tmp_path, {**BLURRY, "sender": G7, "kind": "発注書 情報確認表"})
+        w.run_once()
+        body = bodies(w)[0]
+        assert f"[To:{SHINODA}]" in body and "読み取れませんでした" in body
+
+    def test_matching_ignores_width_spaces_and_case(self):
+        from raizuinu.faxwatch import quiet_rule_for
+
+        rules = [{"sender": "G7ジャパンフードサービス", "title": "情報確認表"}]
+        assert quiet_rule_for("株式会社Ｇ７ジャパンフードサービス　こだわり食品事業本部", "発注書　情報確認表", rules)
+        assert quiet_rule_for("株式会社g7ジャパンフードサービス", "発注書情報確認表", rules)
+        assert quiet_rule_for("株式会社G7ジャパンフードサービス", "発注書", rules) is None
+        assert quiet_rule_for("テスト商店", "発注書 情報確認表", rules) is None
+        assert quiet_rule_for("", "情報確認表", [{"title": "情報確認表"}])  # 表題だけの規則は差出人を問わない
+        assert quiet_rule_for("株式会社G7ジャパンフードサービス", "情報確認表", [{}]) is None  # 空の規則は当たらない
+        assert quiet_rule_for("株式会社G7ジャパンフードサービス", "情報確認表", None) is None
+
+
 class TestEveryKindOfOrderIsCaught:
     """実例（2026-09-07）: 過去のFAXを精査すると、発注書・注文書以外の表題で注文が来ていた。
 
