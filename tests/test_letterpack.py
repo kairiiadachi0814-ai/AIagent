@@ -112,6 +112,9 @@ class TestReadRequest:
             ("プラス1枚", 1, "レターパックプラス"),
             ("ライト２枚", 2, "レターパックライト"),  # 全角数字
             ("枚数はまだ未定", None, ""),
+            ("プラスじゃなくてライトで1枚", 1, "レターパックライト"),  # 「AではなくB」はB
+            ("ライトではなくプラスで", None, "レターパックプラス"),
+            ("レターパックライト 1通が正しいです", 1, "レターパックライト"),
         ],
     )
     def test_count_and_kind(self, text, count, kind):
@@ -203,6 +206,49 @@ class TestOfferFlow:
         assert "・必要枚数: 2枚" in body
         assert "依頼しました" in reply
         assert f"#!rid{SUPPLIES_ROOM}-" in reply  # 投稿先へのリンク
+
+    def test_a_correction_after_the_preview_is_applied_and_shown_again(self, tmp_path):
+        # 実例（2026-09-10）: 「プラスではなくライトでした」を無視して定型で返し、
+        # 「送信」でプラスのまま送ってしまった
+        chatwork = FakeChatwork()
+        run = runner(tmp_path, chatwork)
+        run.offer(DEPT_ROOM, REQUESTER, 1000, DETAIL)
+        run.handle(DEPT_ROOM, REQUESTER, 1100, "レターパックプラスを1枚お願いします。")
+        reply = run.handle(DEPT_ROOM, REQUESTER, 1150, "すみません、レターパックプラスではなくレターパックライトでした。")
+        assert reply.startswith("失礼しました。種類をレターパックライトに直しました。こちらでよろしければ「送信」とお返事ください。")
+        assert "・種類: レターパックライト" in reply and "・必要枚数: 1枚" in reply
+        assert chatwork.sent == []
+        # 言われたとおりになっていることを、同じ内容の念押しにも言葉で返す
+        reply = run.handle(DEPT_ROOM, REQUESTER, 1160, "レターパックライト　1通が正しいです。")
+        assert reply.startswith("はい、いまの文面もレターパックライト・1枚になっています。")
+        run.handle(DEPT_ROOM, REQUESTER, 1200, "送信", display_name="坂田 美穂")
+        assert "・種類: レターパックライト" in chatwork.sent[0][1]
+        assert "レターパックプラス" not in chatwork.sent[0][1]
+
+    def test_a_count_change_is_applied(self, tmp_path):
+        run = runner(tmp_path)
+        run.offer(DEPT_ROOM, REQUESTER, 1000, DETAIL)
+        run.handle(DEPT_ROOM, REQUESTER, 1100, "ライト2枚で")
+        reply = run.handle(DEPT_ROOM, REQUESTER, 1150, "3枚に変更で")
+        assert "枚数を3枚に直しました" in reply and "・必要枚数: 3枚" in reply
+
+    def test_a_correction_with_a_polite_ending_is_not_taken_as_send(self, tmp_path):
+        # 「ライトでお願いします」の「お願いします」を「送信」と読んで、直す前に送らない
+        chatwork = FakeChatwork()
+        run = runner(tmp_path, chatwork)
+        run.offer(DEPT_ROOM, REQUESTER, 1000, DETAIL)
+        run.handle(DEPT_ROOM, REQUESTER, 1100, "プラス1枚で")
+        reply = run.handle(DEPT_ROOM, REQUESTER, 1150, "ライトでお願いします")
+        assert chatwork.sent == [] and "種類をレターパックライトに直しました" in reply
+
+    def test_an_unreadable_reply_asks_naturally(self, tmp_path):
+        run = runner(tmp_path)
+        run.offer(DEPT_ROOM, REQUESTER, 1000, DETAIL)
+        run.handle(DEPT_ROOM, REQUESTER, 1100, "ライト2枚で")
+        reply = run.handle(DEPT_ROOM, REQUESTER, 1150, "何日くらいで届きますか")
+        assert reply.startswith("すみません、どこを直せばよいか読み取れませんでした。")
+        reply = run.handle(DEPT_ROOM, REQUESTER, 1160, "宛先を大阪支店に変えたい")
+        assert "送付状を作り直してから" in reply
 
     def test_cancelling_the_draft_sends_nothing(self, tmp_path):
         chatwork = FakeChatwork()

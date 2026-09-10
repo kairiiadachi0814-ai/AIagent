@@ -146,6 +146,30 @@ def confirmed_lead(waited_seconds: int) -> str:
     return "依頼者に確認しました。"
 
 
+# 「AではなくB」の区切り。この後に出てくる種類を採る
+_INSTEAD_RE = re.compile(r"(ではなく|じゃなく|でなく|ではなくて|じゃなくて|→|に変更|に訂正)")
+
+
+def kind_in(text: str) -> str:
+    """文中の種類。「プラスではなくライト」なら後の方、両方あれば最後に出た方。
+
+    実例（2026-09-10）: 「レターパックプラスではなくレターパックライトでした」を
+    最初に出た「プラス」で読んでしまった。
+    """
+    folded = _fold(text)
+    hits = [(m.start(), KINDS["プラス"]) for m in _PLUS_RE.finditer(folded)]
+    hits += [(m.start(), KINDS["ライト"]) for m in _LIGHT_RE.finditer(folded)]
+    if not hits:
+        return ""
+    hits.sort()
+    cue = _INSTEAD_RE.search(folded)
+    if cue:
+        after = [kind for pos, kind in hits if pos > cue.start()]
+        if after:
+            return after[0]
+    return hits[-1][1]
+
+
 def read_request(text: str) -> dict[str, Any]:
     """依頼者の返事から枚数と種類を読む。
 
@@ -157,16 +181,28 @@ def read_request(text: str) -> dict[str, Any]:
     if _DECLINE_RE.search(folded):
         return {"declined": True, "count": None, "kind": ""}
     count_match = _COUNT_RE.search(folded)
-    kind = ""
-    if _PLUS_RE.search(folded):
-        kind = KINDS["プラス"]
-    elif _LIGHT_RE.search(folded):
-        kind = KINDS["ライト"]
     return {
         "declined": False,
         "count": int(count_match.group(1)) if count_match else None,
-        "kind": kind,
+        "kind": kind_in(folded),
     }
+
+
+def read_correction(text: str, draft: dict[str, Any]) -> dict[str, Any]:
+    """文面を見せた後の返事から、枚数・種類の直しを読む。
+
+    → {"kind": 新しい種類 or "", "count": 新しい枚数 or None, "changed": 何かが変わるか,
+       "mentioned": 枚数か種類に触れているか}
+    「ライトでお願いします」のように「お願いします」が混ざっていても、直しを先に
+    読む（誤った内容のまま送らないため）。
+    """
+    parsed = read_request(text)
+    kind = parsed["kind"]
+    count = parsed["count"]
+    changed = (bool(kind) and kind != str(draft.get("kind", ""))) or (
+        count is not None and int(count) != int(draft.get("count", 0) or 0)
+    )
+    return {"kind": kind, "count": count, "changed": changed, "mentioned": bool(kind) or count is not None}
 
 
 def summarize_use(detail: dict[str, Any]) -> str:
@@ -456,18 +492,70 @@ class LetterpackRunner:
     def _on_draft_answer(
         self, data: dict, key: str, draft: dict, text: str, display_name: str
     ) -> str:
+        """文面を見せた後の返事。直し → 送信 → 取りやめ の順に読む。
+
+        実例（2026-09-10）: 「プラスではなくライトでした」という直しに、
+        「直すところがあれば…」と定型で返して無視した形になり、誤った種類のまま
+        送ってしまった。直しは読み取って文面を作り直し、何を直したかを言う。
+        """
         folded = _fold(text)
-        if _CANCEL_RE.search(folded):
+        correction = read_correction(folded, draft)
+        if correction["changed"]:
+            return self._redraft(data, key, draft, correction)
+        if _CANCEL_RE.search(folded) and not correction["mentioned"]:
             data["drafts"].pop(key, None)
             self._store.save(data)
             return self._phrasebook.pick("letterpack_cancelled")
-        if not _SEND_RE.search(folded):
-            # 文面の直しは読み取らず、作り直しを促す（誤った内容で送らないため）
+        if correction["mentioned"]:
+            # 言われた内容はすでにそのとおりになっている
+            same = []
+            if correction["kind"]:
+                same.append(correction["kind"])
+            if correction["count"] is not None:
+                same.append(f"{correction['count']}枚")
             return (
-                "送ってよければ「送信」とお返事ください。"
-                "直すところがあれば、枚数・種類・宛先のどれをどう直すか書いていただければ作り直します。"
+                f"はい、いまの文面も{'・'.join(same)}になっています。"
+                "このまま送ってよければ「送信」とお返事ください。"
             )
-        return self._send(data, key, draft, display_name)
+        if _SEND_RE.search(folded):
+            return self._send(data, key, draft, display_name)
+        if re.search(r"(宛先|宛て|書類|内容|会社名)", folded):
+            return (
+                "宛先や書類の内容は送付状から取っているので、そちらを直す場合は送付状を作り直してから"
+                "改めて手配しますね。枚数・種類の直しでしたら、このまま教えてください。"
+            )
+        return (
+            "すみません、どこを直せばよいか読み取れませんでした。"
+            "枚数か種類（プラス／ライト）を教えていただければ直します。"
+            "このまま送ってよければ「送信」とお返事ください。"
+        )
+
+    def _redraft(self, data: dict, key: str, draft: dict, correction: dict) -> str:
+        """直しを文面に反映して見せ直す。何を直したかを一言添える。"""
+        settings = self._settings
+        detail = draft.get("detail") or {}
+        kind = correction["kind"] or str(draft.get("kind", ""))
+        count = int(correction["count"]) if correction["count"] is not None else int(draft.get("count", 0) or 0)
+        fixed = []
+        if kind != str(draft.get("kind", "")):
+            fixed.append(f"種類を{kind}に")
+        if count != int(draft.get("count", 0) or 0):
+            fixed.append(f"枚数を{count}枚に")
+        draft.update({"kind": kind, "count": count, "text": build_request_text(detail, count, kind)})
+        data["drafts"][key] = draft
+        self._store.save(data)
+        from .answer import sanitize_for_chatwork
+
+        route = route_for(settings, detail.get("company_id", ""))
+        recipients = route.get("recipients") or []
+        head = sanitize_for_chatwork(mention_all(recipients))
+        return (
+            f"失礼しました。{'、'.join(fixed)}直しました。こちらでよろしければ「送信」とお返事ください。\n"
+            "\n"
+            "――――――――――\n"
+            f"{head}\n{draft['text']}\n"
+            "――――――――――"
+        )
 
     def _send(self, data: dict, key: str, draft: dict, display_name: str) -> str:
         detail = draft.get("detail") or {}
