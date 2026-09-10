@@ -271,7 +271,17 @@ READ_SCHEMA: dict[str, Any] = {
     "properties": {
         "sender": {
             "type": "string",
-            "description": "差出人の会社名（団体名）。文書に書かれているとおり。分からなければ空文字",
+            "description": (
+                "差出人＝このFAXを送ってきた相手側の会社名（団体名）。文書に書かれているとおり。"
+                "宛先（こちらのグループ会社）を入れてはならない。分からなければ空文字"
+            ),
+        },
+        "addressee": {
+            "type": "string",
+            "description": (
+                "宛先の社名（「御中」「様」の付いた側。取引先からの発注書なら宛先はこちらの"
+                "グループ会社）。読み取れなければ空文字。sender と同じ名前を入れてはならない"
+            ),
         },
         "kind": {
             "type": "string",
@@ -324,10 +334,69 @@ READ_SCHEMA: dict[str, Any] = {
         },
     },
     "required": [
-        "sender", "kind", "category", "is_order", "summary", "items", "due", "notes", "rotation", "readable",
+        "sender", "addressee", "kind", "category", "is_order", "summary", "items", "due", "notes",
+        "rotation", "readable",
     ],
     "additionalProperties": False,
 }
+
+# こちら（受信側）のグループ会社。差出人にこれが書かれていたら宛先と取り違えている
+# （実例 2026-09-07〜10: 47件中9件で「RAKUTENKEN株式会社から発注書が届きました」と
+# 出た。取引先の発注書は宛先が当社なので、宛先を差出人と読んでいた）
+DEFAULT_OWN_COMPANY_WORDS = (
+    "ライズクリエイション", "ライズクリエーション", "RAKUTENKEN", "楽天軒", "樂天軒", "ラクテンケン",
+    "ヤマトライジング", "イノベイト", "ohirome", "ライズホールディングス",
+)
+
+# 差出人を読み直させるときの一言。宛先を差出人と読んだ理由ごと伝える
+REREAD_SENDER_HINT = (
+    "前回の読み取りでは sender に「{sender}」と書かれていましたが、これはこちら（受信側）の"
+    "会社名で、文書の宛先です。FAXを送ってきた相手側の社名を探し直してください"
+    "（社判・住所・TEL/FAX・担当者欄・発注者欄。こちらの様式を相手が記入して送り返した場合は、"
+    "その相手＝様式上の宛先が差出人）。見当たらなければ sender は空文字にしてください。"
+)
+
+
+def is_own_company(name: str, words: tuple[str, ...] | list[str]) -> bool:
+    """差出人として読まれた社名が、こちらのグループ会社か。"""
+    text = _loose(name)
+    return bool(text) and any(_loose(w) and _loose(w) in text for w in words)
+
+
+def _flex(word: str) -> str:
+    """英数字の全角半角・大文字小文字の違いを許す正規表現の断片。"""
+    out = []
+    for ch in unicodedata.normalize("NFKC", word):
+        if ch.isascii() and ch.isalnum():
+            wide = chr(ord(ch) + 0xFEE0)
+            variants = {ch.lower(), ch.upper(), wide.lower(), wide.upper()}
+            out.append("[" + "".join(re.escape(v) for v in sorted(variants)) + "]")
+        else:
+            out.append(re.escape(ch))
+    return "".join(out)
+
+
+_CORP = r"(?:株式会社|有限会社|\(株\)|（株）|㈱)?"
+
+
+def strip_own_company(summary: str, words: tuple[str, ...] | list[str]) -> str:
+    """要約から、当社を主語・宛先にした言い回しを外す。
+
+    実例（2026-09-10）: 「RAKUTENKEN株式会社よりJR名古屋高島屋への天津甘栗の直送依頼」。
+    注文は当社に来るものなので当社名は要らない（「JR名古屋高島屋への天津甘栗の直送依頼」）。
+    商品名に含まれる「樂天軒本店〜」のような語はそのまま残す。
+    """
+    text = str(summary or "")
+    names = [w for w in words if w]
+    if not text.strip() or not names:
+        return text
+    body = "(?:" + "|".join(_flex(w) for w in names) + r")[^\s、。]{0,12}?" + _CORP
+    # 文頭の「当社より／から／への」
+    head = re.compile(r"^\s*" + _CORP + r"\s*" + body + r"\s*(?:よりの|より|からの|から|への|宛ての|宛の|あての)\s*")
+    text = head.sub("", text, count=1)
+    # 文中の「〜を当社へ発注」「当社宛に注文」
+    mid = re.compile(body + r"\s*(?:へ|宛に|宛てに|あてに|宛|あて)(?=\s*(?:発注|注文|依頼|直送|ご注文|ご依頼))")
+    return mid.sub("", text)
 
 # 表題にこれらの語があれば、モデルの判定に関わらず注文として扱う（見落としを防ぐ保険）。
 # 実例（2026-09-07）: 直送依頼書・サンプル依頼書・FAX申込書・商品注文伝票・注文表・
@@ -369,6 +438,15 @@ READ_SYSTEM = """あなたは株式会社ライズクリエイション経理財
 届いたFAXのPDFを読み、差出人と内容を部内へ知らせるために整理します。
 
 厳守すること:
+- 差出人（sender）は「このFAXを送ってきた相手側」＝文書の発行元。宛先はこちらの
+  グループ会社（{own_companies}）なので、これらを sender に書いてはならない。
+  取引先の発注書・直送依頼書は宛先が当社で、差出人は取引先。「御中」「様」の付いた
+  社名は宛先。発行元は社判・住所・TEL/FAX・担当者欄・発注者欄から拾う。当社の様式を
+  相手が記入して送り返してきた場合も、差出人はその相手（様式上の宛先）。
+  宛先は addressee に入れ、sender と同じ名前にしない
+- summary に当社（宛先）の社名を書かない。「RAKUTENKEN株式会社より〜」「〜をRAKUTENKEN
+  株式会社へ発注」のように書かず、「JR名古屋高島屋への天津甘栗の直送依頼」のように
+  相手・納品先・品物だけで書く（注文が当社に来るのは当たり前なので）
 - 発注・注文の見落としは許されない。表題が「発注書」「注文書」でなくても、
   直送依頼書・サンプル依頼書・FAX申込書・商品注文伝票・注文表・【発注・入荷】表・
   発注伝票のように、こちらへ商品の注文・発注・直送・サンプル送付を頼んでいる文書は
@@ -667,10 +745,14 @@ class FaxWatcher:
                 self._save_state(state)
         return handled
 
-    def _handle(self, room_id: int, item: dict, ask_done: bool) -> dict[str, Any]:
-        settings = self._config.fax_watch
-        notice = item.get("notice") or {}
-        data, filename = self._download(room_id, item["attachment"])
+    def _read_document(
+        self, data: bytes, filename: str, need_sender: bool = True
+    ) -> tuple[dict[str, Any], dict, int, bool]:
+        """PDFを読む。→ (読み取り結果, 使用量, 回した角度, 差出人が当社名しか取れなかったか)。
+
+        逆さま・判読不能なら回してもう一度読む。差出人に当社（宛先）の社名が入っていたら、
+        need_sender のときだけ理由を添えて一度読み直させ、それでも当社なら差出人を空にする。
+        """
         found = self._read(data, filename)
         usage = found.pop("_usage", {})
         rotated = 0
@@ -682,16 +764,36 @@ class FaxWatcher:
                 again = self._read(turned, filename)
                 usage = _merge_usage(usage, again.pop("_usage", {}))
                 if again.get("readable", True) or not found.get("readable", True):
-                    found, rotated = again, rotation or 180
-        readable = bool(found.get("readable", True))
+                    found, rotated, data = again, rotation or 180, turned
+        own_only = False
+        own_words = self._own_words()
+        if need_sender and found.get("readable", True) and is_own_company(str(found.get("sender") or ""), own_words):
+            # 宛先を差出人と読んでいる。理由を添えて読み直させる
+            hint = REREAD_SENDER_HINT.format(sender=str(found.get("sender") or ""))
+            again = self._read(data, filename, hint=hint)
+            usage = _merge_usage(usage, again.pop("_usage", {}))
+            if again.get("readable", True) and not is_own_company(str(again.get("sender") or ""), own_words):
+                found = again
+            else:
+                found, own_only = {**found, "sender": ""}, True
+        found = {**found, "summary": strip_own_company(str(found.get("summary") or ""), own_words)}
+        return found, usage, rotated, own_only
 
+    def _handle(self, room_id: int, item: dict, ask_done: bool) -> dict[str, Any]:
+        settings = self._config.fax_watch
+        notice = item.get("notice") or {}
+        data, filename = self._download(room_id, item["attachment"])
         # 差出人: 台帳で引けたらそれを正とする。無ければ文書の記載
         number = notice.get("sender_number", "")
         partner = self._directory.lookup(number) if number else ""
+        found, usage, rotated, own_only = self._read_document(data, filename, need_sender=not partner)
+        readable = bool(found.get("readable", True))
         if partner:
             sender, basis = partner, f"FAX番号 {number} を台帳で照合"
         elif found.get("sender"):
             sender, basis = str(found["sender"]), "FAXの記載から"
+        elif own_only:
+            sender, basis = "", "文書には宛先の当社名しか見当たりません"
         else:
             sender, basis = "", ""
 
@@ -1063,7 +1165,10 @@ class FaxWatcher:
             raise RuntimeError(f"{filename} をPDFとして取得できませんでした（HTTP {status}）")
         return data, filename
 
-    def _read(self, data: bytes, filename: str) -> dict[str, Any]:
+    def _own_words(self) -> tuple[str, ...]:
+        return tuple(self._config.fax_watch.get("own_company_words") or DEFAULT_OWN_COMPANY_WORDS)
+
+    def _read(self, data: bytes, filename: str, hint: str = "") -> dict[str, Any]:
         from .answer import _call_with_continuation
 
         if self._client is None:
@@ -1078,8 +1183,11 @@ class FaxWatcher:
                 "effort": "low",
                 "format": {"type": "json_schema", "schema": READ_SCHEMA},
             },
-            "system": READ_SYSTEM,
+            "system": READ_SYSTEM.replace("{own_companies}", "／".join(self._own_words())),
         }
+        ask = f"このFAX（{filename}）の差出人と内容を整理してください。"
+        if hint:
+            ask += "\n" + hint
         content = [
             {
                 "type": "document",
@@ -1090,7 +1198,7 @@ class FaxWatcher:
                 },
                 "title": filename,
             },
-            {"type": "text", "text": f"このFAX（{filename}）の差出人と内容を整理してください。"},
+            {"type": "text", "text": ask},
         ]
         response, usage, _ = _call_with_continuation(
             self._client.messages.create, kwargs, [{"role": "user", "content": content}]
@@ -1135,6 +1243,9 @@ class FaxWatcher:
             )
         if sender:
             lines.append(f"差出人の根拠: {basis}")
+        elif basis:
+            why = f"FAX番号 {number} は台帳に無く、{basis}" if number else f"送信元番号なし・{basis}"
+            lines.append(f"差出人: 特定できませんでした（{why}）")
         elif number:
             lines.append(f"差出人: 特定できませんでした（FAX番号 {number} は台帳に無く、文書にも社名が見当たりません）")
         else:

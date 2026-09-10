@@ -455,6 +455,102 @@ class TestQuietRules:
         assert quiet_rule_for("株式会社G7ジャパンフードサービス", "情報確認表", None) is None
 
 
+class TestSenderIsNeverOurselves:
+    """実例（2026-09-07〜10）: 47件中9件で「RAKUTENKEN株式会社から発注書が届きました」と出た。
+
+    取引先の発注書は宛先が当社なので、宛先を差出人と読んでいた。差出人に当社の社名が
+    読まれたら理由を添えて読み直させ、それでも当社なら差出人を空にして人に渡す。
+    要約の「当社より〜」「〜を当社へ発注」も外す（注文が当社に来るのは当たり前）。
+    """
+
+    OWN = {**ORDER, "sender": "RAKUTENKEN株式会社", "addressee": ""}
+    G7 = {**ORDER, "sender": "株式会社G7ジャパンフードサービス", "addressee": "RAKUTENKEN株式会社"}
+
+    def test_the_addressee_read_as_sender_is_reread_with_the_reason(self, tmp_path):
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], [self.OWN, self.G7])
+        prime(w)
+        w.run_once()
+        body = bodies(w)[0]
+        assert "株式会社G7ジャパンフードサービスから発注書が届きました。" in body
+        assert "RAKUTENKEN" not in body
+        assert w._client.calls == 2
+        asked = w._client.history[1]["messages"][0]["content"][1]["text"]
+        assert "「RAKUTENKEN株式会社」" in asked and "こちら（受信側）の会社名" in asked
+        assert w._client.history[1]["messages"][0]["content"][0]["type"] == "document"  # PDFを付け直す
+
+    def test_if_the_reread_still_says_us_the_sender_is_left_open(self, tmp_path):
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], self.OWN)
+        prime(w)
+        w.run_once()
+        body = bodies(w)[0]
+        assert "発注書が届きました。\n差出人: 特定できませんでした（送信元番号なし・文書には宛先の当社名しか見当たりません）" in body
+        assert "RAKUTENKEN株式会社から" not in body
+        assert f"[To:{SHINODA}]" in body and "■発注内容" in body and ASK_DONE in body  # 注文としては扱う
+        assert w._client.calls == 2  # 読み直しは1回だけ
+        assert w._load_state()["open"][0]["sender"] == ""
+
+    def test_a_number_in_the_directory_needs_no_reread(self, tmp_path):
+        w = watcher(tmp_path, [bot(1, NOTICE_WITH_SENDER), bot(2, ATTACHMENT_2)], self.OWN)
+        prime(w)
+        w.run_once()
+        assert "とくとく香芝SA下りから発注書が届きました。" in bodies(w)[0]
+        assert w._client.calls == 1
+
+    def test_an_unreadable_fax_is_not_reread_for_the_sender(self, tmp_path):
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], {**BLURRY, "sender": "RAKUTENKEN株式会社"})
+        prime(w)
+        w.run_once()
+        assert w._client.calls == 2  # 回して読み直す分だけ
+        assert "読み取れませんでした" in bodies(w)[0]
+
+    def test_our_name_is_dropped_from_the_summary(self, tmp_path):
+        # 実例（2026-09-10 15:12）: 「RAKUTENKEN株式会社よりJR名古屋高島屋への天津甘栗の直送依頼」
+        payload = {**ORDER, "sender": "ジャポニックス", "kind": "直送依頼書",
+                   "summary": "RAKUTENKEN株式会社よりJR名古屋高島屋への天津甘栗の直送依頼。発注No.2609076116。"}
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], payload)
+        prime(w)
+        w.run_once()
+        body = bodies(w)[0]
+        assert "\nJR名古屋高島屋への天津甘栗の直送依頼。発注No.2609076116。\n" in body
+        assert "RAKUTENKEN" not in body
+        assert w._client.calls == 1  # 差出人は正しいので読み直さない
+
+    @pytest.mark.parametrize("summary, expected", [
+        ("RAKUTENKEN株式会社よりJR名古屋高島屋への天津甘栗の直送依頼。", "JR名古屋高島屋への天津甘栗の直送依頼。"),
+        ("ＲＡＫＵＴＥＮＫＥＮ㈱より天津甘栗の直送依頼。", "天津甘栗の直送依頼。"),
+        ("RAKUTENKEN(楽天軒本店)からの9月分の発注。", "9月分の発注。"),
+        ("楽天軒への天津甘栗150g袋の発注。", "天津甘栗150g袋の発注。"),
+        ("和栗プリン等をRAKUTENKEN株式会社へ発注。9月11日納品希望。", "和栗プリン等を発注。9月11日納品希望。"),
+        ("樂天軒本店eむき甘栗化粧箱入を1点発注、2026/09/20必着。", "樂天軒本店eむき甘栗化粧箱入を1点発注、2026/09/20必着。"),
+        ("清水屋Vinos 藤ヶ丘店へマロングラッセの発注。", "清水屋Vinos 藤ヶ丘店へマロングラッセの発注。"),
+        ("", ""),
+    ])
+    def test_stripping_our_name_from_a_summary(self, summary, expected):
+        from raizuinu.faxwatch import DEFAULT_OWN_COMPANY_WORDS, strip_own_company
+
+        assert strip_own_company(summary, DEFAULT_OWN_COMPANY_WORDS) == expected
+
+    def test_recognising_our_own_companies(self):
+        from raizuinu.faxwatch import DEFAULT_OWN_COMPANY_WORDS, is_own_company
+
+        for name in ["RAKUTENKEN株式会社", "RAKUTENKEN(株)", "RAKUTENKEN(楽天軒本店)", "ＲＡＫＵＴＥＮＫＥＮ株式会社",
+                     "山田園(RAKUTENKEN株式会社宛)", "株式会社ライズクリエイション", "合同会社ohirome"]:
+            assert is_own_company(name, DEFAULT_OWN_COMPANY_WORDS), name
+        for name in ["株式会社G7ジャパンフードサービス", "ジャポニックス", "", "光パックス石川"]:
+            assert not is_own_company(name, DEFAULT_OWN_COMPANY_WORDS), name
+
+    def test_the_reader_is_told_who_we_are(self, tmp_path):
+        from raizuinu.faxwatch import READ_SCHEMA
+
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], ORDER)
+        prime(w)
+        w.run_once()
+        system = w._client.history[0]["system"]
+        assert "RAKUTENKEN／楽天軒" in system and "{own_companies}" not in system
+        assert "sender に書いてはならない" in system and "summary に当社（宛先）の社名を書かない" in system
+        assert "addressee" in READ_SCHEMA["properties"] and "addressee" in READ_SCHEMA["required"]
+
+
 class TestEveryKindOfOrderIsCaught:
     """実例（2026-09-07）: 過去のFAXを精査すると、発注書・注文書以外の表題で注文が来ていた。
 
