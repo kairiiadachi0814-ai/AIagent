@@ -214,8 +214,43 @@ def mentions_all(body: str) -> bool:
 
 
 def names_exceptions(body: str) -> bool:
-    """「①以外は対応完了」のように除外を含む返事（番号で閉じると逆になるので聞き返す）。"""
+    """「①以外は対応完了」のように除外を含む返事（番号で閉じると逆になる）。"""
     return bool(_EXCEPT_RE.search(unicodedata.normalize("NFKC", strip_tags(body))))
+
+
+# 「以外」の後ろにこれがあれば、済んでいない分の話が混ざっているので受けない
+_PENDING_RE = re.compile(r"(確認中|対応中|処理中|作業中|保留|後で|あとで|後ほど|明日|来週|未|まだ|待ち)")
+# 「以外」の前に番号以外の語が無いことを見る（番号・区切りを除いた残り）
+_NUMBER_SEPARATORS_RE = re.compile(r"^[\s、,，・/／とや及びおよび番No.()（）#＃]*$", re.IGNORECASE)
+
+
+def exclusion_numbers(body: str) -> list[int] | None:
+    """「①③以外は対応完了」の①③。形が崩れていれば None（聞き返す）。
+
+    「以外」は挙げなかった分を全部閉じるので、読み違いが複数件の取りこぼしになる。
+    受けるのは、「以外」の前が番号だけで、後ろに番号や保留の語（確認中・明日など）が
+    無いときだけ。「光パックスの①以外」「①以外は完了、③は確認中」は受けない。
+    """
+    text = strip_tags(body).strip()
+    match = _EXCEPT_RE.search(unicodedata.normalize("NFKC", text))
+    if not match:
+        return None
+    # NFKC で長さが変わることがあるので、元の文でも同じ語を探して切る
+    raw = re.search("|".join(re.escape(w) for w in ("以外", "除い", "除き", "のぞい", "のぞき")), text)
+    if not raw:
+        return None
+    before, after = text[: raw.start()], text[raw.end():]
+    numbers = report_numbers(before)
+    if not numbers or report_numbers(after):
+        return None
+    rest = "".join(" " if _circled_value(ch) else ch for ch in before)
+    rest = re.sub(r"\d", " ", unicodedata.normalize("NFKC", rest))
+    rest = re.sub(r"No\.?", " ", rest, flags=re.IGNORECASE)
+    if not _NUMBER_SEPARATORS_RE.match(rest):
+        return None
+    if _PENDING_RE.search(unicodedata.normalize("NFKC", after)):
+        return None
+    return numbers
 
 
 def pick_by_number(threads: list[dict], numbers: list[int]) -> list[dict]:
@@ -1092,8 +1127,11 @@ class FaxWatcher:
                 continue  # 別のFAXへの返事、または通知より前の発言
             # ファイル名を挙げて書かれた報告は、そのFAXだけの話として読む
             named = [f for f in filenames if f and f in body]
+            note = ""
+            via = "reply"
             if named:
                 chosen = [t for t in candidates if str(t.get("filename") or "") in named]
+                via = "filename"
             else:
                 # 返信でもファイル名指定でもない文は、短い報告（「2件とも対応完了です」）だけを
                 # 完了と読む。実例（2026-09-08）: メンバー宛の周知文に「対応完了に対する返信…」
@@ -1101,10 +1139,28 @@ class FaxWatcher:
                 if not targets and not is_short_report(body, me):
                     continue
                 numbers = report_numbers(body)
-                if numbers and not names_exceptions(body):
+                if names_exceptions(body):
+                    # 「①以外は対応完了」。挙げなかった分を全部閉じるので、条件を全部満たす
+                    # ときだけ受け、外れたら番号を聞き返す（取り違えが複数件の取りこぼしになる）
+                    kept = self._exclusion_targets(body, candidates, targets)
+                    if kept is None:
+                        asked.append(str(mid))
+                        self._ask_which(room_id, message, candidates, exclusion=True)
+                        self.asked_last_run.append(message)
+                        continue
+                    chosen = [t for t in candidates if t not in kept]
+                    if chosen:
+                        note = (
+                            f"{self._numbers_of(kept)}を残して{self._numbers_of(chosen)}を閉じました。"
+                            "違っていればお知らせください。"
+                        )
+                    via = "exclusion"
+                elif numbers:
                     chosen = pick_by_number(candidates, numbers)
-                elif mentions_all(body) or (len(candidates) == 1 and not names_exceptions(body)):
+                    via = "number"
+                elif mentions_all(body) or len(candidates) == 1:
                     chosen = candidates
+                    via = "all" if mentions_all(body) else "reply"
                 else:
                     # まとめ通知に番号なしの「対応完了」。どれか分からないので聞き返す（一度だけ）
                     asked.append(str(mid))
@@ -1123,10 +1179,11 @@ class FaxWatcher:
                         "number": int(thread.get("number") or 0),
                         "by": _account_of(message),
                         "stage": int(thread.get("stage", 0)),
+                        "via": via,
                     }
                 )
                 closed.append(thread)
-            closers.setdefault(str(mid), message)
+            closers.setdefault(str(mid), (message, note))
         remaining = [t for t in threads if t not in closed]
         state["open"] = remaining
         state["asked_ids"] = asked[-50:]
@@ -1134,19 +1191,47 @@ class FaxWatcher:
         # 報告には一言返す。1つの「完了」で複数の発注書が閉じても、お礼は1回。
         # そのとき、まだ対応待ちのFAXがあれば一緒に示す（月曜朝にまとめて届いた
         # 分の処理漏れを防ぐ）
-        for closer in closers.values():
-            self._thank(room_id, closer, remaining)
+        for closer, note in closers.values():
+            self._thank(room_id, closer, remaining, note)
 
-    def _ask_which(self, room_id: int, message: dict, candidates: list[dict]) -> None:
+    @staticmethod
+    def _numbers_of(threads: list[dict]) -> str:
+        return "".join(circled(int(t.get("number") or 0)) for t in threads)
+
+    def _exclusion_targets(self, body: str, candidates: list[dict], targets: set[str]) -> list[dict] | None:
+        """「①以外は対応完了」で残す控え。条件に外れれば None（閉じずに聞き返す）。
+
+        条件: (1) 返信先で範囲が決まっている（返信でない一言では受けない）
+        (2) 候補に番号のない古い控えが無く、番号が一意（前日の①と今日の①が混ざらない）
+        (3) 番号がすべて「以外」の前にあり、後ろに番号や保留の語が無い
+        (4) 挙げた番号が候補に実在する（打ち間違いを受けない）
+        """
+        if not targets:
+            return None
+        numbers = [int(t.get("number") or 0) for t in candidates]
+        if any(n <= 0 for n in numbers) or len(set(numbers)) != len(numbers):
+            return None
+        excluded = exclusion_numbers(body)
+        if excluded is None or any(n not in numbers for n in excluded):
+            return None
+        return [t for t in candidates if int(t.get("number") or 0) in excluded]
+
+    def _ask_which(self, room_id: int, message: dict, candidates: list[dict], exclusion: bool = False) -> None:
         """番号の無い「対応完了」に、どのFAXの話か番号で聞き返す。"""
         try:
             tag = f"[rp aid={_account_of(message)} to={room_id}-{message.get('message_id')}]"
             hint = self._reply_hint(candidates)
-            lines = [
-                f"ありがとうございます。対応待ちが{len(candidates)}件あるので、どのFAXが済んだか"
-                f"番号を添えて「対応完了」とお返事ください{hint}。全部済んでいれば「全て対応完了」で結構です。"
-            ]
-            lines += ["・" + self._thread_line(t) for t in candidates]
+            if exclusion:
+                opening = (
+                    "ありがとうございます。「以外」の範囲を取り違えないよう、済んだFAXの番号を挙げる形で"
+                    f"「対応完了」とお返事ください{hint}。全部済んでいれば「全て対応完了」で結構です。"
+                )
+            else:
+                opening = (
+                    f"ありがとうございます。対応待ちが{len(candidates)}件あるので、どのFAXが済んだか"
+                    f"番号を添えて「対応完了」とお返事ください{hint}。全部済んでいれば「全て対応完了」で結構です。"
+                )
+            lines = [opening] + ["・" + self._thread_line(t) for t in candidates]
             self._chatwork.send_message(room_id, f"{tag}\n" + "\n".join(lines))
         except Exception:
             print("[warn] 番号の聞き返しに失敗: " + traceback.format_exc(), flush=True)
@@ -1157,8 +1242,11 @@ class FaxWatcher:
         numbers = [int(t.get("number") or 0) for t in threads if t.get("number")]
         return f"（例:「{circled(numbers[0])} 対応完了」）" if numbers else ""
 
-    def _thank(self, room_id: int, message: dict, remaining: list[dict]) -> None:
-        """完了の報告に、相手のメッセージへの返信で礼を言い、残りを添える（黙って閉じない）。"""
+    def _thank(self, room_id: int, message: dict, remaining: list[dict], note: str = "") -> None:
+        """完了の報告に、相手のメッセージへの返信で礼を言い、残りを添える（黙って閉じない）。
+
+        note は「①を残して②③を閉じました」のような、何を閉じたかの明記（除外の形のとき）。
+        """
         try:
             if self._phrasebook is None:
                 from .phrasing import build
@@ -1166,6 +1254,8 @@ class FaxWatcher:
                 self._phrasebook = build(self._config)
             tag = f"[rp aid={_account_of(message)} to={room_id}-{message.get('message_id')}]"
             lines = [self._phrasebook.pick("fax_done_thanks", scope=str(room_id))]
+            if note:
+                lines.append(note)
             lines += self._remaining_lines(remaining)
             self._chatwork.send_message(room_id, f"{tag}\n" + "\n".join(lines))
         except Exception:
@@ -1668,6 +1758,8 @@ class FaxStatus:
   報告されたら、その番号のPDF名を done_filenames に入れる。番号も「全て」も無い
   「対応完了」で対象が複数あるときは閉じず、どの番号か聞き返す
   （「全部でしたら『全て対応完了』とお返事ください」と添える）
+- 「①以外は完了」のような除外の形はプログラム側が扱う。done_all・done_filenames は
+  立てず、reply は「済んだ番号を挙げる形でお願いします」と一言添える
 
 いま対応待ちのFAX（番号 / PDF名 / 差出人 / 種類）:
 {open_list}

@@ -914,12 +914,109 @@ class TestBatchedNotices:
         assert [t["number"] for t in w._load_state()["open"]] == [1]
         assert w.asked_last_run == []
 
-    def test_a_reply_that_excludes_a_number_is_asked_back(self, tmp_path):
-        w = self.held_over_weekend(tmp_path)
-        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]①以外は対応完了"))
+    # --- 「①以外は対応完了」（除外の形）。挙げなかった分を全部閉じるので、条件を全部満たすときだけ ---
+
+    def held_three(self, tmp_path):
+        msgs = (held("4950_001.pdf", "2026/09/05 10:00:00") + held("4960_001.pdf", "2026/09/06 15:00:00")
+                + held("4970_001.pdf", "2026/09/06 16:00:00"))
+        w = watcher(tmp_path, msgs, ORDER, now=at(2026, 9, 5, 10, 0))
+        prime(w)
         w.run_once()
-        assert len(w._load_state()["open"]) == 2
-        assert "番号を添えて" in bodies(w)[1]
+        w.clock.now = at(2026, 9, 7, 8, 30)
+        assert w.run_once() == 3  # 通知 9000 に ①②③
+        return w
+
+    def test_all_but_one_closes_the_rest_and_says_what_it_closed(self, tmp_path):
+        w = self.held_three(tmp_path)
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]①以外は対応完了です"))
+        w.run_once()
+        assert [t["number"] for t in w.closed_last_run] == [2, 3]
+        assert [t["number"] for t in w._load_state()["open"]] == [1]
+        thanks = bodies(w)[1]
+        assert thanks.split("\n")[1] in BANKS["fax_done_thanks"]
+        assert thanks.split("\n")[2] == "①を残して②③を閉じました。違っていればお知らせください。"  # 間違いにその場で気づける
+        assert "対応待ちのFAXは、あと1件です。" in thanks and "・① 9/5 10:00" in thanks
+
+    @pytest.mark.parametrize("reply", ["①と③以外は完了しました", "1,3以外 対応完了", "No.1とNo.3以外は対応完了"])
+    def test_all_but_two_in_several_wordings(self, tmp_path, reply):
+        w = self.held_three(tmp_path)
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]{reply}"))
+        w.run_once()
+        assert [t["number"] for t in w._load_state()["open"]] == [1, 3]
+        assert "①③を残して②を閉じました。" in bodies(w)[1]
+
+    def test_all_but_one_needs_a_reply_target(self, tmp_path):
+        # 返信でない一言では範囲が決まらない（前日の分まで閉じかねない）ので聞き返す
+        w = self.held_three(tmp_path)
+        w._chatwork.messages.append(human(9500, "①以外は対応完了"))
+        w.run_once()
+        assert len(w._load_state()["open"]) == 3
+        ask = bodies(w)[1]
+        assert ask.startswith(f"[rp aid={SHINODA} to={FAX_ROOM}-9500]\nありがとうございます。「以外」の範囲を取り違えないよう、済んだFAXの番号を挙げる形で")
+        assert "（例:「① 対応完了」）" in ask and "・③ 9/6 16:00" in ask
+        assert [m["message_id"] for m in w.asked_last_run] == ["9500"]
+
+    @pytest.mark.parametrize("reply", [
+        "⑤以外は対応完了",               # 無い番号（打ち間違い）
+        "①以外は対応完了、③は確認中",     # 後ろに別の番号と保留の語
+        "光パックスの①以外は完了",        # 前に番号以外の語
+        "①以外はまだです",               # 済んでいない（そもそも完了と読まない）
+    ])
+    def test_a_broken_exclusion_closes_nothing(self, tmp_path, reply):
+        w = self.held_three(tmp_path)
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]{reply}"))
+        w.run_once()
+        assert len(w._load_state()["open"]) == 3
+
+    def test_an_exclusion_over_duplicate_numbers_is_asked_back(self, tmp_path):
+        # 月曜の①②と火曜の①が夕方の一覧に並ぶと、「①以外」の①が決まらない
+        w = self.held_over_weekend(tmp_path)
+        w._chatwork.messages += held("4980_001.pdf", "2026/09/08 08:00:00")
+        w.clock.now = at(2026, 9, 8, 8, 35)
+        w.run_once()  # 火曜の① = 4980（通知 9001）
+        w.clock.now = at(2026, 9, 8, 19, 0)
+        w.run_once()  # 月曜分の催促（9002）と夕方の一覧（9003）
+        evening = w._load_state()["evening_ids"][-1]
+        assert evening == "9003"
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-{evening}]①以外は対応完了"))
+        w.clock.now = at(2026, 9, 8, 19, 5)
+        w.run_once()
+        assert len(w._load_state()["open"]) == 3
+        assert "「以外」の範囲を取り違えないよう" in bodies(w)[-1]
+        # 催促（月曜の①②だけ）への返信なら範囲が決まるので受ける
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9002]①以外は対応完了"))
+        w.run_once()
+        assert [t["filename"] for t in w._load_state()["open"]] == ["4950_001.pdf", "4980_001.pdf"]
+
+    def test_an_exclusion_over_an_unnumbered_old_thread_is_asked_back(self, tmp_path):
+        w = self.held_over_weekend(tmp_path)
+        state = w._load_state()
+        state["open"].insert(0, {
+            "posted_id": "8000", "pdf_id": "7999", "filename": "4900_001.pdf", "sender": "旧い取引先",
+            "kind": "発注書", "received_at": "2026/09/03 10:00:00", "posted_at": at(2026, 9, 3, 10, 0).isoformat(),
+            "stage": 2, "check_ids": [],
+        })
+        w._save_state(state)
+        w.clock.now = at(2026, 9, 7, 19, 0)
+        w.run_once()  # 夕方の一覧 9001（番号の無い分も載る）
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9001]①以外は対応完了"))
+        w.clock.now = at(2026, 9, 7, 19, 5)
+        w.run_once()
+        assert len(w._load_state()["open"]) == 3
+        assert "「以外」の範囲を取り違えないよう" in bodies(w)[-1]
+        assert "・9/3 10:00 旧い取引先 発注書（4900_001.pdf）" in bodies(w)[-1]  # 番号の無い分はそのまま示す
+
+    @pytest.mark.parametrize("body, expected", [
+        ("①以外は対応完了", [1]), ("①と③以外は完了しました", [1, 3]), ("1,3以外 対応完了", [1, 3]),
+        ("①②以外 済", [1, 2]), ("No.1とNo.3以外は対応完了", [1, 3]),
+        (f"[rp aid={AGENT} to={FAX_ROOM}-9000]①以外は対応完了", [1]),
+        ("①以外は対応完了、③は確認中", None), ("光パックスの①以外は完了", None), ("全て以外", None),
+        ("①以外は明日対応します", None), ("対応完了", None), ("①以外は後ほど", None),
+    ])
+    def test_reading_the_excluded_numbers(self, body, expected):
+        from raizuinu.faxwatch import exclusion_numbers
+
+        assert exclusion_numbers(body) == expected
 
     def test_a_mixed_batch_asks_only_for_the_orders(self, tmp_path):
         w = self.held_over_weekend(tmp_path, payload=[ORDER, AD])
