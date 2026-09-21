@@ -122,6 +122,8 @@
     ],
     "_own_note": "own_company_words: こちら（受信側）のグループ会社名。差出人にこれが読まれたら宛先との取り違え（実例 2026-09-07〜10: 47件中9件が「RAKUTENKEN株式会社から発注書が届きました」）。読み直させ、要約からも「当社より」「当社へ発注」を外す。会社が増えたらここに足す",
     "own_company_words": ["ライズクリエイション", "ライズクリエーション", "RAKUTENKEN", "楽天軒", "樂天軒", "ラクテンケン", "ヤマトライジング", "イノベイト", "ohirome", "ライズホールディングス"],
+    "_batch_note": "batch: 一度に複数件（朝の控え分など）を知らせるときは1通にまとめて番号（①②…）を振る。返事は番号で（「①③ 対応完了」）、全件なら「全て対応完了」。長ければ max_chars ごとに分ける",
+    "batch": { "enabled": true, "max_chars": 6000 },
     "on_mention": { "enabled": true, "delay_seconds": 5, "retry_seconds": 10 },
     "directory_csv_url": "https://docs.google.com/spreadsheets/d/1cOIYTuhBV3Je9PZtl8gz4DIbNKES0hrtBn-5nOQgO9M/export?format=csv",
     "max_pdf_mb": 15,

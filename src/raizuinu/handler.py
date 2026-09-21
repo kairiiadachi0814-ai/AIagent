@@ -630,8 +630,10 @@ class RaizuinuHandler:
             # 実例（2026-09-08）: 会話の返事とお礼が別々に2通届いて分かりにくかった。
             # 巡回を待たずその場で回し、閉じるものが無かったときだけ先へ進む
             watcher = self._run_fax_watch_now(event, reason="completion")
-            if watcher is not None and getattr(watcher, "closed_last_run", []):
-                return
+            if watcher is not None and (
+                getattr(watcher, "closed_last_run", []) or getattr(watcher, "asked_last_run", [])
+            ):
+                return  # 閉じてお礼を返した、または番号を聞き返した（会話の返事を重ねない）
         try:
             if self._fax_status.is_status_question(question):
                 text, usage = self._fax_status.reply(question)

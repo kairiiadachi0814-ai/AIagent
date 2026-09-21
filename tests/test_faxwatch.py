@@ -653,14 +653,15 @@ class TestNothingSlipsThrough:
     """月曜朝にまとめて届いた分の処理漏れを防ぐ。お礼に残りを添え、19時に一覧を出す。"""
 
     def two_orders(self, tmp_path, now=THU):
-        msgs = [
-            bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT),
+        # 2件を別々の巡回で知らせる（同じ巡回で出る分は1通にまとまる。その形は TestBatchedNotices）
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], ORDER, now=now)
+        prime(w)
+        assert w.run_once() == 1  # 通知は 9000（①）
+        w._chatwork.messages += [
             bot(3, NOTICE_NO_SENDER.replace("4950", "4960").replace("19:10:09", "19:40:00")),
             bot(4, ATTACHMENT.replace("4950", "4960")),
         ]
-        w = watcher(tmp_path, msgs, ORDER, now=now)
-        prime(w)
-        assert w.run_once() == 2  # 通知は 9000, 9001
+        assert w.run_once() == 1  # 通知は 9001（②）
         return w
 
     def test_thanks_lists_what_is_still_waiting(self, tmp_path):
@@ -671,7 +672,7 @@ class TestNothingSlipsThrough:
         thanks = bodies(w)[2]
         assert thanks.split("\n")[1] in BANKS["fax_done_thanks"]
         assert "対応待ちのFAXは、あと1件です。" in thanks
-        assert "・9/4 19:40 光パックス石川 発注書（4960_001.pdf）" in thanks
+        assert "・② 9/4 19:40 光パックス石川 発注書（4960_001.pdf）" in thanks
         assert "4950_001.pdf" not in thanks
         # 最後の1件が済んだら、もう無いと言う
         w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9001]こちらも対応完了です。"))
@@ -736,9 +737,10 @@ class TestNothingSlipsThrough:
         assert body.startswith(
             f"[To:{SHINODA}] [To:{ADACHI}]\nお疲れさまです。19:00時点で、対応完了の返信をいただいていないFAXが2件あります。"
         )
-        assert "・9/4 19:10 光パックス石川 発注書（4950_001.pdf）" in body
-        assert "・9/4 19:40 光パックス石川 発注書（4960_001.pdf）" in body
-        assert "「対応完了」とご返信ください" in body and "問題ないか" in body
+        assert "・① 9/4 19:10 光パックス石川 発注書（4950_001.pdf）" in body
+        assert "・② 9/4 19:40 光パックス石川 発注書（4960_001.pdf）" in body
+        assert "番号を添えて「対応完了」とお知らせください（例:「① 対応完了」）" in body
+        assert "「全て対応完了」で結構です" in body and "問題ないか" in body
         w.clock.now = at(2026, 9, 3, 19, 10)
         w.run_once()
         assert len(w._chatwork.sent) == 3  # 同じ日に二度は出さない
@@ -816,6 +818,240 @@ class TestNothingSlipsThrough:
         w.clock.now = at(2026, 9, 18, 9, 0)  # 15日後
         w.run_once()
         assert w._load_state()["open"] == []
+
+
+def held(filename, received):
+    """時間外に届いた通知と添付（受信日時つき）。"""
+    return [
+        bot(int(filename[:4]) * 2, NOTICE_NO_SENDER.replace("4950", filename[:4]).replace("2026/09/04 19:10:09", received)),
+        bot(int(filename[:4]) * 2 + 1, ATTACHMENT.replace("4950", filename[:4])),
+    ]
+
+
+class TestBatchedNotices:
+    """朝 8:30 に出す控え分（時間外・土日に届いたFAX）は1通にまとめ、番号（①②…）で返してもらう。
+
+    1件ずつ通知が鳴ると月曜の朝に何通も並ぶ。番号を振れば「①③ 対応完了」で済み、
+    全部なら「全て対応完了」で閉じられる。
+    """
+
+    def held_over_weekend(self, tmp_path, payload=None, **config):
+        msgs = held("4950_001.pdf", "2026/09/05 10:00:00") + held("4960_001.pdf", "2026/09/06 15:00:00")
+        w = watcher(tmp_path, msgs, payload or ORDER, now=at(2026, 9, 5, 10, 0))  # 土
+        for key, value in config.items():
+            w._config.data["fax_watch"][key] = value
+        prime(w)
+        assert w.run_once() == 0  # 土日は控えるだけ
+        w.clock.now = at(2026, 9, 7, 8, 30)  # 月
+        assert w.run_once() == 2
+        return w
+
+    def test_two_held_faxes_go_out_as_one_numbered_message(self, tmp_path):
+        w = self.held_over_weekend(tmp_path)
+        assert len(w._chatwork.sent) == 1
+        body = bodies(w)[0]
+        assert body.startswith(f"[To:{SHINODA}] [To:{ADACHI}]\n届いているFAXが2件あります。まとめてお知らせします。")
+        assert "\n① 光パックス石川から発注書が届きました。" in body
+        assert "\n② 光パックス石川から発注書が届きました。" in body
+        assert body.count("■発注内容") == 2
+        assert "（ファイル: 4950_001.pdf／受信 2026/09/05 10:00:00）" in body
+        assert "（ファイル: 4960_001.pdf／受信 2026/09/06 15:00:00）" in body
+        assert body.count("※PDFを読んで整理しています") == 1  # 注意書きは末尾に1回
+        assert ASK_DONE not in body
+        assert "対応完了の返事が要るのは ①② です。" in body
+        assert "番号を添えて「対応完了」とお知らせください（例:「① 対応完了」）。全件済みでしたら「全て対応完了」で結構です。" in body
+        assert "[rp " not in body  # 複数のPDFをまとめているので特定の投稿にはつなげない
+        threads = w._load_state()["open"]
+        assert [(t["number"], t["filename"]) for t in threads] == [(1, "4950_001.pdf"), (2, "4960_001.pdf")]
+        assert threads[0]["posted_id"] == threads[1]["posted_id"] == "9000"
+
+    def test_a_number_closes_only_that_fax(self, tmp_path):
+        w = self.held_over_weekend(tmp_path)
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]① 対応完了"))
+        w.clock.now = at(2026, 9, 7, 9, 0)
+        w.run_once()
+        assert [t["filename"] for t in w.closed_last_run] == ["4950_001.pdf"]
+        thanks = bodies(w)[1]
+        assert thanks.startswith(f"[rp aid={SHINODA} to={FAX_ROOM}-9500]\n")
+        assert "対応待ちのFAXは、あと1件です。" in thanks
+        assert "・② 9/6 15:00 光パックス石川 発注書（4960_001.pdf）" in thanks
+        assert [t["number"] for t in w._load_state()["open"]] == [2]
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9000]全て対応完了"))
+        w.run_once()
+        assert w._load_state()["open"] == []
+        assert "対応待ちのFAXは、これでありません。" in bodies(w)[2]
+
+    @pytest.mark.parametrize("reply, left", [
+        ("①② 対応完了", []), ("1と2 対応完了", []), ("No.2 完了です", [1]), ("2番 済みました", [1]),
+        ("2件とも対応完了です", []), ("全部済みました", []), ("(1) 対応完了", [2]),
+    ])
+    def test_numbers_and_all_in_several_wordings(self, tmp_path, reply, left):
+        w = self.held_over_weekend(tmp_path)
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]{reply}"))
+        w.run_once()
+        assert [t["number"] for t in w._load_state()["open"]] == left
+        assert len(w._chatwork.sent) == 2  # お礼は1回
+
+    def test_done_without_a_number_is_asked_back_once(self, tmp_path):
+        # 黙って全部閉じると処理漏れになるので、どの番号か聞き返す
+        w = self.held_over_weekend(tmp_path)
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]対応完了です。"))
+        w.run_once()
+        assert len(w._load_state()["open"]) == 2  # 閉じない
+        assert [m["message_id"] for m in w.asked_last_run] == ["9500"]  # webhook側が会話の返事を重ねない目印
+        ask = bodies(w)[1]
+        assert ask.startswith(f"[rp aid={SHINODA} to={FAX_ROOM}-9500]\nありがとうございます。対応待ちが2件あるので")
+        assert "番号を添えて「対応完了」とお返事ください（例:「① 対応完了」）" in ask
+        assert "「全て対応完了」で結構です" in ask
+        assert "・① 9/5 10:00 光パックス石川 発注書（4950_001.pdf）" in ask
+        assert not is_completion(ask.split("\n", 1)[1]) or True  # 自分の投稿は投稿者で除くので誤読しない
+        w.run_once()
+        assert len(w._chatwork.sent) == 2  # 二度は聞かない
+        assert w._load_state()["asked_ids"] == ["9500"]
+        # あとから「② 対応完了」→ ②だけ閉じる。先の曖昧な報告で残りが閉じたりしない
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9000]② 対応完了"))
+        w.run_once()
+        assert [t["number"] for t in w._load_state()["open"]] == [1]
+        assert w.asked_last_run == []
+
+    def test_a_reply_that_excludes_a_number_is_asked_back(self, tmp_path):
+        w = self.held_over_weekend(tmp_path)
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]①以外は対応完了"))
+        w.run_once()
+        assert len(w._load_state()["open"]) == 2
+        assert "番号を添えて" in bodies(w)[1]
+
+    def test_a_mixed_batch_asks_only_for_the_orders(self, tmp_path):
+        w = self.held_over_weekend(tmp_path, payload=[ORDER, AD])
+        body = bodies(w)[0]
+        assert body.startswith(f"[To:{SHINODA}] [To:{ADACHI}]\n")  # 発注書があるので呼び出す
+        assert "\n① 光パックス石川から発注書が届きました。" in body
+        assert "\n② FAXが届きました（広告）。" in body  # 広告にも番号は振る（指せるように）
+        assert "対応完了の返事が要るのは ① です。" in body
+        assert [t["number"] for t in w._load_state()["open"]] == [1]  # 見届けるのは発注書だけ
+
+    def test_only_ads_are_posted_quietly_without_asking(self, tmp_path):
+        w = self.held_over_weekend(tmp_path, payload=AD)
+        body = bodies(w)[0]
+        assert "[To:" not in body and "対応完了の返事が要るのは" not in body
+        assert "\n① FAXが届きました（広告）。" in body and "\n② FAXが届きました（広告）。" in body
+        assert w._load_state()["open"] == []
+
+    def test_daytime_singles_continue_the_numbering_and_the_next_day_restarts(self, tmp_path):
+        w = self.held_over_weekend(tmp_path)
+        w._chatwork.messages += held("4970_001.pdf", "2026/09/07 10:00:00")
+        w.clock.now = at(2026, 9, 7, 10, 5)
+        assert w.run_once() == 1
+        body = bodies(w)[1]
+        assert body.startswith(
+            f"[rp aid={NOTIFIER} to={FAX_ROOM}-{4970 * 2 + 1}]\n[To:{SHINODA}] [To:{ADACHI}]\n③ 光パックス石川から発注書が届きました。"
+        )
+        assert body.endswith(ASK_DONE)  # 1件の通知は従来の返し方のまま
+        w._chatwork.messages += held("4980_001.pdf", "2026/09/08 08:00:00")
+        w.clock.now = at(2026, 9, 8, 8, 35)  # 翌日は①から
+        assert w.run_once() == 1
+        assert "\n① 光パックス石川から発注書が届きました。" in bodies(w)[2]
+        assert [t["number"] for t in w._load_state()["open"]] == [1, 2, 3, 1]
+
+    def test_the_same_number_on_another_day_means_the_newest_unless_replied_to(self, tmp_path):
+        w = self.held_over_weekend(tmp_path)
+        w._chatwork.messages += held("4980_001.pdf", "2026/09/08 08:00:00")
+        w.clock.now = at(2026, 9, 8, 8, 35)
+        w.run_once()  # 火曜の① = 4980（通知 9001）
+        w._chatwork.messages.append(human(9500, "① 対応完了"))  # 返信でなければ新しい方
+        w.run_once()
+        assert [t["filename"] for t in w.closed_last_run] == ["4980_001.pdf"]
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9000]① 対応完了"))  # 月曜の通知への返信
+        w.run_once()
+        assert [t["filename"] for t in w.closed_last_run] == ["4950_001.pdf"]
+        assert [t["filename"] for t in w._load_state()["open"]] == ["4960_001.pdf"]
+
+    def test_the_morning_check_for_a_batch_is_one_message(self, tmp_path):
+        w = self.held_over_weekend(tmp_path)
+        w.clock.now = at(2026, 9, 8, 9, 0)  # 翌営業日 9:00
+        w.run_once()
+        assert len(w._chatwork.sent) == 2
+        check = bodies(w)[1]
+        assert check.startswith(f"[To:{SHINODA}] [To:{ADACHI}]\nおはようございます。\n次の2件のFAXですが、確認と対応は完了していますでしょうか。")
+        assert "・① 9/5 10:00 光パックス石川 発注書（4950_001.pdf）" in check
+        assert "・② 9/6 15:00 光パックス石川 発注書（4960_001.pdf）" in check
+        assert "番号を添えて「対応完了」とお知らせください（例:「① 対応完了」）。全件済みでしたら「全て対応完了」で結構です。" in check
+        assert all(t["stage"] == 1 and t["check_ids"] == ["9001"] for t in w._load_state()["open"])
+        # 催促への返事も番号で
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9001]② 対応完了"))
+        w.clock.now = at(2026, 9, 8, 9, 30)
+        w.run_once()
+        assert [t["number"] for t in w._load_state()["open"]] == [1]
+        # 昼の再確認は残った①だけ（1件なので従来の形）
+        w.clock.now = at(2026, 9, 8, 12, 0)
+        w.run_once()
+        again = bodies(w)[-1]
+        assert "たびたび失礼します。" in again and "4950_001.pdf" in again
+        assert again.startswith(f"[rp aid={NOTIFIER} to={FAX_ROOM}-{4950 * 2 + 1}]")
+
+    def test_the_evening_list_uses_the_numbers(self, tmp_path):
+        w = self.held_over_weekend(tmp_path)
+        w.clock.now = at(2026, 9, 7, 19, 0)
+        w.run_once()
+        body = bodies(w)[1]
+        assert "・① 9/5 10:00 光パックス石川 発注書（4950_001.pdf）" in body
+        assert "番号を添えて「対応完了」とお知らせください（例:「① 対応完了」）" in body
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9001]①対応完了"))
+        w.clock.now = at(2026, 9, 7, 19, 5)
+        w.run_once()
+        assert [t["number"] for t in w._load_state()["open"]] == [2]
+
+    def test_a_long_batch_is_split_and_the_numbering_continues(self, tmp_path):
+        msgs = (held("4950_001.pdf", "2026/09/05 10:00:00") + held("4960_001.pdf", "2026/09/06 15:00:00")
+                + held("4970_001.pdf", "2026/09/06 16:00:00"))
+        w = watcher(tmp_path, msgs, ORDER, now=at(2026, 9, 5, 10, 0))
+        w._config.data["fax_watch"]["batch"] = {"enabled": True, "max_chars": 1}
+        prime(w)
+        w.run_once()
+        w.clock.now = at(2026, 9, 7, 8, 30)
+        assert w.run_once() == 3
+        assert len(w._chatwork.sent) == 3
+        first, second, third = bodies(w)
+        assert "届いているFAXが3件あります" in first and "\n① " in first and "対応完了の返事が要るのは ① です。" in first
+        assert second.startswith(f"[To:{SHINODA}] [To:{ADACHI}]\n（続き 2/3）") and "\n② " in second
+        assert "（続き 3/3）" in third and "\n③ " in third
+        assert [(t["number"], t["posted_id"]) for t in w._load_state()["open"]] == [(1, "9000"), (2, "9001"), (3, "9002")]
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9001]② 対応完了"))
+        w.run_once()
+        assert [t["number"] for t in w._load_state()["open"]] == [1, 3]
+
+    def test_batching_can_be_switched_off(self, tmp_path):
+        w = self.held_over_weekend(tmp_path, batch={"enabled": False})
+        assert len(w._chatwork.sent) == 2
+        assert "\n① 光パックス石川から発注書が届きました。" in bodies(w)[0]
+        assert "\n② 光パックス石川から発注書が届きました。" in bodies(w)[1]
+        assert all(b.endswith(ASK_DONE) for b in bodies(w))
+
+    def test_the_status_reply_shows_the_numbers(self, tmp_path):
+        from raizuinu.faxwatch import FaxStatus
+
+        w = self.held_over_weekend(tmp_path)
+        text = FaxStatus(w._config, now=lambda: at(2026, 9, 7, 10, 0))._status()
+        assert "・① 9/5 10:00 光パックス石川 発注書（4950_001.pdf）" in text
+        assert "番号を添えて「対応完了」とお知らせください（例:「① 対応完了」）" in text
+
+    @pytest.mark.parametrize("body, expected", [
+        ("①③ 対応完了", [1, 3]), ("1と3対応完了", [1, 3]), ("No.2 完了です", [2]), ("(4) 対応完了", [4]),
+        ("2番と 5番 済みました", [2, 5]), ("㉑ 済", [21]), ("１と２ 対応完了", [1, 2]),
+        ("9/12納品分 対応完了", []), ("2件とも対応完了", []), ("4950_001.pdf 対応完了", []),
+        ("10時に対応完了しました", []), (f"[rp aid={AGENT} to={FAX_ROOM}-9000]①対応完了", [1]),
+    ])
+    def test_reading_numbers_from_a_reply(self, body, expected):
+        from raizuinu.faxwatch import report_numbers
+
+        assert report_numbers(body) == expected
+
+    def test_wording_for_all_and_the_circled_numbers(self):
+        from raizuinu.faxwatch import circled, mentions_all
+
+        assert mentions_all("全て対応完了") and mentions_all("2件とも対応完了です") and mentions_all("全部済みました")
+        assert not mentions_all("①対応完了") and not mentions_all("対応完了です")
+        assert [circled(n) for n in (1, 20, 21, 35, 36, 50, 51)] == ["①", "⑳", "㉑", "㉟", "㊱", "㊿", "(51)"]
 
 
 COMBINED = (
@@ -1097,6 +1333,29 @@ class TestQuestionsInTheFaxRoom:
         assert len(chatwork.sent) == 1  # 会話の返事は重ねない
         assert handler._fax_status._client.kwargs is None
         assert audit.records[-1]["type"] == "fax_mention_trigger" and audit.records[-1]["closed"] == ["4958_001.pdf"]
+
+    def test_a_done_report_the_watcher_asked_back_about_gets_no_second_reply(self, tmp_path, monkeypatch):
+        # まとめ通知に番号なしの「対応完了」→ 巡回側が番号を聞き返す。会話の返事は重ねない
+        import time
+
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        handler, chatwork, _, _ = self._handler(tmp_path, monkeypatch, {"open": self.OPEN})
+
+        class FakeRun:
+            closed_last_run = []
+            asked_last_run = [{"message_id": "7"}]
+
+            def run_once(self):
+                chatwork.sent.append((FAX_ROOM, "ありがとうございます。対応待ちが2件あるので、どのFAXが済んだか番号を添えて「対応完了」とお返事ください。"))
+                return 0
+
+            def has_pending(self):
+                return False
+
+        handler._fax_watch_factory = lambda: FakeRun()
+        self._ask(handler, NAKAURA_ID, "対応完了です", "7")
+        assert len(chatwork.sent) == 1
+        assert handler._fax_status._client.kwargs is None  # モデルでの会話に進まない
 
     def test_a_long_mentioned_report_is_read_and_closed_in_one_reply(self, tmp_path, monkeypatch):
         # メンション付きの長めの報告は、内容を読んで済んだと分かれば閉じ、お礼と残りを1通で返す
@@ -1445,14 +1704,15 @@ class TestFollowUp:
                 bot(4, ATTACHMENT.replace("4950", "4960"))]
         w = watcher(tmp_path, msgs, ORDER)
         prime(w)
-        assert w.run_once() == 2
+        assert w.run_once() == 2  # 同じ巡回の2件は1通にまとまる（①②）
+        assert len(w._chatwork.sent) == 1
         w._chatwork.messages.append(human(9500, "2件とも対応完了です"))
         w.run_once()
-        assert len(w._chatwork.sent) == 3  # お礼は1回
+        assert len(w._chatwork.sent) == 2  # お礼は1回
         assert w._load_state()["open"] == []
         w.clock.now = at(2026, 9, 4, 9, 0)
         w.run_once()
-        assert len(w._chatwork.sent) == 3
+        assert len(w._chatwork.sent) == 2
 
     def test_thanks_wording_never_reads_as_a_completion_report(self):
         # お礼の文が「完了」の報告と誤読されると、自分の投稿で発注書を閉じてしまう

@@ -155,6 +155,79 @@ def is_short_report(body: str, me: int = 0) -> bool:
     return len(strip_tags(body).strip()) <= SHORT_REPORT_CHARS
 
 
+# --- 通知の番号（①②…）---
+# 朝のまとめ通知は1通に複数のFAXを載せるので、どれが済んだかを番号で返してもらう。
+# 番号はその日の通知の通し番号（まとめ通知の中は①から、日中の単独通知はその続き）
+_CIRCLED_RANGES = ((1, 20, 0x2460), (21, 35, 0x3251), (36, 50, 0x32B1))
+
+
+def circled(n: int) -> str:
+    """1→①、21→㉑、36→㊱。51以上は (51)。"""
+    for lo, hi, base in _CIRCLED_RANGES:
+        if lo <= n <= hi:
+            return chr(base + n - lo)
+    return f"({n})"
+
+
+def _circled_value(ch: str) -> int:
+    code = ord(ch)
+    for lo, hi, base in _CIRCLED_RANGES:
+        if base <= code <= base + (hi - lo):
+            return lo + code - base
+    return 0
+
+
+_NUM_FORMS_RE = re.compile(r"(?:No\.?\s*|[#＃])(\d{1,2})|(\d{1,2})\s*番|[(（](\d{1,2})[)）]", re.IGNORECASE)
+# 日付・時刻・件数・ファイル名の一部（9/12、10時、2件、4950_001）は番号と読まない
+_BARE_NUM_RE = re.compile(r"(?<![\d/:.\-_A-Za-z])(\d{1,2})(?![\d/:.\-_月日円件時分個枚人%])")
+_ALL_RE = re.compile(r"(全て|すべて|全部|全件|一式|まとめて|両方|どちらも|いずれも|件とも|つとも|とも(対応|完了|済|確認))")
+_EXCEPT_RE = re.compile(r"(以外|除い|除き|のぞい|のぞき)")
+
+
+def report_numbers(body: str) -> list[int]:
+    """返事に書かれた通知の番号（①③、1と3、No.2、(4)）。順番どおり、重複なし。"""
+    text = strip_tags(body)
+    found: list[int] = []
+    kept: list[str] = []
+    for ch in text:
+        value = _circled_value(ch)
+        if value:
+            found.append(value)
+            kept.append(" ")
+        else:
+            kept.append(ch)
+    plain = unicodedata.normalize("NFKC", "".join(kept))
+    for match in _NUM_FORMS_RE.finditer(plain):
+        found.append(int(next(g for g in match.groups() if g)))
+    plain = _NUM_FORMS_RE.sub(" ", plain)
+    found += [int(m.group(1)) for m in _BARE_NUM_RE.finditer(plain)]
+    seen: list[int] = []
+    for n in found:
+        if n and n not in seen:
+            seen.append(n)
+    return seen
+
+
+def mentions_all(body: str) -> bool:
+    """「全て対応完了」「2件とも済み」のように、載っている分をまとめて済んだと言っているか。"""
+    return bool(_ALL_RE.search(unicodedata.normalize("NFKC", strip_tags(body))))
+
+
+def names_exceptions(body: str) -> bool:
+    """「①以外は対応完了」のように除外を含む返事（番号で閉じると逆になるので聞き返す）。"""
+    return bool(_EXCEPT_RE.search(unicodedata.normalize("NFKC", strip_tags(body))))
+
+
+def pick_by_number(threads: list[dict], numbers: list[int]) -> list[dict]:
+    """番号に当たる控え。同じ番号が別の日の通知にもあれば、新しい通知の方を採る。"""
+    chosen: list[dict] = []
+    for n in numbers:
+        hits = [t for t in threads if int(t.get("number") or 0) == n]
+        if hits:
+            chosen.append(max(hits, key=lambda t: _as_int(t.get("posted_id"))))
+    return chosen
+
+
 # --- 時間の扱い ---
 
 
@@ -499,6 +572,8 @@ class FaxWatcher:
         self._phrasebook = phrasebook
         # 直前の run_once で「対応完了」により閉じた発注書（webhook側が二重に返さないための目印）
         self.closed_last_run: list[dict] = []
+        # 直前の run_once で「どの番号が済んだか」を聞き返した報告（同じく二重に返さないため）
+        self.asked_last_run: list[dict] = []
         if http_get is None:
             import requests
 
@@ -693,8 +768,8 @@ class FaxWatcher:
         limit = int(settings.get("max_per_day", 50))
         follow = (settings.get("follow_up") or {}).get("enabled", True)
 
-        handled = 0
         seen = state.setdefault("handled", {})  # ファイル名 → 直近の処理（同じFAXの再投稿を二度読まない）
+        prepared: list[dict] = []
         for item in sorted(list(state.get("pending") or []), key=lambda p: int(p["message_id"])):
             if state["count"] >= limit:
                 print(f"[warn] FAXの1日の処理上限（{limit}件）に達しました。残りは明日知らせます", flush=True)
@@ -713,37 +788,139 @@ class FaxWatcher:
             state["count"] += 1
             self._save_state(state)  # 呼ぶ前に数える（失敗しても消費は起きるため）
             try:
-                result = self._handle(room_id, item, follow)
-                handled += 1
+                prepared.append(self._prepare(room_id, item, follow))
             except Exception:
                 print("[error] FAXの処理に失敗: " + traceback.format_exc(), flush=True)
                 self._report_failure(room_id, item)
                 continue
-            seen[filename] = {
+        if not prepared:
+            return 0
+
+        # 一度に複数（時間外・土日に控えた分が朝にまとめて出るとき）は1通にまとめ、
+        # 番号（①②…）を振って、どれが済んだか番号で返してもらう。1件なら従来どおり
+        batch = settings.get("batch") or {}
+        if batch.get("enabled", True) and len(prepared) >= 2:
+            posted = self._post_batch(room_id, prepared, state, now)
+        else:
+            posted = [self._post_single(room_id, p, state, now) for p in prepared]
+
+        for p in posted:
+            item = p["item"]
+            self._audit(
+                {
+                    "type": "fax_notice",
+                    "room_id": room_id,
+                    "message_id": str(item["message_id"]),
+                    "posted_id": p.get("posted_id", ""),
+                    "number": int(p.get("number") or 0),
+                    "filename": p["filename"],
+                    "sender": p["sender"],
+                    "basis": p["basis"],
+                    "kind": p["kind"],
+                    "category": p["category"],
+                    "is_order": p["is_order"],
+                    "quiet": bool(p.get("quiet")),
+                    "readable": p["readable"],
+                    "rotated": p["rotated"],
+                    "usage": p["usage"],
+                }
+            )
+            seen[p["filename"].lower()] = {
                 "ts": now.timestamp(),
-                "readable": bool(result.get("readable")),
+                "readable": bool(p["readable"]),
                 "message_id": item["message_id"],
                 "at": now.strftime("%H:%M"),
             }
-            if len(seen) > 300:
-                for key in sorted(seen, key=lambda k: float(seen[k].get("ts", 0)))[: len(seen) - 300]:
-                    seen.pop(key, None)
-            if follow and result.get("is_order"):
+            if follow and p["is_order"]:
                 state.setdefault("open", []).append(
                     {
-                        "posted_id": result["posted_id"],
+                        "posted_id": p.get("posted_id", ""),
+                        "batch_id": p.get("posted_id", ""),
+                        "number": int(p.get("number") or 0),
                         "pdf_id": item["message_id"],
-                        "filename": result["filename"],
-                        "sender": result["sender"],
-                        "kind": result["kind"],
+                        "filename": p["filename"],
+                        "sender": p["sender"],
+                        "kind": p["kind"],
                         "received_at": (item.get("notice") or {}).get("received_at", ""),
                         "posted_at": now.isoformat(),
                         "stage": 0,
                         "check_ids": [],
                     }
                 )
-                self._save_state(state)
-        return handled
+        if len(seen) > 300:
+            for key in sorted(seen, key=lambda k: float(seen[k].get("ts", 0)))[: len(seen) - 300]:
+                seen.pop(key, None)
+        self._save_state(state)
+        return len(posted)
+
+    @staticmethod
+    def _take_number(state: dict, now: datetime) -> int:
+        """その日の通知の通し番号を1つ取る（日付が変われば①から）。"""
+        today = now.strftime("%Y%m%d")
+        numbering = state.get("numbering") or {}
+        if numbering.get("date") != today:
+            numbering = {"date": today, "next": 1}
+        n = int(numbering.get("next", 1))
+        state["numbering"] = {"date": today, "next": n + 1}
+        return n
+
+    def _post_single(self, room_id: int, p: dict, state: dict, now: datetime) -> dict:
+        """1件だけの通知（従来の形）。発注書には番号を付ける（夕方の一覧などで番号で指せるように）。"""
+        from .answer import sanitize_for_chatwork
+
+        item = p["item"]
+        number = self._take_number(state, now) if (p["is_order"] and p["ask_done"]) else 0
+        prefix = f"{circled(number)} " if number else ""
+        text = self._render(p, prefix, trailer=True, ask_done=p["ask_done"] and p["is_order"])
+        reply_tag = f"[rp aid={int(item.get('account_id', 0))} to={room_id}-{item['message_id']}]"
+        heads = self._heads(now) if p["wants_heads"] else ""
+        parts = [reply_tag] + ([heads] if heads else []) + [sanitize_for_chatwork(text)]
+        posted_id = self._chatwork.send_message(room_id, "\n".join(parts))
+        return {**p, "posted_id": str(posted_id or ""), "number": number}
+
+    def _post_batch(self, room_id: int, prepared: list[dict], state: dict, now: datetime) -> list[dict]:
+        """複数件を1通にまとめて知らせる。長すぎれば分ける（番号は続き）。"""
+        from .answer import sanitize_for_chatwork
+
+        max_chars = int((self._config.fax_watch.get("batch") or {}).get("max_chars", 6000))
+        numbered = [(p, self._take_number(state, now)) for p in prepared]
+        blocks = [
+            (p, n, self._render(p, f"{circled(n)} ", trailer=False, ask_done=False)) for p, n in numbered
+        ]
+        chunks: list[list[tuple[dict, int, str]]] = [[]]
+        size = 0
+        for block in blocks:
+            if chunks[-1] and size + len(block[2]) > max_chars:
+                chunks.append([])
+                size = 0
+            chunks[-1].append(block)
+            size += len(block[2])
+
+        heads = self._heads(now) if any(p["wants_heads"] for p in prepared) else ""
+        total = len(prepared)
+        posted: list[dict] = []
+        for index, chunk in enumerate(chunks):
+            if index == 0:
+                header = f"届いているFAXが{total}件あります。まとめてお知らせします。"
+            else:
+                header = f"（続き {index + 1}/{len(chunks)}）"
+            lines = [header, ""]
+            for _, _, text in chunk:
+                lines.append(text)
+                lines.append("")
+            if any(p["readable"] for p, _, _ in chunk):
+                lines.append("※PDFを読んで整理しています。数量・金額は原本でご確認ください。")
+            need = [circled(n) for p, n, _ in chunk if p["is_order"] and p["ask_done"]]
+            if need:
+                lines.append(
+                    f"対応完了の返事が要るのは {''.join(need)} です。"
+                    "済みましたら、このメッセージへの返信で番号を添えて「対応完了」とお知らせください"
+                    f"（例:「{need[0]} 対応完了」）。全件済みでしたら「全て対応完了」で結構です。"
+                )
+            body = sanitize_for_chatwork("\n".join(lines))
+            posted_id = str(self._chatwork.send_message(room_id, (heads + "\n" if heads else "") + body) or "")
+            posted += [{**p, "posted_id": posted_id, "number": n} for p, n, _ in chunk]
+        return posted
 
     def _read_document(
         self, data: bytes, filename: str, need_sender: bool = True
@@ -779,7 +956,8 @@ class FaxWatcher:
         found = {**found, "summary": strip_own_company(str(found.get("summary") or ""), own_words)}
         return found, usage, rotated, own_only
 
-    def _handle(self, room_id: int, item: dict, ask_done: bool) -> dict[str, Any]:
+    def _prepare(self, room_id: int, item: dict, ask_done: bool) -> dict[str, Any]:
+        """PDFを取って読み、通知に要る材料をそろえる（投稿はしない）。"""
         settings = self._config.fax_watch
         notice = item.get("notice") or {}
         data, filename = self._download(room_id, item["attachment"])
@@ -810,53 +988,47 @@ class FaxWatcher:
         if quiet:
             is_order = False
         found = {**found, "is_order": is_order}
-        if readable:
-            text = self._compose(found, sender, basis, number, notice, filename, ask_done and is_order)
-            if quiet and str(quiet.get("reason") or "").strip():
-                text += f"\n※{str(quiet['reason']).strip()}のため、呼び出し（To）と対応完了の確認は省いています。"
-        else:
-            text = self._compose_unreadable(found, notice, filename)
-        from .answer import sanitize_for_chatwork
-
-        reply_tag = f"[rp aid={int(item.get('account_id', 0))} to={room_id}-{item['message_id']}]"
         # 案内・広告などは呼び出さず、ルームに置くだけ（To を付けると通知が鳴る）。
         # 読めなかったものは発注書かもしれないので呼び出す
         mention = set(settings.get("mention_kinds") or [])
-        wants_heads = is_order or not readable or category in mention or kind in mention
-        heads = self._heads() if (wants_heads and not quiet) else ""
-        parts = [reply_tag] + ([heads] if heads else []) + [sanitize_for_chatwork(text)]
-        posted_id = self._chatwork.send_message(room_id, "\n".join(parts))
-        self._audit(
-            {
-                "type": "fax_notice",
-                "room_id": room_id,
-                "message_id": str(item["message_id"]),
-                "filename": filename,
-                "sender": sender,
-                "basis": basis,
-                "kind": kind,
-                "category": category,
-                "is_order": is_order,
-                "quiet": bool(quiet),
-                "readable": readable,
-                "rotated": rotated,
-                "usage": usage,
-            }
-        )
+        wants_heads = (is_order or not readable or category in mention or kind in mention) and not quiet
         return {
-            "posted_id": str(posted_id or ""),
+            "item": item,
+            "found": found,
+            "notice": notice,
+            "filename": filename,
+            "sender": sender,
+            "basis": basis,
+            "fax_number": number,
+            "kind": kind,
+            "category": category,
             "is_order": is_order,
             "readable": readable,
-            "sender": sender,
-            "kind": kind,
-            "filename": filename,
+            "rotated": rotated,
+            "usage": usage,
+            "quiet": quiet,
+            "wants_heads": wants_heads,
+            "ask_done": bool(ask_done),
         }
 
+    def _render(self, p: dict, prefix: str, trailer: bool, ask_done: bool) -> str:
+        """通知1件分の本文。prefix は番号（「① 」）、trailer は末尾の注意書きと返し方。"""
+        if p["readable"]:
+            text = self._compose(
+                p["found"], p["sender"], p["basis"], p["fax_number"], p["notice"], p["filename"],
+                ask_done, prefix=prefix, trailer=trailer,
+            )
+            quiet = p.get("quiet") or {}
+            if quiet and str(quiet.get("reason") or "").strip():
+                text += f"\n※{str(quiet['reason']).strip()}のため、呼び出し（To）と対応完了の確認は省いています。"
+            return text
+        return self._compose_unreadable(p["found"], p["notice"], p["filename"], prefix=prefix)
+
     @staticmethod
-    def _compose_unreadable(found: dict, notice: dict, filename: str) -> str:
+    def _compose_unreadable(found: dict, notice: dict, filename: str, prefix: str = "") -> str:
         """回しても読めなかったとき。黙って「その他」にせず、人に見てもらう。"""
         lines = [
-            f"FAX「{filename}」が届きましたが、こちらでは内容を読み取れませんでした（不鮮明などのため）。",
+            f"{prefix}FAX「{filename}」が届きましたが、こちらでは内容を読み取れませんでした（不鮮明などのため）。",
             "お手数ですがPDFを直接ご確認ください。",
         ]
         seen = [str(found.get(k) or "").strip() for k in ("summary", "notes")]
@@ -874,69 +1046,116 @@ class FaxWatcher:
 
     # --- 発注書の見届け ---
 
+    @staticmethod
+    def _thread_ids(thread: dict, evening_ids: set[str]) -> set[str]:
+        """この控えへの返事とみなすメッセージID（通知・PDF・催促・夕方の一覧）。"""
+        return {str(thread.get("posted_id")), str(thread.get("pdf_id"))} | {
+            str(c) for c in thread.get("check_ids") or []
+        } | evening_ids
+
     def _close_finished(self, state: dict, messages: list[dict], room_id: int, notifier: int) -> None:
-        """「対応完了」の返事があった発注書を、見届けの対象から外す。"""
+        """「対応完了」の返事があった発注書を、見届けの対象から外す。
+
+        どの発注書の話かは、返信先 → ファイル名 → 番号（①③）→ 「全て」の順に決める。
+        まとめ通知（複数件）への番号も「全て」も無い「対応完了」は、どれか分からないので
+        閉じずに番号を聞き返す（黙って全部閉じると処理漏れになる）。
+        """
         self.closed_last_run = []
+        self.asked_last_run = []
         threads = state.get("open") or []
         if not threads:
             return
         me = self._me()
         # 夕方の一覧への返信は、載っている発注書すべてへの返事として受ける
         evening_ids = {str(i) for i in state.get("evening_ids") or []}
+        asked = [str(i) for i in state.get("asked_ids") or []]
         filenames = [str(t.get("filename") or "") for t in threads if t.get("filename")]
-        remaining = []
+        closed: list[dict] = []
         closers: dict[str, dict] = {}
-        for thread in threads:
-            ids = {str(thread.get("posted_id")), str(thread.get("pdf_id"))} | {
-                str(c) for c in thread.get("check_ids") or []
-            } | evening_ids
-            since = _as_int(thread.get("posted_id"))
-            filename = str(thread.get("filename") or "")
-            closer = None
-            for message in messages:
-                mid = int(message.get("message_id", 0))
-                if mid <= since or _account_of(message) in (notifier, me):
-                    continue
-                body = str(message.get("body", ""))
-                if _OWN_MARK in body:
-                    continue  # 自分の投稿（自IDが取れなかったときの保険）
-                targets = reply_targets(body, room_id)
-                if targets and not (targets & ids):
-                    continue  # 別のFAXへの返事
-                # ファイル名を挙げて書かれた報告は、そのFAXだけの話として読む
-                named = [f for f in filenames if f and f in body]
-                if named and filename not in named:
-                    continue
-                if not is_completion(body):
-                    continue
+        for message in sorted(messages, key=lambda m: int(m.get("message_id", 0))):
+            mid = int(message.get("message_id", 0))
+            if str(mid) in asked or _account_of(message) in (notifier, me):
+                continue
+            body = str(message.get("body", ""))
+            if _OWN_MARK in body:
+                continue  # 自分の投稿（自IDが取れなかったときの保険）
+            if not is_completion(body):
+                continue
+            targets = reply_targets(body, room_id)
+            candidates = [
+                t for t in threads
+                if t not in closed
+                and mid > _as_int(t.get("posted_id"))
+                and (not targets or targets & self._thread_ids(t, evening_ids))
+            ]
+            if not candidates:
+                continue  # 別のFAXへの返事、または通知より前の発言
+            # ファイル名を挙げて書かれた報告は、そのFAXだけの話として読む
+            named = [f for f in filenames if f and f in body]
+            if named:
+                chosen = [t for t in candidates if str(t.get("filename") or "") in named]
+            else:
                 # 返信でもファイル名指定でもない文は、短い報告（「2件とも対応完了です」）だけを
                 # 完了と読む。実例（2026-09-08）: メンバー宛の周知文に「対応完了に対する返信…」
                 # とあり、開いていた発注書を閉じてお礼を返してしまった
-                if not targets and not named and not is_short_report(body, me):
+                if not targets and not is_short_report(body, me):
                     continue
-                closer = message
-                break
-            if closer is None:
-                remaining.append(thread)
+                numbers = report_numbers(body)
+                if numbers and not names_exceptions(body):
+                    chosen = pick_by_number(candidates, numbers)
+                elif mentions_all(body) or (len(candidates) == 1 and not names_exceptions(body)):
+                    chosen = candidates
+                else:
+                    # まとめ通知に番号なしの「対応完了」。どれか分からないので聞き返す（一度だけ）
+                    asked.append(str(mid))
+                    self._ask_which(room_id, message, candidates)
+                    self.asked_last_run.append(message)
+                    continue
+            if not chosen:
                 continue
-            self._audit(
-                {
-                    "type": "fax_done",
-                    "room_id": room_id,
-                    "message_id": str(thread.get("pdf_id")),
-                    "filename": thread.get("filename"),
-                    "by": _account_of(closer),
-                    "stage": int(thread.get("stage", 0)),
-                }
-            )
-            closers.setdefault(str(closer.get("message_id")), closer)
-            self.closed_last_run.append(thread)
+            for thread in chosen:
+                self._audit(
+                    {
+                        "type": "fax_done",
+                        "room_id": room_id,
+                        "message_id": str(thread.get("pdf_id")),
+                        "filename": thread.get("filename"),
+                        "number": int(thread.get("number") or 0),
+                        "by": _account_of(message),
+                        "stage": int(thread.get("stage", 0)),
+                    }
+                )
+                closed.append(thread)
+            closers.setdefault(str(mid), message)
+        remaining = [t for t in threads if t not in closed]
         state["open"] = remaining
+        state["asked_ids"] = asked[-50:]
+        self.closed_last_run = closed
         # 報告には一言返す。1つの「完了」で複数の発注書が閉じても、お礼は1回。
         # そのとき、まだ対応待ちのFAXがあれば一緒に示す（月曜朝にまとめて届いた
         # 分の処理漏れを防ぐ）
         for closer in closers.values():
             self._thank(room_id, closer, remaining)
+
+    def _ask_which(self, room_id: int, message: dict, candidates: list[dict]) -> None:
+        """番号の無い「対応完了」に、どのFAXの話か番号で聞き返す。"""
+        try:
+            tag = f"[rp aid={_account_of(message)} to={room_id}-{message.get('message_id')}]"
+            hint = self._reply_hint(candidates)
+            lines = [
+                f"ありがとうございます。対応待ちが{len(candidates)}件あるので、どのFAXが済んだか"
+                f"番号を添えて「対応完了」とお返事ください{hint}。全部済んでいれば「全て対応完了」で結構です。"
+            ]
+            lines += ["・" + self._thread_line(t) for t in candidates]
+            self._chatwork.send_message(room_id, f"{tag}\n" + "\n".join(lines))
+        except Exception:
+            print("[warn] 番号の聞き返しに失敗: " + traceback.format_exc(), flush=True)
+
+    @staticmethod
+    def _reply_hint(threads: list[dict]) -> str:
+        """「（例:「① 対応完了」）」。番号の付いた控えが無ければ空。"""
+        numbers = [int(t.get("number") or 0) for t in threads if t.get("number")]
+        return f"（例:「{circled(numbers[0])} 対応完了」）" if numbers else ""
 
     def _thank(self, room_id: int, message: dict, remaining: list[dict]) -> None:
         """完了の報告に、相手のメッセージへの返信で礼を言い、残りを添える（黙って閉じない）。"""
@@ -981,7 +1200,8 @@ class FaxWatcher:
         ]
         lines += ["・" + self._thread_line(t) for t in open_threads]
         lines.append(
-            "対応済みでしたら「対応完了」とご返信ください（このメッセージへの返信で、まとめてで構いません）。"
+            "対応済みでしたら、このメッセージへの返信で番号を添えて「対応完了」とお知らせください"
+            f"{self._reply_hint(open_threads)}。全件済みでしたら「全て対応完了」で結構です。"
         )
         lines.append("未対応のままで問題ないかもあわせてご確認ください。残っている分は翌営業日にもお知らせします。")
         try:
@@ -1045,6 +1265,8 @@ class FaxWatcher:
 
         max_open_days = int(settings.get("max_open_days", 14))
         remaining = []
+        due_first: list[dict] = []
+        due_again: list[dict] = []
         for thread in state.get("open") or []:
             stage = int(thread.get("stage", 0))
             posted_at = _parse_iso(thread.get("posted_at")) or now
@@ -1057,55 +1279,90 @@ class FaxWatcher:
             if stage == 0:
                 due = at_clock(next_business_day(posted_at.date()), check_clock)
                 if now >= due:
-                    mid = self._post_check(room_id, notifier, thread, now, first=True)
-                    thread["stage"] = 1
-                    thread["checked_at"] = now.isoformat()
-                    thread.setdefault("check_ids", []).append(mid)
-                remaining.append(thread)
+                    due_first.append(thread)
             elif stage == 1:
                 checked_at = _parse_iso(thread.get("checked_at")) or posted_at
                 due = at_clock(checked_at.date(), recheck_clock)
                 if due <= checked_at:  # 朝の確認が遅れた日は、そこから同じ間隔を空ける
                     due = checked_at + gap
                 if now >= due:
-                    self._post_check(room_id, notifier, thread, now, first=False)
-                    # 催促は2度で打ち切るが、対応待ちとしては残す（夕方の一覧と
-                    # お礼の返信で示し続け、完了の返事で外れる）
-                    thread["stage"] = 2
-                    thread["rechecked_at"] = now.isoformat()
-                remaining.append(thread)
-            else:
-                remaining.append(thread)
+                    due_again.append(thread)
+            remaining.append(thread)
+        # 同じまとめ通知で知らせた分は、催促も1通にまとめる（1件ずつ鳴らさない）
+        for group in self._group_by_batch(due_first):
+            mid = self._post_check(room_id, notifier, group, now, first=True)
+            for thread in group:
+                thread["stage"] = 1
+                thread["checked_at"] = now.isoformat()
+                thread.setdefault("check_ids", []).append(mid)
+        for group in self._group_by_batch(due_again):
+            mid = self._post_check(room_id, notifier, group, now, first=False)
+            for thread in group:
+                # 催促は2度で打ち切るが、対応待ちとしては残す（夕方の一覧と
+                # お礼の返信で示し続け、完了の返事で外れる）
+                thread["stage"] = 2
+                thread["rechecked_at"] = now.isoformat()
+                thread.setdefault("check_ids", []).append(mid)
         state["open"] = remaining
 
-    def _post_check(self, room_id: int, notifier: int, thread: dict, now: datetime, first: bool) -> str:
+    @staticmethod
+    def _group_by_batch(threads: list[dict]) -> list[list[dict]]:
+        """同じ通知（まとめ通知）で知らせた控えをひとまとめに。単独の通知は1件ずつ。"""
+        groups: dict[str, list[dict]] = {}
+        for thread in threads:
+            key = str(thread.get("batch_id") or thread.get("posted_id") or thread.get("pdf_id") or id(thread))
+            groups.setdefault(key, []).append(thread)
+        return list(groups.values())
+
+    def _post_check(self, room_id: int, notifier: int, threads: list[dict], now: datetime, first: bool) -> str:
         from .answer import sanitize_for_chatwork
 
-        subject = self._describe(thread)
-        if first:
-            greeting = "おはようございます。" if now.hour < 11 else "お疲れさまです。"
-            text = (
-                f"{greeting}\n{subject}ですが、確認と対応は完了していますでしょうか。\n"
-                "済んでいましたら、このメッセージへの返信で「対応完了」とお知らせください。"
-            )
+        greeting = "おはようございます。" if now.hour < 11 else "お疲れさまです。"
+        if len(threads) == 1:
+            thread = threads[0]
+            subject = self._describe(thread)
+            if first:
+                text = (
+                    f"{greeting}\n{subject}ですが、確認と対応は完了していますでしょうか。\n"
+                    "済んでいましたら、このメッセージへの返信で「対応完了」とお知らせください。"
+                )
+            else:
+                text = (
+                    f"たびたび失礼します。\n{subject}について、先ほどの確認にもまだお返事がないようです。"
+                    "確認漏れになっていないでしょうか。\n対応が済んでいましたら「対応完了」とご返信ください。"
+                )
+            reply_tag = f"[rp aid={notifier} to={room_id}-{thread.get('pdf_id')}]\n"
         else:
-            text = (
-                f"たびたび失礼します。\n{subject}について、先ほどの確認にもまだお返事がないようです。"
-                "確認漏れになっていないでしょうか。\n対応が済んでいましたら「対応完了」とご返信ください。"
-            )
-        reply_tag = f"[rp aid={notifier} to={room_id}-{thread.get('pdf_id')}]"
+            listing = "\n".join("・" + self._thread_line(t) for t in threads)
+            hint = self._reply_hint(threads)
+            if first:
+                text = (
+                    f"{greeting}\n次の{len(threads)}件のFAXですが、確認と対応は完了していますでしょうか。\n"
+                    f"{listing}\n済んでいましたら、このメッセージへの返信で番号を添えて「対応完了」と"
+                    f"お知らせください{hint}。全件済みでしたら「全て対応完了」で結構です。"
+                )
+            else:
+                text = (
+                    f"たびたび失礼します。\n次の{len(threads)}件のFAXについて、先ほどの確認にもまだお返事が"
+                    f"ないようです。確認漏れになっていないでしょうか。\n{listing}\n"
+                    f"対応が済んでいましたら番号を添えて「対応完了」とご返信ください{hint}。"
+                    "全件済みでしたら「全て対応完了」で結構です。"
+                )
+            reply_tag = ""
         mid = self._chatwork.send_message(
-            room_id, f"{reply_tag}\n{self._heads(now)}\n" + sanitize_for_chatwork(text)
+            room_id, f"{reply_tag}{self._heads(now)}\n" + sanitize_for_chatwork(text)
         )
-        self._audit(
-            {
-                "type": "fax_check",
-                "room_id": room_id,
-                "message_id": str(thread.get("pdf_id")),
-                "filename": thread.get("filename"),
-                "stage": 1 if first else 2,
-            }
-        )
+        for thread in threads:
+            self._audit(
+                {
+                    "type": "fax_check",
+                    "room_id": room_id,
+                    "message_id": str(thread.get("pdf_id")),
+                    "filename": thread.get("filename"),
+                    "number": int(thread.get("number") or 0),
+                    "stage": 1 if first else 2,
+                }
+            )
         return str(mid or "")
 
     @staticmethod
@@ -1231,15 +1488,17 @@ class FaxWatcher:
         notice: dict,
         filename: str,
         ask_done: bool = False,
+        prefix: str = "",
+        trailer: bool = True,
     ) -> str:
         kind = str(found.get("kind") or "その他")
         received = notice.get("received_at", "")
         lines: list[str] = []
         if found.get("is_order"):
-            lines.append(f"{kind}が届きました。" if sender == "" else f"{sender}から{kind}が届きました。")
+            lines.append(prefix + (f"{kind}が届きました。" if sender == "" else f"{sender}から{kind}が届きました。"))
         else:
             lines.append(
-                f"FAXが届きました（{kind}）。" if sender == "" else f"{sender}からFAXが届きました（{kind}）。"
+                prefix + (f"FAXが届きました（{kind}）。" if sender == "" else f"{sender}からFAXが届きました（{kind}）。")
             )
         if sender:
             lines.append(f"差出人の根拠: {basis}")
@@ -1283,9 +1542,10 @@ class FaxWatcher:
         if received:
             meta.append(f"受信 {received}")
         lines.append("（" + "／".join(meta) + "）")
-        lines.append("※PDFを読んで整理しています。数量・金額は原本でご確認ください。")
-        if ask_done:
-            lines.append(ASK_DONE)
+        if trailer:
+            lines.append("※PDFを読んで整理しています。数量・金額は原本でご確認ください。")
+            if ask_done:
+                lines.append(ASK_DONE)
         return "\n".join(lines)
 
     def _note_duplicate(self, room_id: int, item: dict, prior: dict) -> None:
@@ -1359,7 +1619,9 @@ def thread_line(thread: dict) -> str:
             continue
     sender = str(thread.get("sender") or "").strip() or "差出人不明"
     kind = str(thread.get("kind") or "FAX")
-    return f"{when}{sender} {kind}（{thread.get('filename', '')}）"
+    number = int(thread.get("number") or 0)
+    label = f"{circled(number)} " if number else ""
+    return f"{label}{when}{sender} {kind}（{thread.get('filename', '')}）"
 
 
 # 「未処理の注文書残ってる？」のような、対応状況を尋ねる言い方
@@ -1402,8 +1664,12 @@ class FaxStatus:
   done_filenames（済んだPDF名。下の一覧から）で示す。運用の連絡や説明
   （「〜の件、修正しました」「〜に変更しました」など）は報告ではないので示さない。
   報告のときの reply は短いお礼だけでよい（残りの一覧はプログラム側が添える）
+- 対応待ちには番号（①②…）が付いている。「①と③が済みました」のように番号で
+  報告されたら、その番号のPDF名を done_filenames に入れる。番号も「全て」も無い
+  「対応完了」で対象が複数あるときは閉じず、どの番号か聞き返す
+  （「全部でしたら『全て対応完了』とお返事ください」と添える）
 
-いま対応待ちのFAX（PDF名 / 差出人 / 種類）:
+いま対応待ちのFAX（番号 / PDF名 / 差出人 / 種類）:
 {open_list}
 
 例:
@@ -1411,6 +1677,7 @@ class FaxStatus:
 - 相手「ありがとう」→「こちらこそ、ご確認ありがとうございます。」
 - 相手「お疲れさまです」→「お疲れさまです。今日も何かあればお知らせください。」
 - 相手「4987の件、対応完了しました。ありがとうございました。」→ done_filenames に 4987_001.pdf、reply「ご対応ありがとうございます。」
+- 相手「②は済みました」→ 一覧で②のPDF名を done_filenames に、reply「ご対応ありがとうございます。」
 """
 
     def __init__(
@@ -1467,7 +1734,8 @@ class FaxStatus:
                 self._client = anthropic.Anthropic()
             cfg = self._config
             open_list = "\n".join(
-                f"- {t.get('filename', '')} / {t.get('sender') or '差出人不明'} / {t.get('kind', '')}"
+                f"- {circled(int(t.get('number') or 0)) if t.get('number') else '（番号なし）'} / "
+                f"{t.get('filename', '')} / {t.get('sender') or '差出人不明'} / {t.get('kind', '')}"
                 for t in self.open_threads()
             ) or "（なし）"
             kwargs = {
@@ -1538,7 +1806,11 @@ class FaxStatus:
         if open_threads:
             lines.append(f"いま対応完了の返信をいただいていないのは{len(open_threads)}件です。")
             lines += ["・" + thread_line(t) for t in open_threads]
-            lines.append("対応済みでしたら、それぞれの通知への返信で「対応完了」とお知らせください。")
+            hint = FaxWatcher._reply_hint(open_threads)
+            lines.append(
+                f"対応済みでしたら、番号を添えて「対応完了」とお知らせください{hint}。"
+                "全件済みでしたら「全て対応完了」で結構です。"
+            )
         else:
             lines.append("いま対応待ちのFAXはありません。")
         if pending:
