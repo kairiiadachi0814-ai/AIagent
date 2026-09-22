@@ -309,15 +309,6 @@ def _parse_iso(text: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=JST)
 
 
-def _parse_received(text: Any) -> date | None:
-    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y/%m/%d"):
-        try:
-            return datetime.strptime(str(text).strip(), fmt).date()
-        except ValueError:
-            continue
-    return None
-
-
 class PartnerDirectory:
     """FAX番号 → 取引先名 の台帳（Googleスプレッドシートの公開CSV）。
 
@@ -890,11 +881,16 @@ class FaxWatcher:
 
     @staticmethod
     def _take_number(state: dict, now: datetime) -> int:
-        """その日の通知の通し番号を1つ取る（日付が変われば①から）。"""
+        """通知の通し番号を1つ取る。
+
+        日付が変わったとき、対応待ちが残っていなければ①に戻し、残っていれば続きから振る
+        （前日の①と当日の①が朝の一覧に並ぶと、どちらの話か決まらないため）。
+        """
         today = now.strftime("%Y%m%d")
         numbering = state.get("numbering") or {}
         if numbering.get("date") != today:
-            numbering = {"date": today, "next": 1}
+            carry = bool(state.get("open"))
+            numbering = {"date": today, "next": int(numbering.get("next", 1)) if carry else 1}
         n = int(numbering.get("next", 1))
         state["numbering"] = {"date": today, "next": n + 1}
         return n
@@ -919,8 +915,15 @@ class FaxWatcher:
 
         max_chars = int((self._config.fax_watch.get("batch") or {}).get("max_chars", 6000))
         numbered = [(p, self._take_number(state, now)) for p in prepared]
+        # 1通にまとめると1件ずつの通知（PDFの投稿への返信）が無いので、各件にPDFのリンクを添える
         blocks = [
-            (p, n, self._render(p, f"{circled(n)} ", trailer=False, ask_done=False)) for p, n in numbered
+            (
+                p,
+                n,
+                self._render(p, f"{circled(n)} ", trailer=False, ask_done=False)
+                + f"\nPDF: {message_url(room_id, p['item']['message_id'])}",
+            )
+            for p, n in numbered
         ]
         chunks: list[list[tuple[dict, int, str]]] = [[]]
         size = 0
@@ -1261,7 +1264,8 @@ class FaxWatcher:
         except Exception:
             print("[warn] 完了報告への返事に失敗: " + traceback.format_exc(), flush=True)
 
-    _thread_line = staticmethod(lambda thread: thread_line(thread))
+    def _thread_line(self, thread: dict) -> str:
+        return thread_line(thread, int(self._config.fax_watch.get("room_id", 0) or 0))
 
     def _remaining_lines(self, remaining: list[dict]) -> list[str]:
         if not remaining:
@@ -1378,16 +1382,17 @@ class FaxWatcher:
                 if now >= due:
                     due_again.append(thread)
             remaining.append(thread)
-        # 同じまとめ通知で知らせた分は、催促も1通にまとめる（1件ずつ鳴らさない）
-        for group in self._group_by_batch(due_first):
-            mid = self._post_check(room_id, notifier, group, now, first=True)
-            for thread in group:
+        # 同じ時刻に催促する分は、夕方の一覧と同じ形で1通にまとめる（1件ずつ鳴らさない。
+        # 指摘 2026-09-22: 朝9時の前日分も19時の一覧と同じまとめにしてほしい）
+        if due_first:
+            mid = self._post_check(room_id, due_first, now, first=True)
+            for thread in due_first:
                 thread["stage"] = 1
                 thread["checked_at"] = now.isoformat()
                 thread.setdefault("check_ids", []).append(mid)
-        for group in self._group_by_batch(due_again):
-            mid = self._post_check(room_id, notifier, group, now, first=False)
-            for thread in group:
+        if due_again:
+            mid = self._post_check(room_id, due_again, now, first=False)
+            for thread in due_again:
                 # 催促は2度で打ち切るが、対応待ちとしては残す（夕方の一覧と
                 # お礼の返信で示し続け、完了の返事で外れる）
                 thread["stage"] = 2
@@ -1395,53 +1400,29 @@ class FaxWatcher:
                 thread.setdefault("check_ids", []).append(mid)
         state["open"] = remaining
 
-    @staticmethod
-    def _group_by_batch(threads: list[dict]) -> list[list[dict]]:
-        """同じ通知（まとめ通知）で知らせた控えをひとまとめに。単独の通知は1件ずつ。"""
-        groups: dict[str, list[dict]] = {}
-        for thread in threads:
-            key = str(thread.get("batch_id") or thread.get("posted_id") or thread.get("pdf_id") or id(thread))
-            groups.setdefault(key, []).append(thread)
-        return list(groups.values())
-
-    def _post_check(self, room_id: int, notifier: int, threads: list[dict], now: datetime, first: bool) -> str:
+    def _post_check(self, room_id: int, threads: list[dict], now: datetime, first: bool) -> str:
+        """催促を、対応待ちの一覧（番号・PDFのリンク付き）として1通で出す。"""
         from .answer import sanitize_for_chatwork
 
-        greeting = "おはようございます。" if now.hour < 11 else "お疲れさまです。"
-        if len(threads) == 1:
-            thread = threads[0]
-            subject = self._describe(thread)
-            if first:
-                text = (
-                    f"{greeting}\n{subject}ですが、確認と対応は完了していますでしょうか。\n"
-                    "済んでいましたら、このメッセージへの返信で「対応完了」とお知らせください。"
-                )
-            else:
-                text = (
-                    f"たびたび失礼します。\n{subject}について、先ほどの確認にもまだお返事がないようです。"
-                    "確認漏れになっていないでしょうか。\n対応が済んでいましたら「対応完了」とご返信ください。"
-                )
-            reply_tag = f"[rp aid={notifier} to={room_id}-{thread.get('pdf_id')}]\n"
+        listing = "\n".join("・" + self._thread_line(t) for t in threads)
+        hint = self._reply_hint(threads)
+        count = len(threads)
+        if first:
+            greeting = "おはようございます。" if now.hour < 11 else "お疲れさまです。"
+            text = (
+                f"{greeting}\n先にお知らせした次の{count}件のFAXについて、まだ対応完了の返信をいただいていません。"
+                f"確認と対応は完了していますでしょうか。\n{listing}\n"
+                f"済んでいましたら、このメッセージへの返信で番号を添えて「対応完了」とお知らせください{hint}。"
+                "全件済みでしたら「全て対応完了」で結構です。"
+            )
         else:
-            listing = "\n".join("・" + self._thread_line(t) for t in threads)
-            hint = self._reply_hint(threads)
-            if first:
-                text = (
-                    f"{greeting}\n次の{len(threads)}件のFAXですが、確認と対応は完了していますでしょうか。\n"
-                    f"{listing}\n済んでいましたら、このメッセージへの返信で番号を添えて「対応完了」と"
-                    f"お知らせください{hint}。全件済みでしたら「全て対応完了」で結構です。"
-                )
-            else:
-                text = (
-                    f"たびたび失礼します。\n次の{len(threads)}件のFAXについて、先ほどの確認にもまだお返事が"
-                    f"ないようです。確認漏れになっていないでしょうか。\n{listing}\n"
-                    f"対応が済んでいましたら番号を添えて「対応完了」とご返信ください{hint}。"
-                    "全件済みでしたら「全て対応完了」で結構です。"
-                )
-            reply_tag = ""
-        mid = self._chatwork.send_message(
-            room_id, f"{reply_tag}{self._heads(now)}\n" + sanitize_for_chatwork(text)
-        )
+            text = (
+                f"たびたび失礼します。\n次の{count}件のFAXについて、先ほどの確認にもまだお返事がないようです。"
+                f"確認漏れになっていないでしょうか。\n{listing}\n"
+                f"対応が済んでいましたら番号を添えて「対応完了」とご返信ください{hint}。"
+                "全件済みでしたら「全て対応完了」で結構です。"
+            )
+        mid = self._chatwork.send_message(room_id, f"{self._heads(now)}\n" + sanitize_for_chatwork(text))
         for thread in threads:
             self._audit(
                 {
@@ -1454,20 +1435,6 @@ class FaxWatcher:
                 }
             )
         return str(mid or "")
-
-    @staticmethod
-    def _describe(thread: dict) -> str:
-        day = _parse_received(thread.get("received_at"))
-        if day is None:
-            posted = _parse_iso(thread.get("posted_at"))
-            day = posted.date() if posted else None
-        when = f"{day.month}月{day.day}日に" if day else ""
-        sender = str(thread.get("sender") or "").strip()
-        kind = str(thread.get("kind") or "FAX")
-        filename = str(thread.get("filename") or "")
-        if sender:
-            return f"{when}{sender}から届いた{kind}（{filename}）"
-        return f"{when}届いた{kind}（{filename}・差出人不明）"
 
     # --- 部品 ---
 
@@ -1696,8 +1663,16 @@ class FaxWatcher:
             print("[warn] FAX巡回の状態を保存できませんでした", flush=True)
 
 
-def thread_line(thread: dict) -> str:
-    """対応待ちのFAX1件の短い説明。「9/5 17:55 有限会社珍味屋 発注書（4955_001.pdf）」"""
+def message_url(room_id: int, message_id: Any) -> str:
+    """Chatworkのメッセージへのリンク（PDFの投稿を開ける）。"""
+    return f"https://www.chatwork.com/#!rid{int(room_id)}-{message_id}"
+
+
+def thread_line(thread: dict, room_id: int = 0) -> str:
+    """対応待ちのFAX1件の短い説明。「① 9/5 17:55 有限会社珍味屋 発注書（4955_001.pdf） <PDFのURL>」
+
+    まとめて示すと1件ずつの通知を開けないので、room_id があればPDFの投稿へのリンクを添える。
+    """
     received = str(thread.get("received_at") or "")
     when = ""
     for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
@@ -1711,7 +1686,10 @@ def thread_line(thread: dict) -> str:
     kind = str(thread.get("kind") or "FAX")
     number = int(thread.get("number") or 0)
     label = f"{circled(number)} " if number else ""
-    return f"{label}{when}{sender} {kind}（{thread.get('filename', '')}）"
+    line = f"{label}{when}{sender} {kind}（{thread.get('filename', '')}）"
+    if room_id and thread.get("pdf_id"):
+        line += " " + message_url(room_id, thread["pdf_id"])
+    return line
 
 
 # 「未処理の注文書残ってる？」のような、対応状況を尋ねる言い方
@@ -1897,7 +1875,8 @@ class FaxStatus:
         lines: list[str] = []
         if open_threads:
             lines.append(f"いま対応完了の返信をいただいていないのは{len(open_threads)}件です。")
-            lines += ["・" + thread_line(t) for t in open_threads]
+            room_id = int(self._config.fax_watch.get("room_id", 0) or 0)
+            lines += ["・" + thread_line(t, room_id) for t in open_threads]
             hint = FaxWatcher._reply_hint(open_threads)
             lines.append(
                 f"対応済みでしたら、番号を添えて「対応完了」とお知らせください{hint}。"

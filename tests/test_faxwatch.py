@@ -969,24 +969,22 @@ class TestBatchedNotices:
         assert len(w._load_state()["open"]) == 3
 
     def test_an_exclusion_over_duplicate_numbers_is_asked_back(self, tmp_path):
-        # 月曜の①②と火曜の①が夕方の一覧に並ぶと、「①以外」の①が決まらない
+        # 番号が万一重なっていると「①以外」の①が決まらない → 閉じずに聞き返す
         w = self.held_over_weekend(tmp_path)
-        w._chatwork.messages += held("4980_001.pdf", "2026/09/08 08:00:00")
-        w.clock.now = at(2026, 9, 8, 8, 35)
-        w.run_once()  # 火曜の① = 4980（通知 9001）
-        w.clock.now = at(2026, 9, 8, 19, 0)
-        w.run_once()  # 月曜分の催促（9002）と夕方の一覧（9003）
-        evening = w._load_state()["evening_ids"][-1]
-        assert evening == "9003"
-        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-{evening}]①以外は対応完了"))
-        w.clock.now = at(2026, 9, 8, 19, 5)
+        state = w._load_state()
+        state["open"].append({**state["open"][0], "posted_id": "9500", "pdf_id": "9499", "filename": "4990_001.pdf"})
+        w._save_state(state)
+        w.clock.now = at(2026, 9, 7, 19, 0)
+        w.run_once()  # 夕方の一覧 9001（3件。①が2つ）
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9001]①以外は対応完了"))
+        w.clock.now = at(2026, 9, 7, 19, 5)
         w.run_once()
         assert len(w._load_state()["open"]) == 3
         assert "「以外」の範囲を取り違えないよう" in bodies(w)[-1]
-        # 催促（月曜の①②だけ）への返信なら範囲が決まるので受ける
-        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9002]①以外は対応完了"))
+        # まとめ通知（①②だけ）への返信なら範囲が決まるので受ける
+        w._chatwork.messages.append(human(9700, f"[rp aid={AGENT} to={FAX_ROOM}-9000]①以外は対応完了"))
         w.run_once()
-        assert [t["filename"] for t in w._load_state()["open"]] == ["4950_001.pdf", "4980_001.pdf"]
+        assert [t["filename"] for t in w._load_state()["open"]] == ["4950_001.pdf", "4990_001.pdf"]
 
     def test_an_exclusion_over_an_unnumbered_old_thread_is_asked_back(self, tmp_path):
         w = self.held_over_weekend(tmp_path)
@@ -1034,7 +1032,7 @@ class TestBatchedNotices:
         assert "\n① FAXが届きました（広告）。" in body and "\n② FAXが届きました（広告）。" in body
         assert w._load_state()["open"] == []
 
-    def test_daytime_singles_continue_the_numbering_and_the_next_day_restarts(self, tmp_path):
+    def test_daytime_singles_continue_the_numbering(self, tmp_path):
         w = self.held_over_weekend(tmp_path)
         w._chatwork.messages += held("4970_001.pdf", "2026/09/07 10:00:00")
         w.clock.now = at(2026, 9, 7, 10, 5)
@@ -1044,47 +1042,96 @@ class TestBatchedNotices:
             f"[rp aid={NOTIFIER} to={FAX_ROOM}-{4970 * 2 + 1}]\n[To:{SHINODA}] [To:{ADACHI}]\n③ 光パックス石川から発注書が届きました。"
         )
         assert body.endswith(ASK_DONE)  # 1件の通知は従来の返し方のまま
-        w._chatwork.messages += held("4980_001.pdf", "2026/09/08 08:00:00")
-        w.clock.now = at(2026, 9, 8, 8, 35)  # 翌日は①から
-        assert w.run_once() == 1
-        assert "\n① 光パックス石川から発注書が届きました。" in bodies(w)[2]
-        assert [t["number"] for t in w._load_state()["open"]] == [1, 2, 3, 1]
-
-    def test_the_same_number_on_another_day_means_the_newest_unless_replied_to(self, tmp_path):
-        w = self.held_over_weekend(tmp_path)
+        # 翌日、前日の分が残っていれば番号は続き（前日の①と当日の①が朝の一覧に並ばないように）
         w._chatwork.messages += held("4980_001.pdf", "2026/09/08 08:00:00")
         w.clock.now = at(2026, 9, 8, 8, 35)
-        w.run_once()  # 火曜の① = 4980（通知 9001）
-        w._chatwork.messages.append(human(9500, "① 対応完了"))  # 返信でなければ新しい方
+        assert w.run_once() == 1
+        assert "\n④ 光パックス石川から発注書が届きました。" in bodies(w)[2]
+        assert [t["number"] for t in w._load_state()["open"]] == [1, 2, 3, 4]
+
+    def test_numbering_restarts_once_nothing_is_waiting(self, tmp_path):
+        w = self.held_over_weekend(tmp_path)
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]全て対応完了"))
         w.run_once()
-        assert [t["filename"] for t in w.closed_last_run] == ["4980_001.pdf"]
-        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9000]① 対応完了"))  # 月曜の通知への返信
+        assert w._load_state()["open"] == []
+        w._chatwork.messages += held("4980_001.pdf", "2026/09/08 08:00:00")
+        w.clock.now = at(2026, 9, 8, 8, 35)  # 翌日、残りが無いので①から
+        assert w.run_once() == 1
+        assert "\n① 光パックス石川から発注書が届きました。" in bodies(w)[-1]
+        # 同じ日の中では、残りが無くなっても続き番号（①が2つ出ない）
+        w._chatwork.messages.append(human(9600, "① 対応完了"))
+        w.run_once()
+        assert w._load_state()["open"] == []
+        w._chatwork.messages += held("4990_001.pdf", "2026/09/08 09:30:00")
+        w.clock.now = at(2026, 9, 8, 9, 35)
+        assert w.run_once() == 1
+        assert "\n② 光パックス石川から発注書が届きました。" in bodies(w)[-1]
+
+    def test_a_duplicate_number_means_the_newest_unless_replied_to(self, tmp_path):
+        # 番号は対応待ちが残る間は続きなので普段は重ならない。万一重なっていたら新しい方（返信先があればそちら）
+        w = self.held_over_weekend(tmp_path)
+        state = w._load_state()
+        state["open"].append({**state["open"][0], "posted_id": "9500", "pdf_id": "9499", "filename": "4990_001.pdf"})
+        w._save_state(state)
+        w._chatwork.messages.append(human(9600, "① 対応完了"))  # 返信でなければ新しい方
+        w.run_once()
+        assert [t["filename"] for t in w.closed_last_run] == ["4990_001.pdf"]
+        w._chatwork.messages.append(human(9700, f"[rp aid={AGENT} to={FAX_ROOM}-9000]① 対応完了"))  # まとめ通知への返信
         w.run_once()
         assert [t["filename"] for t in w.closed_last_run] == ["4950_001.pdf"]
         assert [t["filename"] for t in w._load_state()["open"]] == ["4960_001.pdf"]
 
-    def test_the_morning_check_for_a_batch_is_one_message(self, tmp_path):
+    def test_the_morning_check_is_one_list_like_the_evening_one(self, tmp_path):
+        # 指摘（2026-09-22）: 朝 9:00 の前日分の催促も、19:00 の一覧と同じ1通のまとめにする
         w = self.held_over_weekend(tmp_path)
+        w._chatwork.messages += held("4970_001.pdf", "2026/09/07 10:00:00")
+        w.clock.now = at(2026, 9, 7, 10, 5)
+        w.run_once()  # 日中の単独の通知 9001（③）
         w.clock.now = at(2026, 9, 8, 9, 0)  # 翌営業日 9:00
         w.run_once()
-        assert len(w._chatwork.sent) == 2
-        check = bodies(w)[1]
-        assert check.startswith(f"[To:{SHINODA}] [To:{ADACHI}]\nおはようございます。\n次の2件のFAXですが、確認と対応は完了していますでしょうか。")
-        assert "・① 9/5 10:00 光パックス石川 発注書（4950_001.pdf）" in check
-        assert "・② 9/6 15:00 光パックス石川 発注書（4960_001.pdf）" in check
+        assert len(w._chatwork.sent) == 3  # まとめ通知の分も単独の分も、催促は1通
+        check = bodies(w)[2]
+        assert check.startswith(
+            f"[To:{SHINODA}] [To:{ADACHI}]\nおはようございます。\n"
+            "先にお知らせした次の3件のFAXについて、まだ対応完了の返信をいただいていません。確認と対応は完了していますでしょうか。"
+        )
+        assert f"・① 9/5 10:00 光パックス石川 発注書（4950_001.pdf） https://www.chatwork.com/#!rid{FAX_ROOM}-9901" in check
+        assert f"・② 9/6 15:00 光パックス石川 発注書（4960_001.pdf） https://www.chatwork.com/#!rid{FAX_ROOM}-9921" in check
+        assert f"・③ 9/7 10:00 光パックス石川 発注書（4970_001.pdf） https://www.chatwork.com/#!rid{FAX_ROOM}-9941" in check
         assert "番号を添えて「対応完了」とお知らせください（例:「① 対応完了」）。全件済みでしたら「全て対応完了」で結構です。" in check
-        assert all(t["stage"] == 1 and t["check_ids"] == ["9001"] for t in w._load_state()["open"])
+        assert "[rp " not in check
+        assert all(t["stage"] == 1 and t["check_ids"] == ["9002"] for t in w._load_state()["open"])
         # 催促への返事も番号で
-        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9001]② 対応完了"))
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9002]②③ 対応完了"))
         w.clock.now = at(2026, 9, 8, 9, 30)
         w.run_once()
         assert [t["number"] for t in w._load_state()["open"]] == [1]
-        # 昼の再確認は残った①だけ（1件なので従来の形）
+        # 昼の再確認も同じ形（残った①だけ）
         w.clock.now = at(2026, 9, 8, 12, 0)
         w.run_once()
         again = bodies(w)[-1]
-        assert "たびたび失礼します。" in again and "4950_001.pdf" in again
-        assert again.startswith(f"[rp aid={NOTIFIER} to={FAX_ROOM}-{4950 * 2 + 1}]")
+        assert again.startswith(f"[To:{SHINODA}] [To:{ADACHI}]\nたびたび失礼します。\n次の1件のFAXについて")
+        assert f"・① 9/5 10:00 光パックス石川 発注書（4950_001.pdf） https://www.chatwork.com/#!rid{FAX_ROOM}-9901" in again
+
+    def test_every_list_carries_a_link_to_the_pdf(self, tmp_path):
+        # まとめると1件ずつの通知（PDFの投稿への返信）が無いので、リンクで開けるようにする
+        from raizuinu.faxwatch import FaxStatus, message_url, thread_line
+
+        assert message_url(FAX_ROOM, "9901") == f"https://www.chatwork.com/#!rid{FAX_ROOM}-9901"
+        w = self.held_over_weekend(tmp_path)
+        notice = bodies(w)[0]
+        assert f"（ファイル: 4950_001.pdf／受信 2026/09/05 10:00:00）\nPDF: https://www.chatwork.com/#!rid{FAX_ROOM}-9901\n" in notice
+        assert f"\nPDF: https://www.chatwork.com/#!rid{FAX_ROOM}-9921\n" in notice
+        line = f"・② 9/6 15:00 光パックス石川 発注書（4960_001.pdf） https://www.chatwork.com/#!rid{FAX_ROOM}-9921"
+        assert line in FaxStatus(w._config, now=lambda: at(2026, 9, 7, 10, 0))._status()
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]① 対応完了"))
+        w.run_once()
+        assert line in bodies(w)[1]  # お礼の残り
+        w.clock.now = at(2026, 9, 7, 19, 0)
+        w.run_once()
+        assert line in bodies(w)[2]  # 夕方の一覧
+        thread = w._load_state()["open"][0]
+        assert thread_line(thread) == "② 9/6 15:00 光パックス石川 発注書（4960_001.pdf）"  # ルームが無ければリンク無し
 
     def test_the_evening_list_uses_the_numbers(self, tmp_path):
         w = self.held_over_weekend(tmp_path)
@@ -1588,7 +1635,7 @@ class TestRecipientsByWorkDay:
     def _to(self, body):
         import re
 
-        return [int(x) for x in re.findall(r"\[To:(\d+)\]", body.split("\n")[1])]
+        return [int(x) for x in re.findall(r"\[To:(\d+)\]", body)]
 
     def test_thursday_leaves_out_nakaura(self, tmp_path):
         w = self._watcher(tmp_path, THU)  # 木曜
@@ -1733,11 +1780,11 @@ class TestFollowUp:
         w.run_once()
         assert len(w._chatwork.sent) == 2
         body = bodies(w)[1]
-        assert body.startswith(f"[rp aid={NOTIFIER} to={FAX_ROOM}-2]")  # PDFの投稿につなげる
-        assert f"[To:{SHINODA}]" in body and f"[To:{ADACHI}]" in body
-        assert "おはようございます。" in body
-        assert "9月4日に光パックス石川から届いた発注書（4950_001.pdf）ですが、確認と対応は完了していますでしょうか" in body
-        assert "「対応完了」とお知らせください" in body
+        # 夕方の一覧と同じ形（番号とPDFへのリンク付き）
+        assert body.startswith(f"[To:{SHINODA}] [To:{ADACHI}]\nおはようございます。\n先にお知らせした次の1件のFAXについて")
+        assert "確認と対応は完了していますでしょうか" in body
+        assert f"・① 9/4 19:10 光パックス石川 発注書（4950_001.pdf） https://www.chatwork.com/#!rid{FAX_ROOM}-2" in body
+        assert "番号を添えて「対応完了」とお知らせください（例:「① 対応完了」）" in body
         w.run_once()
         assert len(w._chatwork.sent) == 2  # 同じ朝に二度は聞かない
 
@@ -1754,7 +1801,7 @@ class TestFollowUp:
         body = bodies(w)[2]
         assert "たびたび失礼します。" in body
         assert "確認漏れになっていないでしょうか" in body
-        assert "9月4日に光パックス石川から届いた発注書（4950_001.pdf）" in body
+        assert "・① 9/4 19:10 光パックス石川 発注書（4950_001.pdf）" in body
         # 3度目の催促は無い。ただし対応待ちとしては残る（夕方の一覧に載る）
         for later in (at(2026, 9, 4, 15, 0), at(2026, 9, 7, 9, 0), at(2026, 9, 8, 12, 0)):
             w.clock.now = later
