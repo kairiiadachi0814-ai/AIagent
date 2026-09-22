@@ -1409,8 +1409,9 @@ class FaxWatcher:
         count = len(threads)
         if first:
             greeting = "おはようございます。" if now.hour < 11 else "お疲れさまです。"
+            when = posted_phrase(threads, now)
             text = (
-                f"{greeting}\n先にお知らせした次の{count}件のFAXについて、まだ対応完了の返信をいただいていません。"
+                f"{greeting}\n{when}お知らせした次の{count}件のFAXについて、まだ対応完了の返信をいただいていません。"
                 f"確認と対応は完了していますでしょうか。\n{listing}\n"
                 f"済んでいましたら、このメッセージへの返信で番号を添えて「対応完了」とお知らせください{hint}。"
                 "全件済みでしたら「全て対応完了」で結構です。"
@@ -1661,6 +1662,24 @@ class FaxWatcher:
             self._state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
         except OSError:
             print("[warn] FAX巡回の状態を保存できませんでした", flush=True)
+
+
+def posted_phrase(threads: list[dict], now: datetime) -> str:
+    """催促の冒頭で、いつ知らせた分かを言う語。「昨日」「先週金曜日に」「9月19日に」「これまでに」。
+
+    指摘（2026-09-22）: 「先にお知らせした」は分かりにくい。人の会話として日に則した言い方にする。
+    """
+    days = {p.date() for p in (_parse_iso(t.get("posted_at")) for t in threads) if p}
+    if len(days) != 1:
+        return "これまでに"
+    day = days.pop()
+    delta = (now.date() - day).days
+    if delta == 1:
+        return "昨日"
+    if 2 <= delta <= 6:
+        prefix = "先週" if day.isocalendar()[1] != now.date().isocalendar()[1] else ""
+        return f"{prefix}{WEEKDAYS[day.weekday()]}曜日に"
+    return f"{day.month}月{day.day}日に"
 
 
 def message_url(room_id: int, message_id: Any) -> str:

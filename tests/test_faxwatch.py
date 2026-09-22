@@ -1093,7 +1093,7 @@ class TestBatchedNotices:
         check = bodies(w)[2]
         assert check.startswith(
             f"[To:{SHINODA}] [To:{ADACHI}]\nおはようございます。\n"
-            "先にお知らせした次の3件のFAXについて、まだ対応完了の返信をいただいていません。確認と対応は完了していますでしょうか。"
+            "昨日お知らせした次の3件のFAXについて、まだ対応完了の返信をいただいていません。確認と対応は完了していますでしょうか。"
         )
         assert f"・① 9/5 10:00 光パックス石川 発注書（4950_001.pdf） https://www.chatwork.com/#!rid{FAX_ROOM}-9901" in check
         assert f"・② 9/6 15:00 光パックス石川 発注書（4960_001.pdf） https://www.chatwork.com/#!rid{FAX_ROOM}-9921" in check
@@ -1781,7 +1781,7 @@ class TestFollowUp:
         assert len(w._chatwork.sent) == 2
         body = bodies(w)[1]
         # 夕方の一覧と同じ形（番号とPDFへのリンク付き）
-        assert body.startswith(f"[To:{SHINODA}] [To:{ADACHI}]\nおはようございます。\n先にお知らせした次の1件のFAXについて")
+        assert body.startswith(f"[To:{SHINODA}] [To:{ADACHI}]\nおはようございます。\n昨日お知らせした次の1件のFAXについて")
         assert "確認と対応は完了していますでしょうか" in body
         assert f"・① 9/4 19:10 光パックス石川 発注書（4950_001.pdf） https://www.chatwork.com/#!rid{FAX_ROOM}-2" in body
         assert "番号を添えて「対応完了」とお知らせください（例:「① 対応完了」）" in body
@@ -1818,6 +1818,21 @@ class TestFollowUp:
         w.clock.now = at(2026, 9, 7, 9, 0)  # 月
         w.run_once()
         assert len(w._chatwork.sent) == 2
+        assert "先週金曜日にお知らせした次の1件のFAXについて" in bodies(w)[1]  # 月曜に「昨日」と言わない
+
+    @pytest.mark.parametrize("posted, now, expected", [
+        (at(2026, 9, 21, 8, 30), at(2026, 9, 22, 9, 0), "昨日"),
+        (at(2026, 9, 18, 15, 0), at(2026, 9, 21, 9, 0), "先週金曜日に"),
+        (at(2026, 9, 22, 10, 0), at(2026, 9, 24, 9, 0), "火曜日に"),  # 同じ週なら曜日だけ
+        (at(2026, 9, 10, 10, 0), at(2026, 9, 22, 9, 0), "9月10日に"),  # 1週間より前は日付
+    ])
+    def test_the_check_says_when_it_told_them(self, posted, now, expected):
+        # 指摘（2026-09-22）: 「先にお知らせした」は分かりにくい。日に則した言い方にする
+        from raizuinu.faxwatch import posted_phrase
+
+        assert posted_phrase([{"posted_at": posted.isoformat()}], now) == expected
+        two = [{"posted_at": posted.isoformat()}, {"posted_at": at(2026, 9, 1, 9, 0).isoformat()}]
+        assert posted_phrase(two, now) == "これまでに"  # 日がまたがるときは断定しない
 
     def test_a_done_reply_to_the_notice_stops_the_follow_up(self, tmp_path):
         w = self.order(tmp_path)
