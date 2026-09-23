@@ -1198,6 +1198,125 @@ class TestBatchedNotices:
         assert [circled(n) for n in (1, 20, 21, 35, 36, 50, 51)] == ["①", "⑳", "㉑", "㉟", "㊱", "㊿", "(51)"]
 
 
+MORI, FUJITA = 10604615, 5631017
+URGENT_CFG = {
+    "words": ["急ぎ", "至急", "早急", "大至急", "緊急", "特急", "急いで", "急ぐ", "ASAP"],
+    "extra_recipients": [{"account_id": MORI, "name": "森"}, {"account_id": FUJITA, "name": "藤田"}],
+}
+JET = {
+    **ORDER, "sender": "ジェット", "kind": "発注看板", "summary": "楽々栗150gを発注。セール急ぎ分。",
+    "items": [{"name": "楽々栗150g", "quantity": "105", "amount": "原価408.00/売価510"}],
+    "due": "2026年9月25日", "notes": "担当者 島 悠稀、看板番号1691072-5", "urgent": False,
+}
+
+
+class TestUrgentOrders:
+    """実例（2026-09-23 10:11）: ジェットの発注看板に「セール急ぎ分」。急ぎの注文は楽天軒の
+    森さん・藤田さんにも To を付けて知らせる（語は設定で足せる）。"""
+
+    def urgent_watcher(self, tmp_path, payload, urgent=None):
+        w = watcher(tmp_path, [bot(1, NOTICE_NO_SENDER), bot(2, ATTACHMENT)], payload)
+        w._config.data["fax_watch"]["urgent"] = urgent or URGENT_CFG
+        prime(w)
+        return w
+
+    def test_an_urgent_order_also_calls_the_factory_side(self, tmp_path):
+        from raizuinu.faxwatch import thread_line
+
+        w = self.urgent_watcher(tmp_path, JET)
+        w.run_once()
+        body = bodies(w)[0]
+        assert body.split("\n")[1] == f"[To:{SHINODA}] [To:{ADACHI}] [To:{MORI}] [To:{FUJITA}]"
+        assert "① ジェットから発注看板が届きました。" in body
+        assert "※急ぎの指定があるため（「急ぎ」）、森さん・藤田さんにもお知らせしています。" in body
+        assert body.endswith(ASK_DONE)
+        thread = w._load_state()["open"][0]
+        assert thread["urgent"] is True
+        assert thread_line(thread).startswith("① 【急ぎ】9/4 19:10 ジェット 発注看板（4950_001.pdf）")
+
+    def test_an_ordinary_order_does_not(self, tmp_path):
+        w = self.urgent_watcher(tmp_path, ORDER)
+        w.run_once()
+        body = bodies(w)[0]
+        assert f"[To:{MORI}]" not in body and "急ぎ" not in body
+        assert w._load_state()["open"][0]["urgent"] is False
+
+    @pytest.mark.parametrize("field, text", [
+        ("notes", "至急お願いします"), ("due", "早急に"), ("kind", "大至急発注書"), ("summary", "ＡＳＡＰでの納品希望"),
+    ])
+    def test_the_word_can_be_anywhere_in_the_reading(self, tmp_path, field, text):
+        w = self.urgent_watcher(tmp_path, {**ORDER, field: text})
+        w.run_once()
+        assert f"[To:{MORI}]" in bodies(w)[0]
+
+    def test_the_word_in_an_item_name_counts_too(self, tmp_path):
+        w = self.urgent_watcher(tmp_path, {**ORDER, "items": [{"name": "楽々栗150g（急ぎ）", "quantity": "5", "amount": ""}]})
+        w.run_once()
+        assert f"[To:{FUJITA}]" in bodies(w)[0]
+
+    def test_the_models_flag_is_a_backstop(self, tmp_path):
+        w = self.urgent_watcher(tmp_path, {**ORDER, "urgent": True, "summary": "なるべく早くお願いしますとの依頼。"})
+        w.run_once()
+        body = bodies(w)[0]
+        assert f"[To:{MORI}]" in body
+        assert "※急ぎと読める記載があるため、森さん・藤田さんにもお知らせしています。" in body
+
+    def test_an_ad_shouting_urgent_calls_nobody(self, tmp_path):
+        w = self.urgent_watcher(tmp_path, {**AD, "summary": "至急ご確認ください！複合機リースの広告です。", "urgent": True})
+        w.run_once()
+        assert "[To:" not in bodies(w)[0]
+
+    def test_a_quiet_sheet_stays_quiet_even_if_urgent(self, tmp_path):
+        w = self.urgent_watcher(tmp_path, {**CONFIRMATION, "summary": "至急ご確認ください。"})
+        w._config.data["fax_watch"]["quiet_rules"] = QUIET_RULES
+        w.run_once()
+        assert "[To:" not in bodies(w)[0] and "森さん" not in bodies(w)[0]
+
+    def test_a_batch_calls_them_when_any_item_is_urgent(self, tmp_path):
+        msgs = held("4950_001.pdf", "2026/09/05 10:00:00") + held("4960_001.pdf", "2026/09/06 15:00:00")
+        w = watcher(tmp_path, msgs, [ORDER, JET], now=at(2026, 9, 5, 10, 0))
+        w._config.data["fax_watch"]["urgent"] = URGENT_CFG
+        prime(w)
+        w.run_once()
+        w.clock.now = at(2026, 9, 7, 8, 30)
+        w.run_once()
+        body = bodies(w)[0]
+        assert body.startswith(f"[To:{SHINODA}] [To:{ADACHI}] [To:{MORI}] [To:{FUJITA}]\n届いているFAXが2件あります")
+        assert body.count("森さん・藤田さんにもお知らせしています") == 1
+        assert body.index("② ジェットから発注看板が届きました。") < body.index("※急ぎの指定があるため")
+        w.clock.now = at(2026, 9, 7, 19, 0)
+        w.run_once()
+        evening = bodies(w)[-1]
+        assert "・② 【急ぎ】9/6 15:00 ジェット 発注看板（4960_001.pdf）" in evening
+        assert "・① 9/5 10:00 光パックス石川 発注書（4950_001.pdf）" in evening
+        assert f"[To:{MORI}]" not in evening  # 催促や一覧は経理だけ
+
+    def test_words_are_configurable(self, tmp_path):
+        w = self.urgent_watcher(tmp_path, {**ORDER, "notes": "最短納品でお願いします"}, urgent={**URGENT_CFG, "words": ["最短"]})
+        w.run_once()
+        assert f"[To:{MORI}]" in bodies(w)[0] and "（「最短」）" in bodies(w)[0]
+
+    def test_the_default_words_leave_the_boilerplate_alone(self, tmp_path):
+        # G7の定型「最短納品でお願いします」は急ぎと読まない（毎回鳴らさない）
+        w = self.urgent_watcher(tmp_path, {**ORDER, "notes": "最短納品でお願いします"})
+        w.run_once()
+        assert f"[To:{MORI}]" not in bodies(w)[0]
+
+    def test_without_extra_recipients_only_the_note_is_added(self, tmp_path):
+        w = self.urgent_watcher(tmp_path, JET, urgent={"words": ["急ぎ"], "extra_recipients": []})
+        w.run_once()
+        body = bodies(w)[0]
+        assert body.split("\n")[1] == f"[To:{SHINODA}] [To:{ADACHI}]"
+        assert "※急ぎの指定があるため（「急ぎ」）" in body and "お知らせしています" not in body
+
+    def test_the_reader_is_asked_to_flag_urgency(self):
+        from raizuinu.faxwatch import READ_SCHEMA, READ_SYSTEM
+
+        assert "urgent" in READ_SCHEMA["properties"] and "urgent" in READ_SCHEMA["required"]
+        assert "最短納品でお願いします」だけなら false" in READ_SCHEMA["properties"]["urgent"]["description"]
+        assert "urgent を true" in READ_SYSTEM
+
+
 COMBINED = (
     "[To:7777]\n[info][title]FAX受信通知[/title]受信日時：2026/09/07 18:55:46\n"
     "送信元番号なしのFAXです\nRJOBNUM：8531\nファイル名：4971_001.pdf\n"

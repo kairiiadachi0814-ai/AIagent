@@ -402,6 +402,13 @@ READ_SCHEMA: dict[str, Any] = {
             "type": "boolean",
             "description": "category が「注文」なら true（こちらに何かを発注・注文・依頼してきている文書）",
         },
+        "urgent": {
+            "type": "boolean",
+            "description": (
+                "「急ぎ」「至急」「早急」「大至急」のように、急いでほしいと文書に明記されていれば true。"
+                "納期が近いだけ、定型の「最短納品でお願いします」だけなら false"
+            ),
+        },
         "summary": {
             "type": "string",
             "description": "内容を1〜2文で。発注なら何を・いくつ・いくらで・いつまでに、を含める",
@@ -433,11 +440,27 @@ READ_SCHEMA: dict[str, Any] = {
         },
     },
     "required": [
-        "sender", "addressee", "kind", "category", "is_order", "summary", "items", "due", "notes",
+        "sender", "addressee", "kind", "category", "is_order", "urgent", "summary", "items", "due", "notes",
         "rotation", "readable",
     ],
     "additionalProperties": False,
 }
+
+# 急ぎの注文を見分ける語（表題・要約・備考・納期・品名のどこかにあれば急ぎ）。
+# 実例 2026-09-23: ジェットの発注看板に「セール急ぎ分」。楽天軒の森さん・藤田さんにも知らせる
+DEFAULT_URGENT_WORDS = ("急ぎ", "至急", "早急", "大至急", "緊急", "特急", "急いで", "急ぐ", "ASAP")
+
+
+def find_urgent_word(found: dict, words: tuple[str, ...] | list[str]) -> str:
+    """読み取り結果のどこかにある急ぎの語（最初に見つかったもの）。無ければ空文字。"""
+    parts = [str(found.get(k) or "") for k in ("kind", "summary", "notes", "due")]
+    parts += [str(i.get("name") or "") for i in (found.get("items") or []) if isinstance(i, dict)]
+    text = unicodedata.normalize("NFKC", " ".join(parts)).lower()
+    for word in words:
+        needle = unicodedata.normalize("NFKC", str(word or "")).lower()
+        if needle and needle in text:
+            return str(word)
+    return ""
 
 # こちら（受信側）のグループ会社。差出人にこれが書かれていたら宛先と取り違えている
 # （実例 2026-09-07〜10: 47件中9件で「RAKUTENKEN株式会社から発注書が届きました」と
@@ -558,6 +581,8 @@ READ_SYSTEM = """あなたは株式会社ライズクリエイション経理財
 - 納品日が行ごとに違う様式（納品日と数量の表）なら、items は行ごとに分け、
   name の先頭に納品日を付ける（例: 「6/5(金) 天津栗 焼冷凍10KG/CS」）。
   due には納品日の範囲や一覧を入れる
+- 「急ぎ」「至急」「早急」のように急いでほしいと書かれていれば urgent を true にし、
+  その語を summary か notes にそのまま残す（例: 「セール急ぎ分」）
 - 発注してよいか・金額が妥当かなどの判断はしない。内容の整理だけを行う
 - FAXは画質が粗いことがある。自信の無い読み取りは summary で
   「（判読しづらい）」と添える
@@ -846,6 +871,8 @@ class FaxWatcher:
                     "category": p["category"],
                     "is_order": p["is_order"],
                     "quiet": bool(p.get("quiet")),
+                    "urgent": bool(p.get("urgent")),
+                    "urgent_word": p.get("urgent_word", ""),
                     "readable": p["readable"],
                     "rotated": p["rotated"],
                     "usage": p["usage"],
@@ -871,6 +898,7 @@ class FaxWatcher:
                         "posted_at": now.isoformat(),
                         "stage": 0,
                         "check_ids": [],
+                        "urgent": bool(p.get("urgent")),
                     }
                 )
         if len(seen) > 300:
@@ -904,7 +932,7 @@ class FaxWatcher:
         prefix = f"{circled(number)} " if number else ""
         text = self._render(p, prefix, trailer=True, ask_done=p["ask_done"] and p["is_order"])
         reply_tag = f"[rp aid={int(item.get('account_id', 0))} to={room_id}-{item['message_id']}]"
-        heads = self._heads(now) if p["wants_heads"] else ""
+        heads = " ".join(h for h in (self._heads(now) if p["wants_heads"] else "", self._urgent_heads([p])) if h)
         parts = [reply_tag] + ([heads] if heads else []) + [sanitize_for_chatwork(text)]
         posted_id = self._chatwork.send_message(room_id, "\n".join(parts))
         return {**p, "posted_id": str(posted_id or ""), "number": number}
@@ -956,7 +984,8 @@ class FaxWatcher:
                     f"（例:「{need[0]} 対応完了」）。全件済みでしたら「全て対応完了」で結構です。"
                 )
             body = sanitize_for_chatwork("\n".join(lines))
-            posted_id = str(self._chatwork.send_message(room_id, (heads + "\n" if heads else "") + body) or "")
+            top = " ".join(h for h in (heads, self._urgent_heads([p for p, _, _ in chunk])) if h)
+            posted_id = str(self._chatwork.send_message(room_id, (top + "\n" if top else "") + body) or "")
             posted += [{**p, "posted_id": posted_id, "number": n} for p, n, _ in chunk]
         return posted
 
@@ -1030,6 +1059,11 @@ class FaxWatcher:
         # 読めなかったものは発注書かもしれないので呼び出す
         mention = set(settings.get("mention_kinds") or [])
         wants_heads = (is_order or not readable or category in mention or kind in mention) and not quiet
+        # 急ぎの注文は、経理のほかに楽天軒側（urgent.extra_recipients）にも知らせる。
+        # 語で見つけるのを主にし、モデルの urgent は取りこぼしの保険
+        urgent_cfg = settings.get("urgent") or {}
+        urgent_word = find_urgent_word(found, urgent_cfg.get("words") or DEFAULT_URGENT_WORDS) if readable else ""
+        urgent = bool(is_order and not quiet and (urgent_word or found.get("urgent")))
         return {
             "item": item,
             "found": found,
@@ -1047,20 +1081,50 @@ class FaxWatcher:
             "quiet": quiet,
             "wants_heads": wants_heads,
             "ask_done": bool(ask_done),
+            "urgent": urgent,
+            "urgent_word": urgent_word if urgent else "",
         }
+
+    def _urgent_recipients(self) -> list[dict]:
+        return [
+            r for r in ((self._config.fax_watch.get("urgent") or {}).get("extra_recipients") or [])
+            if r.get("account_id")
+        ]
+
+    def _urgent_heads(self, prepared: list[dict]) -> str:
+        """急ぎの注文が1件でもあれば、追加の宛先の To。"""
+        if not any(p.get("urgent") for p in prepared):
+            return ""
+        return " ".join(f"[To:{int(r['account_id'])}]" for r in self._urgent_recipients())
+
+    def _urgent_note(self, p: dict) -> str:
+        names = "・".join(f"{r.get('name')}さん" for r in self._urgent_recipients() if r.get("name"))
+        told = f"{names}にもお知らせしています。" if names else ""
+        if p.get("urgent_word"):
+            return f"※急ぎの指定があるため（「{p['urgent_word']}」）、{told}".rstrip("、")
+        return f"※急ぎと読める記載があるため、{told}".rstrip("、")
 
     def _render(self, p: dict, prefix: str, trailer: bool, ask_done: bool) -> str:
         """通知1件分の本文。prefix は番号（「① 」）、trailer は末尾の注意書きと返し方。"""
-        if p["readable"]:
-            text = self._compose(
+        if not p["readable"]:
+            return self._compose_unreadable(p["found"], p["notice"], p["filename"], prefix=prefix)
+        lines = [
+            self._compose(
                 p["found"], p["sender"], p["basis"], p["fax_number"], p["notice"], p["filename"],
-                ask_done, prefix=prefix, trailer=trailer,
+                prefix=prefix, trailer=False,
             )
-            quiet = p.get("quiet") or {}
-            if quiet and str(quiet.get("reason") or "").strip():
-                text += f"\n※{str(quiet['reason']).strip()}のため、呼び出し（To）と対応完了の確認は省いています。"
-            return text
-        return self._compose_unreadable(p["found"], p["notice"], p["filename"], prefix=prefix)
+        ]
+        # 補足（静かに置く理由・急ぎの宛先）は本文の直後、注意書きと返し方の前に置く
+        quiet = p.get("quiet") or {}
+        if quiet and str(quiet.get("reason") or "").strip():
+            lines.append(f"※{str(quiet['reason']).strip()}のため、呼び出し（To）と対応完了の確認は省いています。")
+        if p.get("urgent"):
+            lines.append(self._urgent_note(p))
+        if trailer:
+            lines.append("※PDFを読んで整理しています。数量・金額は原本でご確認ください。")
+            if ask_done:
+                lines.append(ASK_DONE)
+        return "\n".join(lines)
 
     @staticmethod
     def _compose_unreadable(found: dict, notice: dict, filename: str, prefix: str = "") -> str:
@@ -1705,7 +1769,8 @@ def thread_line(thread: dict, room_id: int = 0) -> str:
     kind = str(thread.get("kind") or "FAX")
     number = int(thread.get("number") or 0)
     label = f"{circled(number)} " if number else ""
-    line = f"{label}{when}{sender} {kind}（{thread.get('filename', '')}）"
+    mark = "【急ぎ】" if thread.get("urgent") else ""
+    line = f"{label}{mark}{when}{sender} {kind}（{thread.get('filename', '')}）"
     if room_id and thread.get("pdf_id"):
         line += " " + message_url(room_id, thread["pdf_id"])
     return line
