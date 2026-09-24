@@ -680,6 +680,30 @@ class TestNothingSlipsThrough:
         assert "対応待ちのFAXは、これでありません。" in bodies(w)[3]
         assert w._load_state()["open"] == []
 
+    def test_replying_to_each_notice_at_once_closes_them_all(self, tmp_path):
+        # 実例（2026-09-24 11:35）: 3通の通知それぞれに返信を付けた「対応完了」に、どの番号か聞き返した。
+        # 返信先が1件ずつの通知なら、どのFAXの話かは明らかなので聞き返さずに全部閉じる
+        w = self.two_orders(tmp_path)
+        w._chatwork.messages.append(
+            human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000][rp aid={AGENT} to={FAX_ROOM}-9001]対応完了")
+        )
+        w.run_once()
+        assert w._load_state()["open"] == []
+        assert w.asked_last_run == []
+        assert len(w._chatwork.sent) == 3  # お礼は1回
+        assert "対応待ちのFAXは、これでありません。" in bodies(w)[2]
+
+    def test_replying_to_some_of_the_notices_closes_only_those(self, tmp_path):
+        w = self.two_orders(tmp_path)
+        w._chatwork.messages += [bot(5, NOTICE_NO_SENDER.replace("4950", "4970")), bot(6, ATTACHMENT.replace("4950", "4970"))]
+        assert w.run_once() == 1  # 通知 9002（③）
+        w._chatwork.messages.append(
+            human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000][rp aid={AGENT} to={FAX_ROOM}-9002]対応完了")
+        )
+        w.run_once()
+        assert [t["number"] for t in w._load_state()["open"]] == [2]
+        assert "・② 9/4 19:40 光パックス石川 発注書（4960_001.pdf）" in bodies(w)[-1]
+
     def test_an_announcement_to_members_is_not_a_report(self, tmp_path):
         # 実例（2026-09-08 13:58）: 足立さんのメンバー宛の周知文（返信ではない）に
         # 「対応完了に対する返信…」とあり、開いていた発注書を閉じてお礼を返した
@@ -913,6 +937,19 @@ class TestBatchedNotices:
         w.run_once()
         assert [t["number"] for t in w._load_state()["open"]] == [1]
         assert w.asked_last_run == []
+
+    def test_a_bare_done_replied_to_the_batch_still_asks(self, tmp_path):
+        # まとめ通知（複数件を指す投稿）への返信は、返信先だけではどの件か決まらない
+        w = self.held_over_weekend(tmp_path)
+        w._chatwork.messages += held("4970_001.pdf", "2026/09/07 10:00:00")
+        w.clock.now = at(2026, 9, 7, 10, 5)
+        w.run_once()  # 単独の通知 9001（③）
+        w._chatwork.messages.append(
+            human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000][rp aid={AGENT} to={FAX_ROOM}-9001]対応完了")
+        )
+        w.run_once()
+        assert len(w._load_state()["open"]) == 3  # まとめ通知の分が決まらないので閉じない
+        assert [m["message_id"] for m in w.asked_last_run] == ["9500"]
 
     # --- 「①以外は対応完了」（除外の形）。挙げなかった分を全部閉じるので、条件を全部満たすときだけ ---
 

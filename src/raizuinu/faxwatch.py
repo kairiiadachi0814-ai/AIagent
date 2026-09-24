@@ -1225,7 +1225,11 @@ class FaxWatcher:
                 elif numbers:
                     chosen = pick_by_number(candidates, numbers)
                     via = "number"
-                elif mentions_all(body) or len(candidates) == 1:
+                elif (
+                    mentions_all(body)
+                    or len(candidates) == 1
+                    or self._replied_to_each(candidates, threads, targets, evening_ids)
+                ):
                     chosen = candidates
                     via = "all" if mentions_all(body) else "reply"
                 else:
@@ -1260,6 +1264,25 @@ class FaxWatcher:
         # 分の処理漏れを防ぐ）
         for closer, note in closers.values():
             self._thank(room_id, closer, remaining, note)
+
+    def _replied_to_each(
+        self, candidates: list[dict], threads: list[dict], targets: set[str], evening_ids: set[str]
+    ) -> bool:
+        """返信先が候補の1件ずつを個別に指しているか（複数の通知にまとめて返信した「対応完了」）。
+
+        実例（2026-09-24 11:35）: 3通の通知それぞれに返信を付けた「対応完了」に、どの番号か
+        聞き返してしまった。返信先がどれも1件だけの通知（まとめ通知や一覧ではない）なら、
+        どのFAXの話かは明らかなので、その全部を済んだと読む。
+        """
+        if not targets:
+            return False
+        for candidate in candidates:
+            own = self._thread_ids(candidate, evening_ids) & targets
+            if not any(
+                sum(1 for t in threads if mid in self._thread_ids(t, evening_ids)) == 1 for mid in own
+            ):
+                return False  # まとめ通知・催促・夕方の一覧など、複数件を指す投稿への返信
+        return True
 
     @staticmethod
     def _numbers_of(threads: list[dict]) -> str:
