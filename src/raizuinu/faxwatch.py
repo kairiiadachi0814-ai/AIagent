@@ -715,22 +715,36 @@ class FaxWatcher:
         return bool(self._load_state().get("pending"))
 
     def close_manually(
-        self, room_id: int, message: dict, filenames: list[str] | None = None, everything: bool = False
+        self,
+        room_id: int,
+        message: dict,
+        filenames: list[str] | None = None,
+        everything: bool = False,
+        targets: set[str] | None = None,
     ) -> int:
         """アシスタント宛の文で「済んだ」と読めたものを閉じ、お礼と残りを1通で返す。→ 閉じた件数
 
         巡回の規則（返信・ファイル名・短い一言）に当たらない長めの報告でも、
         メンション付きで内容が済んだ報告なら、モデルの読み取りを信じて閉じる。
+        everything（「全て対応完了」）は、返信先（targets）が特定の通知や聞き返しを指していれば
+        その分だけ、そうでなければ対応待ち全部。実例（2026-09-24 11:35）: 聞き返し（3件）への
+        「全て対応完了」で、聞いていない⑨まで閉じた。
         """
         wanted = {str(f).strip().lower() for f in (filenames or []) if str(f).strip()}
         if not everything and not wanted:
             return 0
         with self._locked():
             state = self._load_state()
-            closed = [
-                t for t in state.get("open") or []
-                if everything or str(t.get("filename", "")).lower() in wanted
-            ]
+            open_threads = list(state.get("open") or [])
+            if everything:
+                evening_ids = {str(i) for i in state.get("evening_ids") or []}
+                linked = [
+                    t for t in open_threads
+                    if targets and self._thread_ids(t, evening_ids) & {str(x) for x in targets}
+                ]
+                closed = linked or open_threads
+            else:
+                closed = [t for t in open_threads if str(t.get("filename", "")).lower() in wanted]
             if not closed:
                 return 0
             remaining = [t for t in state.get("open") or [] if t not in closed]
@@ -1307,7 +1321,12 @@ class FaxWatcher:
         return [t for t in candidates if int(t.get("number") or 0) in excluded]
 
     def _ask_which(self, room_id: int, message: dict, candidates: list[dict], exclusion: bool = False) -> None:
-        """番号の無い「対応完了」に、どのFAXの話か番号で聞き返す。"""
+        """番号の無い「対応完了」に、どのFAXの話か番号で聞き返す。
+
+        聞き返しの投稿IDは候補の控えに結び付ける（`check_ids`）。その返信の「全て対応完了」が
+        聞き返した分だけを指すようにするため。実例（2026-09-24 11:35）: 結び付けていなかったので
+        返信先から候補が取れず、会話側の「全部済んだ」の読みで、聞いていない⑨まで閉じた。
+        """
         try:
             tag = f"[rp aid={_account_of(message)} to={room_id}-{message.get('message_id')}]"
             hint = self._reply_hint(candidates)
@@ -1322,7 +1341,10 @@ class FaxWatcher:
                     f"番号を添えて「対応完了」とお返事ください{hint}。全部済んでいれば「全て対応完了」で結構です。"
                 )
             lines = [opening] + ["・" + self._thread_line(t) for t in candidates]
-            self._chatwork.send_message(room_id, f"{tag}\n" + "\n".join(lines))
+            mid = str(self._chatwork.send_message(room_id, f"{tag}\n" + "\n".join(lines)) or "")
+            if mid:
+                for thread in candidates:
+                    thread.setdefault("check_ids", []).append(mid)
         except Exception:
             print("[warn] 番号の聞き返しに失敗: " + traceback.format_exc(), flush=True)
 

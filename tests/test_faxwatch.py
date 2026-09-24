@@ -938,6 +938,33 @@ class TestBatchedNotices:
         assert [t["number"] for t in w._load_state()["open"]] == [1]
         assert w.asked_last_run == []
 
+    def test_all_done_replied_to_the_ask_closes_only_what_was_asked(self, tmp_path):
+        # 実例（2026-09-24 11:35）: 聞き返し（⑩⑪⑫）への「全て対応完了」で、聞いていない⑨まで閉じた
+        w = self.held_over_weekend(tmp_path)
+        w._chatwork.messages += held("4970_001.pdf", "2026/09/07 10:00:00")
+        w.clock.now = at(2026, 9, 7, 10, 5)
+        w.run_once()  # 単独の通知 9001（③）
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]対応完了"))
+        w.run_once()  # まとめ通知①②への番号なし → 聞き返し 9002
+        assert [m["message_id"] for m in w.asked_last_run] == ["9500"]
+        assert [t["check_ids"] for t in w._load_state()["open"]] == [["9002"], ["9002"], []]  # 聞き返しは①②に結び付く
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9002]全て対応完了"))
+        w.run_once()
+        assert [t["filename"] for t in w.closed_last_run] == ["4950_001.pdf", "4960_001.pdf"]
+        assert [t["number"] for t in w._load_state()["open"]] == [3]  # ③はそのまま
+        assert "・③ 9/7 10:00" in bodies(w)[-1]
+
+    def test_close_manually_everything_is_scoped_to_the_replied_notice(self, tmp_path):
+        # 会話側で「全部済んだ」と読めても、返信先が特定の通知を指していればその分だけ
+        w = self.held_over_weekend(tmp_path)
+        w._chatwork.messages += held("4970_001.pdf", "2026/09/07 10:00:00")
+        w.clock.now = at(2026, 9, 7, 10, 5)
+        w.run_once()  # ③ = 9001
+        message = {"account": {"account_id": SHINODA}, "message_id": "9500"}
+        assert w.close_manually(FAX_ROOM, message, everything=True, targets={"9001"}) == 1
+        assert [t["number"] for t in w._load_state()["open"]] == [1, 2]
+        assert w.close_manually(FAX_ROOM, message, everything=True, targets={"8888"}) == 2  # 結び付かない返信先なら全部
+
     def test_a_bare_done_replied_to_the_batch_still_asks(self, tmp_path):
         # まとめ通知（複数件を指す投稿）への返信は、返信先だけではどの件か決まらない
         w = self.held_over_weekend(tmp_path)
@@ -1677,7 +1704,7 @@ class TestQuestionsInTheFaxRoom:
             def has_pending(self):
                 return False
 
-            def close_manually(self, room_id, message, filenames=None, everything=False):
+            def close_manually(self, room_id, message, filenames=None, everything=False, targets=None):
                 calls.append((filenames, everything, message["message_id"]))
                 chatwork.sent.append((room_id, "ご対応ありがとうございます。\n対応待ちのFAXは、あと1件です。\n・9/7 18:55 ㈱髙島屋 大阪店 発注書（4971_001.pdf）"))
                 return 1
@@ -1688,6 +1715,34 @@ class TestQuestionsInTheFaxRoom:
         assert len(chatwork.sent) == 1 and "対応待ちのFAXは、あと1件です。" in chatwork.sent[0][1]
         assert "4958_001.pdf" in handler._fax_status._client.kwargs["system"]  # 一覧を渡して選ばせる
         assert audit.records[-1]["type"] == "fax_status" and "閉じた: 1件" in audit.records[-1]["answer"]
+
+    def test_all_done_hands_the_reply_target_to_the_watcher(self, tmp_path, monkeypatch):
+        # 会話側で「全部済んだ」と読んでも、返信先を渡して閉じる範囲を巡回側に決めさせる
+        import time
+
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        handler, chatwork, _, _ = self._handler(tmp_path, monkeypatch, {"open": self.OPEN})
+        handler._fax_status._client = fake_client({"reply": "ありがとうございます。", "done_all": True, "done_filenames": []})
+        calls = []
+
+        class FakeRun:
+            closed_last_run = []
+            asked_last_run = []
+
+            def run_once(self):
+                return 0
+
+            def has_pending(self):
+                return False
+
+            def close_manually(self, room_id, message, filenames=None, everything=False, targets=None):
+                calls.append((everything, set(targets or ())))
+                chatwork.sent.append((room_id, "ご対応ありがとうございます。\n対応待ちのFAXは、あと1件です。"))
+                return 1
+
+        handler._fax_watch_factory = lambda: FakeRun()
+        self._ask(handler, ADACHI, f"[rp aid=999 to={FAX_ROOM}-9002]全て対応完了", "9600")
+        assert calls == [(True, {"9002"})]
 
     def test_an_operational_note_with_a_mention_gets_a_plain_reply(self, tmp_path, monkeypatch):
         import time

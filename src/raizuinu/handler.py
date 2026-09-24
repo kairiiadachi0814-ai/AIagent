@@ -644,11 +644,15 @@ class RaizuinuHandler:
                     question, replied_to=self._replied_text(event)
                 )
                 if (done.get("all") or done.get("filenames")) and self._fax_watch_factory is not None:
+                    from .faxwatch import reply_targets
+
                     closed = self._fax_watch_factory().close_manually(
                         event.room_id,
                         {"account": {"account_id": event.account_id}, "message_id": event.message_id},
                         filenames=done.get("filenames") or None,
                         everything=bool(done.get("all")),
+                        # 「全て」は返信先の通知・聞き返しの範囲に限る（無ければ対応待ち全部）
+                        targets=reply_targets(event.body or "", event.room_id),
                     )
                     if closed:
                         self._add_usage_safely(usage) if usage else None
