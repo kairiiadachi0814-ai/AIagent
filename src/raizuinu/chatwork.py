@@ -24,6 +24,31 @@ class ChatworkError(Exception):
     """Chatwork API呼び出しの失敗。"""
 
 
+# 本文の先頭に並ぶ宛先・返信のタグ（と、Chatworkが付ける「氏名さん」の表示名。
+# 「坂田 美穂さん」のように姓名の間に空白が入る。名前の直後に本文が続く「田中さんへ」は名前と見ない）
+_MENTION_HEAD_RE = re.compile(
+    r"^(?:\[(?:To|rp)[^\]]*\][ \t　]*"
+    r"(?:[^\s\[\]]{1,12}(?:[ 　][^\s\[\]]{1,12}){0,2}(?:さん|様)(?=\s|$))?[ \t　]*)+"
+)
+
+
+def break_after_mentions(body: str) -> str:
+    """宛先（[To:]）・返信（[rp]）のタグの後で必ず改行する。
+
+    指示（2026-09-24）: 部のメンバーへ送るとき、メンションの後ろに本文を続けず改行してから書く。
+    どこから送っても同じになるよう、送信の入口でそろえる。タグに続く「氏名さん」は
+    Chatworkの表示の一部なので同じ行に残し、本文はその次の行から始める。
+    """
+    text = str(body or "")
+    match = _MENTION_HEAD_RE.match(text)
+    if not match:
+        return text
+    head, rest = text[: match.end()], text[match.end():]
+    if not rest or rest.startswith("\n"):
+        return text
+    return head.rstrip(" \t　") + "\n" + rest
+
+
 class ChatworkClient:
     def __init__(self, api_token: str, timeout_seconds: int = 30) -> None:
         if not api_token:
@@ -32,11 +57,11 @@ class ChatworkClient:
         self._timeout = timeout_seconds
 
     def send_message(self, room_id: int, body: str) -> str:
-        """メッセージを送信し、message_idを返す。"""
+        """メッセージを送信し、message_idを返す。宛先タグの後は必ず改行してから本文。"""
         resp = requests.post(
             f"{API_BASE}/rooms/{room_id}/messages",
             headers=self._headers,
-            data={"body": body},
+            data={"body": break_after_mentions(body)},
             timeout=self._timeout,
         )
         self._raise_for_status(resp)

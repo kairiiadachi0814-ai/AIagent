@@ -31,7 +31,7 @@ Chatworkの許可ルームでメンションを受けたら、`handbook/` と `s
 
 ## 実装構成（Phase 1・2026-08-13時点）
 
-- `src/raizuinu/` にコア実装（config／webhook／handbook／answer／chatwork／audit／cost／handler／app／lambda_function）。役割はパッケージdocstring参照
+- `src/raizuinu/` にコア実装（config／webhook／handbook／answer／chatwork／audit／cost／handler／app／lambda_function）。役割はパッケージdocstring参照。**投稿の先頭の宛先・返信タグ（`[To:]`／`[rp]`）の後は必ず改行してから本文**（指示 2026-09-24。`chatwork.break_after_mentions` が送信の入口でそろえる。タグに続く「氏名さん」は同じ行に残す。手で投稿するときも同じ形にする）
 - ひな形からの書類作成は `docbuild.py`（依頼→項目抽出→書式と差出人会社の決定）と `templatefill.py`（Word/Excelへの差し込み。標準ライブラリのみ）。ひな形の実体は `templates/`。Wordは書式ごとに1つだけ持ち（`送付状_標準.docx`／`送付状_楽天軒型.docx`）、差出人の会社情報は `templates/companies.json` から差し込む。**グループ会社が増えたときは companies.json に1件足すだけ**（ひな形は増やさない）。Boxの原本から白紙化して作り直すには `python tools/build_templates.py`（ローカルPC専用）
 - 定型の受け答えの揺らぎは `phrasing.py`。コード側で書いている一言（「下書きを作成しました」等）を同義の候補から毎回選び直し、前回と同じ言い方を避ける。**揺らいでよいのは社交辞令だけ**で、回答本文・出典・免責文・金額・他部署へ送る文面は対象外。各候補が呼び出し側の判定（未来形を弾く等）を満たすことを `tests/test_phrasing.py` で固定してある。`config: phrasing.vary_openings` を false にすると固定へ戻る
 - TaskRising（社内タスク管理）への登録は `taskrising.py`。実体はSupabase（PostgREST）で独自APIは無い。**service_role キーは使わず**、専用ボットユーザー（メール＋パスワード）でログインしてRLSの範囲で読み書きする。**経費支払いタスク・振込用CSV等が揃うまで `taskrising.enabled` は false のまま**。接続確認とテーブル定義の書き出しは `python tools/check_taskrising.py`（書き込みはしない）
