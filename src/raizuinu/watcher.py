@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from .answer import AnswerGenerator, sanitize_for_chatwork
-from .chatwork import ChatworkClient
+from .chatwork import ChatworkClient, OneShotCache
 from .config import Config
 from .cost import CostTracker
 from .handbook import HandbookLoader
@@ -142,10 +142,17 @@ class DiscussionWatcher:
         if state.get("date") != today:
             state["date"] = today
             state["count"] = 0
+            state["verified"] = 0
             state["cited_today"] = []
         if state["count"] >= int(watch.get("max_interventions_per_day", 3)):
             return
         if self._cost.status().over_limit:
+            return
+        # 2段目（ハンドブック全文を載せる裏取り）は1回あたりの費用が大きい。
+        # 介入に至らなくても消費するため、介入回数とは別に日次の上限を持つ
+        max_verifications = int(watch.get("max_verifications_per_day", 10))
+        if int(state.get("verified", 0)) >= max_verifications:
+            self._audit_usage(room_id, "verify_budget_reached", {})
             return
 
         batch = "\n".join(
@@ -161,6 +168,8 @@ class DiscussionWatcher:
             return
 
         # 2段目: ハンドブック・法令で裏取り（Q&Aと同じ検証パイプラインを再利用）
+        state["verified"] = int(state.get("verified", 0)) + 1
+        self._save_state(room_id, state)  # 呼ぶ前に数える（失敗しても消費は起きるため）
         handbook = self._handbook_loader.load()
         answer = self._generator.generate(VERIFY_PROMPT.format(batch=batch), handbook)
         self._cost.add_usage(answer.usage)
@@ -335,7 +344,65 @@ class DiscussionWatcher:
 
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
-    DiscussionWatcher().run_once()
+    config = Config.load()
+    # 3つの処理が同じルームを見に行くことがあるため、取得は1回にまとめる。
+    # 包みの寿命はこの実行だけ（次の巡回では取り直す）
+    chatwork = OneShotCache(ChatworkClient(config.chatwork_api_token or ""))
+    # レターパックの取次ぎも同じタイマーに相乗りする（タイマーを増やさない）。
+    # 片方が落ちてももう片方は動かす
+    try:
+        from .letterpack import LetterpackFollower
+
+        LetterpackFollower(config, chatwork=chatwork).run_once()
+    except Exception:
+        print("[error] レターパックの追跡に失敗: " + traceback.format_exc(), flush=True)
+    try:
+        archive_rooms(config, chatwork)
+    except Exception:
+        print("[error] 過去ログの保存に失敗: " + traceback.format_exc(), flush=True)
+    try:
+        from .faxwatch import FaxWatcher
+
+        FaxWatcher(config, chatwork).run_once()
+    except Exception:
+        print("[error] FAXの見張りに失敗: " + traceback.format_exc(), flush=True)
+    try:
+        from .deadline import DeadlineFollower
+
+        DeadlineFollower(config, chatwork).run_once()
+    except Exception:
+        print("[error] 期日の進捗確認に失敗: " + traceback.format_exc(), flush=True)
+    DiscussionWatcher(config, chatwork=chatwork).run_once()
+
+
+def archive_rooms(config: Config, chatwork: Any | None = None) -> dict[int, int]:
+    """設定されたルームの発言を過去ログへ書き写す。→ ルームごとの追加件数。
+
+    ChatworkのAPIは直近100件しか返さないため、巡回のたびに拾って積み上げる
+    しかない（「楽天BillPayのパスワードは？」のような、チャットにしか無い値へ
+    後から答えるため）。
+    """
+    settings = config.chat_archive
+    if not settings.get("enabled"):
+        return {}
+    from .chatlog import ChatArchive
+
+    chatwork = chatwork or ChatworkClient(config.chatwork_api_token or "")
+    archive = ChatArchive(
+        config.resolve_path(config.state_dir) / "chatlog.sqlite3",
+        retention_days=int(settings.get("retention_days", 730)),
+    )
+    added = {}
+    for room_id in settings.get("room_ids") or []:
+        try:
+            messages = chatwork.get_recent_messages(int(room_id), limit=100)
+            added[int(room_id)] = archive.record(int(room_id), messages)
+        except Exception:
+            print(f"[warn] ルーム{room_id}の取得に失敗: " + traceback.format_exc(), flush=True)
+    removed = archive.prune()
+    if removed:
+        print(f"[info] 保存期間を過ぎた発言を{removed}件消しました", flush=True)
+    return added
 
 
 if __name__ == "__main__":

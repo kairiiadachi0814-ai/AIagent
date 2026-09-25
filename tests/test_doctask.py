@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import zipfile
@@ -80,7 +81,7 @@ class TestFindDocument:
         # 画像添付＋通常質問はQ&Aへ（Noneを返す）。依頼が明確なときだけ形式案内
         body = "[To:999] この処理どうやるの？ [download:9]請求書.png (1 MB)[/download]"
         assert find_document(body, [], "この処理どうやるの？") is None
-        body2 = "[To:999] これ議事録にして [download:9]会議録.pdf (1 MB)[/download]"
+        body2 = "[To:999] これ議事録にして [download:9]会議録.doc (1 MB)[/download]"
         found = find_document(body2, [], "これ議事録にして")
         assert found["kind"] == "unsupported_file"
 
@@ -212,6 +213,13 @@ def file_doc(file_id=1, filename="会議文字起こし.docx"):
             "total_files": 1}
 
 
+def user_text(client):
+    """送信したユーザーメッセージのテキスト部分（contentはブロック配列）。"""
+    return "".join(
+        b["text"] for b in client.kwargs["messages"][0]["content"] if b["type"] == "text"
+    )
+
+
 class TestDocTaskRunner:
     def test_docx_happy_path(self, tmp_path):
         runner, client = make_runner(tmp_path)
@@ -220,7 +228,7 @@ class TestDocTaskRunner:
         assert "会議文字起こし.docx" in reply  # どの文書に基づいたかを明示
         assert meta["label"] == "会議文字起こし.docx"
         assert usage["input_tokens"] == 20000
-        content = client.kwargs["messages"][0]["content"]
+        content = user_text(client)
         assert "会議の内容です。" in content
         assert "議事録にまとめて" in content
         assert "===文書" in content  # 文書本文は区切りで囲む（指示と混同させない）
@@ -232,7 +240,7 @@ class TestDocTaskRunner:
         system = client.kwargs["system"]
         assert "依頼者のメッセージに一言応じることから始める" in system
         # 依頼文そのものもモデルへ渡っている（相手の言葉に応答できる）
-        assert "さっきは添付を忘れました" in client.kwargs["messages"][0]["content"]
+        assert "さっきは添付を忘れました" in user_text(client)
 
     def test_unsupported_kind_returns_guidance_without_api_call(self, tmp_path):
         runner, client = make_runner(tmp_path)
@@ -246,8 +254,8 @@ class TestDocTaskRunner:
         assert client.kwargs is None  # API呼び出しなし
 
     def test_unsupported_extension_from_api_returns_guidance(self, tmp_path):
-        runner, _ = make_runner(tmp_path, filename="会議録.pdf")
-        reply, meta, usage = runner.run("まとめて", file_doc(filename="会議録.pdf"), 12345)
+        runner, _ = make_runner(tmp_path, filename="会議録.doc")
+        reply, meta, usage = runner.run("まとめて", file_doc(filename="会議録.doc"), 12345)
         assert ".docx" in reply
         assert meta.get("error") == "load_failed"
         assert usage == {}
@@ -297,7 +305,7 @@ class TestDocTaskRunner:
         runner._config.data["doc_task"]["max_text_chars"] = 200
         reply, meta, usage = runner.run("まとめて", file_doc(), 12345)
         assert meta.get("truncated") is True
-        content = client.kwargs["messages"][0]["content"]
+        content = user_text(client)
         assert "途中まで" in content
         assert content.index("途中まで") < content.index("===文書")  # 注意書きは文書より前
 
@@ -354,7 +362,7 @@ class TestContractMode:
         runner._config.data["web_fetch_enabled"] = True
         runner.run("この契約書の印紙はいくら？", file_doc(filename="業務委託契約書.docx"), 12345)
         assert client.kwargs["tools"][0]["allowed_domains"] == ["www.nta.go.jp"]
-        assert u1 in client.kwargs["messages"][0]["content"]  # 表のURLを渡す
+        assert u1 in user_text(client)  # 表のURLを渡す
         system = client.kwargs["system"]
         assert "号文書" in system
         assert "丸めたり概算にしたりしない" in system
@@ -366,6 +374,128 @@ class TestContractMode:
         runner._config.data["web_fetch_enabled"] = True
         runner.run("印紙はいくら？", file_doc(filename="契約書.docx"), 12345)
         assert "tools" not in client.kwargs  # リンク集が無ければ取得しない（推測で答えさせない）
+
+
+def make_pdf(pages: int = 2, extra: bytes = b"") -> bytes:
+    body = b"".join(
+        b"%d 0 obj\n<< /Type /Page /Parent 1 0 R >>\nendobj\n" % (i + 2)
+        for i in range(pages)
+    )
+    return b"%PDF-1.7\n" + body + extra + b"\ntrailer\n%%EOF\n"
+
+
+class TestPdfSupport:
+    def test_pdf_is_sent_as_document_block(self, tmp_path):
+        pdf = make_pdf(3)
+        runner, client = make_runner(tmp_path, docx_data=pdf, filename="業務委託契約書.pdf")
+        reply, meta, usage = runner.run(
+            "この契約書の要点をまとめて", file_doc(filename="業務委託契約書.pdf"), 12345
+        )
+        content = client.kwargs["messages"][0]["content"]
+        doc_block = content[0]
+        assert doc_block["type"] == "document"  # テキストより前に置く
+        assert doc_block["source"]["media_type"] == "application/pdf"
+        assert base64.standard_b64decode(doc_block["source"]["data"]) == pdf
+        assert doc_block["title"] == "業務委託契約書.pdf"
+        assert content[-1]["type"] == "text"
+        assert "この契約書の要点をまとめて" in content[-1]["text"]
+        assert meta["pdf_files"] == ["業務委託契約書.pdf"]
+        # ファイル名から契約書と判定し、法的判断の禁止を指示する
+        assert "法的な妥当性・有利不利・リスクの評価は行わない" in client.kwargs["system"]
+
+    def test_stamp_duty_pdf_is_cached(self, tmp_path):
+        u1 = "https://www.nta.go.jp/taxes/shiraberu/taxanswer/inshi/7140.htm"
+        (tmp_path / "税法リンク集_国税庁.md").write_text(
+            f"# 税法\n| No.7140 印紙税額の一覧表（その1） | 表 | {u1} |\n", encoding="utf-8"
+        )
+        runner, client = make_runner(
+            tmp_path, docx_data=make_pdf(4), filename="業務委託契約書.pdf"
+        )
+        runner._config.base_dir = tmp_path
+        runner._config.data["handbook"] = {"roots": ["."], "include": ["*.md"], "exclude": []}
+        runner._config.data["web_fetch_enabled"] = True
+        runner.run("この契約書の印紙はいくら？", file_doc(filename="業務委託契約書.pdf"), 12345)
+        # web_fetchで推論が複数回まわるため、PDFはキャッシュして再課金を避ける
+        docs = [b for b in client.kwargs["messages"][0]["content"] if b["type"] == "document"]
+        assert docs[-1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_pdf_page_limit_rejected(self, tmp_path):
+        runner, client = make_runner(
+            tmp_path, docx_data=make_pdf(60), filename="長い資料.pdf"
+        )
+        reply, meta, usage = runner.run("要約して", file_doc(filename="長い資料.pdf"), 12345)
+        assert "60ページ" in reply and "50ページ" in reply
+        assert usage == {}
+        assert client.kwargs is None  # API呼び出しなし
+
+    def test_oversized_pdf_rejected(self, tmp_path):
+        big = make_pdf(1, extra=b"x" * (16 * 1024 * 1024))
+        runner, _ = make_runner(tmp_path, docx_data=big, filename="大きい資料.pdf")
+        reply, meta, usage = runner.run("要約して", file_doc(filename="大きい資料.pdf"), 12345)
+        assert "15MB" in reply
+        assert usage == {}
+
+    def test_broken_pdf_rejected(self, tmp_path):
+        runner, _ = make_runner(
+            tmp_path, docx_data=b"not a pdf at all", filename="壊れた.pdf"
+        )
+        reply, meta, usage = runner.run("要約して", file_doc(filename="壊れた.pdf"), 12345)
+        assert "PDFとして読み取れませんでした" in reply
+
+    def test_multiple_pdfs_are_limited_by_total(self, tmp_path):
+        # 複数添付も1リクエストで送るため、上限は合計で見る（APIの32MB上限対策）
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["doc_task"] = {"enabled": True, "max_file_mb": 20, "max_text_chars": 120000}
+        pdfs = {1: ("前半.pdf", make_pdf(30)), 2: ("後半.pdf", make_pdf(30))}
+
+        class Files:
+            def get_file_info(self, room_id, file_id):
+                return {"filename": pdfs[file_id][0], "filesize": 1024,
+                        "download_url": f"https://files.example/{file_id}"}
+
+        def http_get(url, timeout=60):
+            return 200, url, pdfs[int(url.rsplit("/", 1)[1])][1]
+
+        client = fake_client()
+        runner = DocTaskRunner(config, Files(), client=client, http_get=http_get)
+        doc = {"kind": "chatwork_file",
+               "files": [{"file_id": 1, "filename": "前半.pdf"},
+                         {"file_id": 2, "filename": "後半.pdf"}],
+               "total_files": 2}
+        reply, meta, usage = runner.run("要約して", doc, 12345)
+        assert "PDFの合計が" in reply and "50ページ" in reply
+        assert client.kwargs is None
+
+    def test_two_small_pdfs_both_attached(self, tmp_path):
+        config = Config.load(tmp_path / "no-config.json")
+        config.data["doc_task"] = {"enabled": True, "max_file_mb": 20, "max_text_chars": 120000}
+        pdfs = {1: ("前半.pdf", make_pdf(2)), 2: ("後半.pdf", make_pdf(3))}
+
+        class Files:
+            def get_file_info(self, room_id, file_id):
+                return {"filename": pdfs[file_id][0], "filesize": 1024,
+                        "download_url": f"https://files.example/{file_id}"}
+
+        def http_get(url, timeout=60):
+            return 200, url, pdfs[int(url.rsplit("/", 1)[1])][1]
+
+        client = fake_client()
+        runner = DocTaskRunner(config, Files(), client=client, http_get=http_get)
+        doc = {"kind": "chatwork_file",
+               "files": [{"file_id": 1, "filename": "前半.pdf"},
+                         {"file_id": 2, "filename": "後半.pdf"}],
+               "total_files": 2}
+        reply, meta, usage = runner.run("要約して", doc, 12345)
+        content = client.kwargs["messages"][0]["content"]
+        assert [b["type"] for b in content] == ["document", "document", "text"]
+        assert meta["pdf_files"] == ["前半.pdf", "後半.pdf"]
+        assert "「前半.pdf」、「後半.pdf」" in content[-1]["text"]  # どのPDFかを本文でも示す
+
+    def test_pdf_detected_as_supported_attachment(self):
+        body = "[To:999] 議事録にして [download:7]会議録.pdf (2 MB)[/download]"
+        found = find_document(body, [], "議事録にして")
+        assert found["kind"] == "chatwork_file"
+        assert found["files"][0]["filename"] == "会議録.pdf"
 
 
 class TestDocumentRequestDetection:
@@ -563,3 +693,152 @@ class TestHandlerIntegration:
         }).encode()
         digest = hmac.new(base64.b64decode(token), body, hashlib.sha256).digest()
         return handler.handle_webhook(body, base64.b64encode(digest).decode())
+
+    def test_a_colleague_can_continue_without_re_attaching(self, tmp_path, monkeypatch):
+        """坂田さんが添付 → 足立さんが返信で続きを聞く、を通しで確認する。
+
+        2026-08-19の運用テストで、途中から入った質問に「ファイルが付いていない」と
+        返してしまった経路。添付し直さなくても同じ文書を読めること。
+        """
+        import base64, hashlib, hmac
+
+        handler, chatwork, generator, audit, token = self._make(tmp_path, monkeypatch)
+        chatwork.get_file_info = lambda room_id, file_id: {
+            "filename": "倉庫寄託契約書.pdf", "filesize": 100,
+            "download_url": "https://files.example/dl",
+        }
+        ids = iter(["9001", "9002"])
+        chatwork.send_message = lambda room_id, body: (
+            chatwork.sent.append((room_id, body)) or next(ids)
+        )
+
+        def post(account_id, message_id, body_text):
+            body = json.dumps({
+                "webhook_event_type": "mention_to_me",
+                "webhook_event": {
+                    "from_account_id": account_id, "to_account_id": 999,
+                    "room_id": 12345, "message_id": message_id,
+                    "body": body_text, "send_time": 1700000000,
+                },
+            }).encode()
+            digest = hmac.new(base64.b64decode(token), body, hashlib.sha256).digest()
+            return handler.handle_webhook(body, base64.b64encode(digest).decode())
+
+        # 坂田さんが添付して要約を依頼
+        post(222, "8001", "[To:999] 添付したファイルの文書を簡潔に要約してほしい。"
+                          "[download:5555]倉庫寄託契約書.pdf (1.04 MB)[/download]")
+        assert audit.records[-1]["type"] == "doc_task"
+
+        # 足立さんが、こちらの回答（9001）への返信で続きを聞く。添付は付けていない
+        post(111, "8002", "[rp aid=999 to=12345-9001] 料金体系ではなく、パレットの取扱についての方。")
+
+        assert audit.records[-1]["type"] == "doc_task"  # Q&Aや案内文へ落ちない
+        assert generator.calls == []
+        assert "倉庫寄託契約書" in chatwork.sent[-1][1]
+        assert "添付" not in chatwork.sent[-1][1].split("※")[0]
+
+
+class TestDocumentMemory:
+    """会話の途中から入っても、添付し直さずに続きを聞けること。
+
+    実例（2026-08-19 運用テスト）: 坂田さんが倉庫寄託契約書.pdf を添付して要約を依頼。
+    そのあと足立さんが会話に入り、条文について尋ねたが添付が見つからず答えられなかった。
+    """
+
+    ROOM = 384793683
+    UPLOAD_ID = "1000"
+    ANSWER_ID = "1001"
+
+    def memory(self, tmp_path, ttl_minutes=1440):
+        from raizuinu.doctask import DocumentMemory
+
+        return DocumentMemory(tmp_path / "room_documents.json", ttl_minutes=ttl_minutes)
+
+    def remembered(self, tmp_path, **kwargs):
+        memory = self.memory(tmp_path, **kwargs)
+        memory.remember(
+            self.ROOM,
+            {"kind": "chatwork_file", "files": [{"file_id": 5555, "filename": "倉庫寄託契約書.pdf"}]},
+            [self.UPLOAD_ID, "1002", self.ANSWER_ID],
+            1000,
+        )
+        return memory
+
+    def test_a_reply_to_the_answer_finds_the_same_file(self, tmp_path):
+        # 「料金体系ではなく、パレットの取扱についての方。」— 単独では文書依頼と読めないが、
+        # こちらの回答への返信なので同じ文書を見に行く
+        memory = self.remembered(tmp_path)
+        body = f"[rp aid=6945415 to={self.ROOM}-{self.ANSWER_ID}] 料金体系ではなく、パレットの取扱についての方。"
+        found = memory.recall(self.ROOM, "料金体系ではなく、パレットの取扱についての方。", body, 2000)
+        assert found["files"][0]["file_id"] == 5555
+        assert found["files"][0]["filename"] == "倉庫寄託契約書.pdf"
+
+    def test_a_reply_to_the_original_upload_finds_it_too(self, tmp_path):
+        memory = self.remembered(tmp_path)
+        body = f"[rp aid=6945415 to={self.ROOM}-{self.UPLOAD_ID}] ここの条文を教えて"
+        assert memory.recall(self.ROOM, "ここの条文を教えて", body, 2000)["files"][0]["file_id"] == 5555
+
+    def test_naming_the_document_finds_it(self, tmp_path):
+        # 返信ではなく通常のメンションでも、ファイル名を名指ししていれば拾う
+        memory = self.remembered(tmp_path)
+        question = "先程、坂田さんから依頼のあった、倉庫寄託契約書のまとめ内でパレットについての条文があったと思うが、内容教えて。"
+        assert memory.recall(self.ROOM, question, "[To:999] " + question, 2000)["files"][0]["file_id"] == 5555
+
+    def test_an_unrelated_question_does_not_drag_the_file_in(self, tmp_path):
+        # 同じルームの別件。文書を持ち出すと見当違いの回答になる
+        memory = self.remembered(tmp_path)
+        assert memory.recall(self.ROOM, "経費精算の締め日は？", "[To:999] 経費精算の締め日は？", 2000) is None
+
+    def test_another_room_never_sees_it(self, tmp_path):
+        memory = self.remembered(tmp_path)
+        body = f"[rp aid=6945415 to=444781726-{self.ANSWER_ID}] 続きを教えて"
+        assert memory.recall(444781726, "倉庫寄託契約書について", body, 2000) is None
+
+    def test_it_is_forgotten_after_the_window(self, tmp_path):
+        memory = self.remembered(tmp_path, ttl_minutes=60)
+        question = "倉庫寄託契約書のパレットの条文を教えて"
+        assert memory.recall(self.ROOM, question, "", 1000 + 59 * 60) is not None
+        assert memory.recall(self.ROOM, question, "", 1000 + 61 * 60) is None
+
+    def test_a_new_document_replaces_the_reply_chain(self, tmp_path):
+        # 別の文書に切り替わったら、前の会話への返信で古い文書を持ち出さない
+        memory = self.remembered(tmp_path)
+        memory.remember(
+            self.ROOM,
+            {"kind": "chatwork_file", "files": [{"file_id": 6666, "filename": "業務委託契約書.pdf"}]},
+            ["2000", "2001"],
+            1500,
+        )
+        stale = f"[rp aid=6945415 to={self.ROOM}-{self.ANSWER_ID}] 続き"
+        assert memory.recall(self.ROOM, "続き", stale, 2000) is None
+        fresh = f"[rp aid=6945415 to={self.ROOM}-2001] 続き"
+        assert memory.recall(self.ROOM, "続き", fresh, 2000)["files"][0]["file_id"] == 6666
+
+    def test_urls_are_not_remembered(self, tmp_path):
+        # Googleドキュメントは相手側で内容が変わりうる。読み直しの対象にしない
+        memory = self.memory(tmp_path)
+        memory.remember(self.ROOM, {"kind": "google", "url": GOOGLE_DOC_URL}, ["1"], 1000)
+        assert memory.recall(self.ROOM, "さっきの資料", "[rp aid=1 to=384793683-1]", 1100) is None
+
+    def test_a_corrupt_state_file_is_ignored(self, tmp_path):
+        path = tmp_path / "room_documents.json"
+        path.write_text("{壊れている", encoding="utf-8")
+        from raizuinu.doctask import DocumentMemory
+
+        assert DocumentMemory(path).recall(self.ROOM, "倉庫寄託契約書", "", 1000) is None
+
+
+class TestDocumentNouns:
+    def test_a_contract_summary_request_is_a_document_task(self):
+        # 「契約書」が文書を指す名詞に無く、まとめ依頼と読めていなかった
+        from raizuinu.doctask import _should_scan_history
+
+        assert _should_scan_history("先程の倉庫寄託契約書のまとめ内容を教えて") is True
+        assert _should_scan_history("さっき送った見積書を要約して") is True
+        assert _should_scan_history("添付のPDFをまとめて") is True
+
+    def test_a_handbook_question_is_still_not_a_document_task(self):
+        from raizuinu.doctask import _should_scan_history
+
+        assert _should_scan_history("契約書の保管ルールは？") is False
+        assert _should_scan_history("契約書の書き方を教えて") is False

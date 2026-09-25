@@ -1,0 +1,1018 @@
+"""レターパックの手配依頼 — 送付状を作ったら総務へ取り次ぐ。
+
+送付状を作るということは郵送する見込みが高い。作った直後に手配の要否を
+確認し、必要なら総務あての依頼を代わりに出して、返信を依頼者へ返す。
+
+流れ:
+1. 送付状を作った返信の末尾で「手配も依頼しますか」と確認する
+2. 枚数・種類を答えてもらったら、総務あての依頼文案を見せて送信確認をとる
+3. 「送信」で備品・消耗品購入依頼チャットへ投稿し、やり取りを追跡する
+4. 総務からの返信は5分ごとの巡回（watcher）で拾い、依頼者へ伝える。
+   質問なら依頼者の答えを備品ルームへ返し、完了ならお礼を返して締める
+
+方針:
+- 備品ルームは投稿と巡回にだけ使い、許可ルーム（Q&Aの対象）には入れない。
+  他部署のルームへ社内ナレッジが流れる経路を作らないため
+- 依頼文は必ず依頼者に見せてから送る。他部署のルームへの投稿は取り消しが
+  きかないため、読み取りを誤ったまま届くことを避ける
+- 誰の依頼かを依頼文に明記する（総務側が誰に確認すればよいか分かるように）
+- 枚数・種類の読み取りは正規表現で行う（モデルに数えさせない）
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import traceback
+import unicodedata
+from datetime import datetime, time, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+JST = timezone(timedelta(hours=9))
+
+# レターパックの種類。金額はJP（日本郵便）の区分で、依頼文にはこの表記を使う
+KINDS = {
+    "プラス": "レターパックプラス",
+    "ライト": "レターパックライト",
+}
+_PLUS_RE = re.compile(r"(プラス|ぷらす|plus|赤|520)", re.I)
+_LIGHT_RE = re.compile(r"(ライト|らいと|light|青|370|430)", re.I)
+_COUNT_RE = re.compile(r"(\d+)\s*(?:枚|通|部)")
+_DECLINE_RE = re.compile(r"(不要|いらな|要らな|結構です|なし$|無し$|いいえ|大丈夫です|やめ|見送)")
+_SEND_RE = re.compile(r"(送信|送って|送付して|依頼して|お願いします|これでお願い|ok|OK|オーケー|了解|はい)")
+_CANCEL_RE = re.compile(r"(取消|取り消|やめ|中止|キャンセル|やっぱり)")
+# 備品ルームは総務が部署全体の依頼をさばく場。こちらの依頼への返事だけを拾うため、
+# 返信タグ・宛先タグでこちらのメッセージを指しているものに限る
+_RP_RE = re.compile(r"\[rp\s+aid=\d+\s+to=(\d+)-(\d+)\]")
+_TO_RE = re.compile(r"\[To:(\d+)\]")
+
+# 送付状の返信の末尾に足す確認文
+OFFER = (
+    "郵送でしたら、レターパックの手配を依頼できます。"
+    "必要でしたら枚数と種類（プラス／ライト）をお知らせください。"
+    "不要なら「不要」とだけお返事いただければ、この件は閉じます。"
+)
+
+
+def _fold(text: str) -> str:
+    return unicodedata.normalize("NFKC", str(text or "")).strip()
+
+
+# メンションのタグを外したあとに残る宛名（「経理財務アシスタントさん」）。
+# 依頼者の答えをそのまま転送すると、先方には宛名だけが浮いて見える
+_LEADING_ADDRESS_RE = re.compile(r"^[^\n]{1,24}さん[\s　]*\n+")
+
+
+def _strip_leading_address(text: str) -> str:
+    """依頼者の答えから、先頭に残った宛名の行を落とす。"""
+    return _LEADING_ADDRESS_RE.sub("", _fold(text)).strip()
+
+
+# 依頼者の言葉をそのまま並べると、依頼者本人が喋っているように読める。
+# こちらが聞いて伝えている形にする
+_ALREADY_REPORTED_RE = re.compile(
+    r"(とのこと|だそう|そうです|と言って|とおっしゃ|と聞いて)"
+    r"(です|でした|で|います|おります|ました)?[。．\s]*$"
+)
+# 「お待たせしました」は実際に待たせたときだけ使う（すぐ返ったのに言うと白々しい）
+WAITED_SECONDS = 300
+
+
+def quote_answer(text: str) -> str:
+    """依頼者の答えを、取り次ぐ側の言い方にする。
+
+    「取りに行きます。」→「取りに行きます。とのことです。」
+    すでに伝聞の形で書かれていれば、そのまま使う。
+    """
+    answer = _strip_leading_address(text)
+    if not answer or _ALREADY_REPORTED_RE.search(answer):
+        return answer
+    return f"{answer}とのことです。"
+
+
+OFFICE_START_HOUR = 9
+OFFICE_END_HOUR = 18
+
+
+def load_holidays(config: Any) -> tuple[set[str], list[int]]:
+    """国民の祝日（config/holidays.json）。→ (日付の集合, 収録年の範囲)
+
+    表は tools/build_holidays.py で作る。年が変わったら作り直す。
+    """
+    try:
+        path = config.resolve_path("config") / "holidays.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, AttributeError):
+        return set(), []
+    return set(data.get("holidays") or {}), list(data.get("covers") or [])
+
+
+def office_seconds(
+    start_ts: int,
+    end_ts: int,
+    holidays: Any = (),
+    start_hour: int = OFFICE_START_HOUR,
+    end_hour: int = OFFICE_END_HOUR,
+) -> int:
+    """営業時間（平日9:00〜18:00、土日祝を除く）で数えた経過秒数。
+
+    金曜17時の依頼に対して23時に「返事がない」と言っても、相手は退勤して
+    いて誰も動けない。依頼者の手元にも夜中に通知が飛ぶ。相手が見られる
+    時間だけを積み、催促が営業時間に収まるようにする。
+    """
+    if end_ts <= start_ts:
+        return 0
+    holidays = set(holidays)
+    start = datetime.fromtimestamp(int(start_ts), JST)
+    end = datetime.fromtimestamp(int(end_ts), JST)
+    total = 0.0
+    day = start.date()
+    while day <= end.date():
+        if day.weekday() < 5 and day.isoformat() not in holidays:
+            opens = datetime.combine(day, time(start_hour), tzinfo=JST)
+            closes = datetime.combine(day, time(end_hour), tzinfo=JST)
+            lo, hi = max(start, opens), min(end, closes)
+            if hi > lo:
+                total += (hi - lo).total_seconds()
+        day += timedelta(days=1)
+    return int(total)
+
+
+def confirmed_lead(waited_seconds: int) -> str:
+    """依頼者に確認した旨の書き出し。待たせていなければ詫びない。"""
+    if waited_seconds >= WAITED_SECONDS:
+        return "お待たせしました。依頼者に確認しました。"
+    return "依頼者に確認しました。"
+
+
+# 「AではなくB」の区切り。この後に出てくる種類を採る
+_INSTEAD_RE = re.compile(r"(ではなく|じゃなく|でなく|ではなくて|じゃなくて|→|に変更|に訂正)")
+
+
+def kind_in(text: str) -> str:
+    """文中の種類。「プラスではなくライト」なら後の方、両方あれば最後に出た方。
+
+    実例（2026-09-10）: 「レターパックプラスではなくレターパックライトでした」を
+    最初に出た「プラス」で読んでしまった。
+    """
+    folded = _fold(text)
+    hits = [(m.start(), KINDS["プラス"]) for m in _PLUS_RE.finditer(folded)]
+    hits += [(m.start(), KINDS["ライト"]) for m in _LIGHT_RE.finditer(folded)]
+    if not hits:
+        return ""
+    hits.sort()
+    cue = _INSTEAD_RE.search(folded)
+    if cue:
+        after = [kind for pos, kind in hits if pos > cue.start()]
+        if after:
+            return after[0]
+    return hits[-1][1]
+
+
+def read_request(text: str) -> dict[str, Any]:
+    """依頼者の返事から枚数と種類を読む。
+
+    → {"declined": bool, "count": int|None, "kind": str}
+    「不要」と読めれば declined。枚数・種類は読めた分だけ返す
+    （足りないぶんはこちらから尋ねる）。
+    """
+    folded = _fold(text)
+    if _DECLINE_RE.search(folded):
+        return {"declined": True, "count": None, "kind": ""}
+    count_match = _COUNT_RE.search(folded)
+    return {
+        "declined": False,
+        "count": int(count_match.group(1)) if count_match else None,
+        "kind": kind_in(folded),
+    }
+
+
+def read_correction(text: str, draft: dict[str, Any]) -> dict[str, Any]:
+    """文面を見せた後の返事から、枚数・種類の直しを読む。
+
+    → {"kind": 新しい種類 or "", "count": 新しい枚数 or None, "changed": 何かが変わるか,
+       "mentioned": 枚数か種類に触れているか}
+    「ライトでお願いします」のように「お願いします」が混ざっていても、直しを先に
+    読む（誤った内容のまま送らないため）。
+    """
+    parsed = read_request(text)
+    kind = parsed["kind"]
+    count = parsed["count"]
+    changed = (bool(kind) and kind != str(draft.get("kind", ""))) or (
+        count is not None and int(count) != int(draft.get("count", 0) or 0)
+    )
+    return {"kind": kind, "count": count, "changed": changed, "mentioned": bool(kind) or count is not None}
+
+
+def summarize_use(detail: dict[str, Any]) -> str:
+    """「宛先と使用内容」の一行。送付状の項目から組み立てる。"""
+    to_lines = [str(line).strip() for line in detail.get("to_lines") or [] if str(line).strip()]
+    destination = to_lines[0] if to_lines else "（宛先未確認）"
+    items = []
+    for item in detail.get("items") or []:
+        name = str(item.get("name", "")).strip()
+        qty = str(item.get("qty", "") or "").strip()
+        if name:
+            items.append(f"{name} {qty}".strip())
+    contents = "・".join(items) if items else "書類"
+    return f"{destination}／{contents}の送付"
+
+
+def mention(account_id: int, name: str) -> str:
+    """Chatworkの宛先タグ。
+
+    本文とは分けて持つ。本文は sanitize_for_chatwork を通すため、タグを
+    本文へ混ぜると全角に置き換わって相手に通知が飛ばなくなる。文面を見せる
+    段階ではあえて本文ごと通し、確認の時点で相手へ通知が飛ばないようにする。
+    """
+    return f"[To:{account_id}] {name}さん"
+
+
+def mention_all(recipients: list[dict[str, Any]]) -> str:
+    """宛先が複数のときの宛先タグ（1人1行）。"""
+    return "\n".join(
+        mention(int(r.get("account_id", 0)), str(r.get("name", ""))) for r in recipients
+    )
+
+
+def recipient_names(recipients: list[dict[str, Any]]) -> str:
+    return "・".join(str(r.get("name", "")) for r in recipients if r.get("name"))
+
+
+def route_for(settings: dict[str, Any], company_id: str) -> dict[str, Any]:
+    """差出人の会社に対応する備品ルームと宛先。
+
+    グループ会社ごとに備品の依頼先が違う（ライズは総務、楽天軒は経理財務部の
+    担当者あて）。会社が増えても routes に1件足すだけで済むようにする。
+    """
+    routes = settings.get("routes") or {}
+    route = routes.get(str(company_id or "")) or routes.get("default")
+    if route:
+        return route
+    # 旧設定（ルームと担当者を1組だけ持っていた形）
+    return {
+        "room_id": int(settings.get("supplies_room_id", 0)),
+        "recipients": [
+            {
+                "account_id": int(settings.get("staff_account_id", 0)),
+                "name": str(settings.get("staff_name", "")),
+            }
+        ],
+    }
+
+
+def build_request_text(detail: dict[str, Any], count: int, kind: str) -> str:
+    """総務あての依頼文（宛先タグを除く本文）。
+
+    誰の依頼かを明記する。名乗りは入れない（投稿元のアカウントで分かるため）。
+    """
+    requester = str(detail.get("staff") or "").strip()
+    on_behalf = f"経理財務部の{requester}さんの依頼です。" if requester else ""
+    return (
+        f"お疲れさまです。\n"
+        f"{on_behalf}レターパックの手配をお願いできますでしょうか。\n"
+        f"\n"
+        f"・使用会社名: {detail.get('company') or ''}\n"
+        f"・宛先と使用内容: {summarize_use(detail)}\n"
+        f"・必要枚数: {count}枚\n"
+        f"・種類: {kind}\n"
+        f"\n"
+        f"お手数をおかけしますが、よろしくお願いいたします。\n"
+        f"（ご返信は、このメッセージへの返信でお願いできますと助かります）"
+    )
+
+
+def room_link(room_id: int, message_id: str | int = "") -> str:
+    """Chatworkの該当メッセージへのリンク。"""
+    return f"https://www.chatwork.com/#!rid{room_id}" + (f"-{message_id}" if message_id else "")
+
+
+REPLY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "kind": {
+            "type": "string",
+            "enum": ["完了", "質問", "その他"],
+            "description": (
+                "手配が済んだ・用意した旨なら完了。こちらへの問い合わせなら質問。"
+                "判断できなければその他"
+            ),
+        },
+        "arranged": {
+            "type": "boolean",
+            "description": (
+                "手配が済んだ・用意した・準備できた旨が書かれていれば true。"
+                "受け取り方法などを併せて聞かれていても、手配自体が済んでいれば true"
+            ),
+        },
+        "summary": {
+            "type": "string",
+            "description": "依頼者へ伝える内容を1〜2文で。相手の言葉づかいは変えてよい",
+        },
+        "question": {
+            "type": "string",
+            "description": "質問のときだけ、聞かれている内容を1文で。それ以外は空文字",
+        },
+    },
+    "required": ["kind", "arranged", "summary", "question"],
+    "additionalProperties": False,
+}
+
+REPLY_SYSTEM = (
+    "あなたは社内チャットの取次ぎ担当です。備品の手配を依頼した相手からの"
+    "返信を読み、依頼者へ伝えるために内容を整理します。"
+    "推測で情報を足さないこと。書かれていないこと（受け取り場所・期日など）を"
+    "補わないこと。"
+)
+
+
+class LetterpackError(Exception):
+    """レターパック手配の取次ぎに失敗した（利用者向けの文面を持つ）。"""
+
+
+class LetterpackStore:
+    """手配の進行状況（依頼者ごとの待ち状態と、総務とのやり取り）。"""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    def load(self) -> dict[str, Any]:
+        if not self._path.exists():
+            return {"offers": {}, "drafts": {}, "threads": {}}
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"offers": {}, "drafts": {}, "threads": {}}
+        for key in ("offers", "drafts", "threads"):
+            data.setdefault(key, {})
+        return data
+
+    def save(self, data: dict[str, Any]) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            print("[warn] レターパック状態の保存に失敗: " + traceback.format_exc(), flush=True)
+
+
+class LetterpackRunner:
+    """依頼者とのやり取り（要否の確認 → 文面の確認 → 投稿）を受け持つ。"""
+
+    def __init__(
+        self,
+        config: Any,
+        chatwork: Any,
+        store: LetterpackStore | None = None,
+        phrasebook: Any | None = None,
+    ) -> None:
+        self._config = config
+        self._chatwork = chatwork
+        self._store = store or LetterpackStore(
+            config.resolve_path(config.state_dir) / "letterpack.json"
+        )
+        if phrasebook is None:
+            from .phrasing import build
+
+            phrasebook = build(config)
+        self._phrasebook = phrasebook
+
+    # --- 公開API ---
+
+    @property
+    def offer_text(self) -> str:
+        return OFFER
+
+    def offer(
+        self, room_id: int, account_id: int, send_time: int, detail: dict[str, Any]
+    ) -> None:
+        """送付状を作った直後に「手配しますか」の待ち状態を作る。"""
+        data = self._store.load()
+        data["offers"][f"{room_id}:{account_id}"] = {
+            "ts": int(send_time),
+            "detail": detail,
+        }
+        self._store.save(data)
+
+    def handle(
+        self, room_id: int, account_id: int, send_time: int, text: str, display_name: str = ""
+    ) -> str | None:
+        """レターパックのやり取りの続きなら返信文を返す。無関係なら None。"""
+        data = self._store.load()
+        key = f"{room_id}:{account_id}"
+        window = int(self._settings.get("reply_window_minutes", 120)) * 60
+
+        draft = data["drafts"].get(key)
+        if draft and int(send_time) - int(draft.get("ts", 0)) <= window:
+            return self._on_draft_answer(data, key, draft, text, display_name)
+
+        offer = data["offers"].get(key)
+        if offer and int(send_time) - int(offer.get("ts", 0)) <= window:
+            return self._on_offer_answer(data, key, offer, send_time, text)
+
+        # 先方の質問への回答は、枚数の返事より待ち時間が長い（相手の都合がある）。
+        # 短い窓で切ると、答えても届かず先方が待ち続けることになる
+        answer_window = int(self._settings.get("answer_window_hours", 48)) * 3600
+        thread = self._find_asked_thread(data, key, send_time, answer_window)
+        if thread is not None and not _looks_like_new_request(text):
+            return self._on_question_answer(data, thread, text, int(send_time))
+        return None
+
+    # --- 内部 ---
+
+    @property
+    def _settings(self) -> dict[str, Any]:
+        return self._config.letterpack
+
+    def _on_offer_answer(
+        self, data: dict, key: str, offer: dict, send_time: int, text: str
+    ) -> str:
+        """枚数・種類の返事を受けて、総務あての文面を見せる。"""
+        answer = read_request(text)
+        if answer["declined"]:
+            data["offers"].pop(key, None)
+            self._store.save(data)
+            return self._phrasebook.pick("letterpack_declined")
+
+        detail = offer.get("detail") or {}
+        missing = []
+        if not answer["count"]:
+            missing.append("必要枚数（例: 2枚）")
+        if not answer["kind"]:
+            missing.append("種類（プラス／ライト）")
+        if missing:
+            # 待ち状態は残す。読めた分は覚えておき、二度手間にしない
+            offer["ts"] = int(send_time)
+            offer["count"] = answer["count"] or offer.get("count")
+            offer["kind"] = answer["kind"] or offer.get("kind", "")
+            data["offers"][key] = offer
+            self._store.save(data)
+            still = [m for m in missing if not (m.startswith("必要枚数") and offer.get("count"))]
+            still = [m for m in still if not (m.startswith("種類") and offer.get("kind"))]
+            if not still:
+                return self._make_draft(
+                    data, key, offer, detail, int(offer["count"]), str(offer["kind"])
+                )
+            return "手配しますね。これも教えていただけますか。\n" + "\n".join(
+                f"・{m}" for m in still
+            )
+
+        return self._make_draft(data, key, offer, detail, answer["count"], answer["kind"])
+
+    def _make_draft(
+        self, data: dict, key: str, offer: dict, detail: dict, count: int, kind: str
+    ) -> str:
+        settings = self._settings
+        text = build_request_text(detail, count, kind)
+        data["offers"].pop(key, None)
+        data["drafts"][key] = {
+            "ts": int(offer.get("ts", 0)),
+            "text": text,
+            "detail": detail,
+            "count": count,
+            "kind": kind,
+        }
+        self._store.save(data)
+        # 送るかどうかを決める前に相手を巻き込まないよう、文面案の宛先タグは
+        # ここで無効にしておく（見た目は残る）。送信時に生のタグを付け直す
+        from .answer import sanitize_for_chatwork
+
+        route = route_for(settings, detail.get("company_id", ""))
+        recipients = route.get("recipients") or []
+        head = sanitize_for_chatwork(mention_all(recipients))
+        return (
+            f"{recipient_names(recipients)}さんへ、下記の内容で依頼します。"
+            "よろしければ「送信」とお返事ください。直すところがあれば教えてください。\n"
+            "\n"
+            "――――――――――\n"
+            f"{head}\n{text}\n"
+            "――――――――――"
+        )
+
+    def _on_draft_answer(
+        self, data: dict, key: str, draft: dict, text: str, display_name: str
+    ) -> str:
+        """文面を見せた後の返事。直し → 送信 → 取りやめ の順に読む。
+
+        実例（2026-09-10）: 「プラスではなくライトでした」という直しに、
+        「直すところがあれば…」と定型で返して無視した形になり、誤った種類のまま
+        送ってしまった。直しは読み取って文面を作り直し、何を直したかを言う。
+        """
+        folded = _fold(text)
+        correction = read_correction(folded, draft)
+        if correction["changed"]:
+            return self._redraft(data, key, draft, correction)
+        if _CANCEL_RE.search(folded) and not correction["mentioned"]:
+            data["drafts"].pop(key, None)
+            self._store.save(data)
+            return self._phrasebook.pick("letterpack_cancelled")
+        if correction["mentioned"]:
+            # 言われた内容はすでにそのとおりになっている
+            same = []
+            if correction["kind"]:
+                same.append(correction["kind"])
+            if correction["count"] is not None:
+                same.append(f"{correction['count']}枚")
+            return (
+                f"はい、いまの文面も{'・'.join(same)}になっています。"
+                "このまま送ってよければ「送信」とお返事ください。"
+            )
+        if _SEND_RE.search(folded):
+            return self._send(data, key, draft, display_name)
+        if re.search(r"(宛先|宛て|書類|内容|会社名)", folded):
+            return (
+                "宛先や書類の内容は送付状から取っているので、そちらを直す場合は送付状を作り直してから"
+                "改めて手配しますね。枚数・種類の直しでしたら、このまま教えてください。"
+            )
+        return (
+            "すみません、どこを直せばよいか読み取れませんでした。"
+            "枚数か種類（プラス／ライト）を教えていただければ直します。"
+            "このまま送ってよければ「送信」とお返事ください。"
+        )
+
+    def _redraft(self, data: dict, key: str, draft: dict, correction: dict) -> str:
+        """直しを文面に反映して見せ直す。何を直したかを一言添える。"""
+        settings = self._settings
+        detail = draft.get("detail") or {}
+        kind = correction["kind"] or str(draft.get("kind", ""))
+        count = int(correction["count"]) if correction["count"] is not None else int(draft.get("count", 0) or 0)
+        fixed = []
+        if kind != str(draft.get("kind", "")):
+            fixed.append(f"種類を{kind}に")
+        if count != int(draft.get("count", 0) or 0):
+            fixed.append(f"枚数を{count}枚に")
+        draft.update({"kind": kind, "count": count, "text": build_request_text(detail, count, kind)})
+        data["drafts"][key] = draft
+        self._store.save(data)
+        from .answer import sanitize_for_chatwork
+
+        route = route_for(settings, detail.get("company_id", ""))
+        recipients = route.get("recipients") or []
+        head = sanitize_for_chatwork(mention_all(recipients))
+        return (
+            f"失礼しました。{'、'.join(fixed)}直しました。こちらでよろしければ「送信」とお返事ください。\n"
+            "\n"
+            "――――――――――\n"
+            f"{head}\n{draft['text']}\n"
+            "――――――――――"
+        )
+
+    def _send(self, data: dict, key: str, draft: dict, display_name: str) -> str:
+        detail = draft.get("detail") or {}
+        route = route_for(self._settings, detail.get("company_id", ""))
+        room_id = int(route.get("room_id", 0))
+        recipients = route.get("recipients") or []
+        from .answer import sanitize_for_chatwork
+
+        head = mention_all(recipients)
+        try:
+            message_id = self._chatwork.send_message(
+                room_id, head + "\n" + sanitize_for_chatwork(draft["text"])
+            )
+        except Exception as exc:
+            raise LetterpackError(
+                "すみません、備品の依頼チャットへの投稿に失敗しました。"
+                "お手数ですが、直接ご依頼いただけますか。"
+            ) from exc
+
+        requester_room, requester_account = key.split(":")
+        data["drafts"].pop(key, None)
+        data["threads"][str(message_id)] = {
+            "requester_room_id": int(requester_room),
+            "requester_account_id": int(requester_account),
+            "requester_name": display_name,
+            "posted_message_id": str(message_id),
+            # こちらが備品ルームへ出したメッセージ。総務の返信がどれを指しているかを
+            # 突き合わせて、他の依頼への返事を拾わないようにする
+            "message_ids": [str(message_id)],
+            # 巡回でどのルームの誰の返事を待つか。会社ごとに送り先が違う
+            "room_id": room_id,
+            "recipient_ids": [int(r.get("account_id", 0)) for r in recipients],
+            "last_seen": int(message_id),
+            "status": "open",
+            "detail": draft.get("detail") or {},
+            "count": draft.get("count"),
+            "kind": draft.get("kind"),
+            "ts": int(datetime.now(JST).timestamp()),
+        }
+        self._store.save(data)
+        return (
+            "備品・消耗品購入依頼チャットへ依頼しました。\n"
+            f"{room_link(room_id, message_id)}\n"
+            "返信があればこちらでお伝えします。"
+        )
+
+    def _find_asked_thread(
+        self, data: dict, key: str, send_time: int, window: int
+    ) -> dict | None:
+        requester_room, requester_account = key.split(":")
+        for thread in data["threads"].values():
+            if thread.get("status") != "asked":
+                continue
+            if int(thread.get("requester_room_id", 0)) != int(requester_room):
+                continue
+            if int(thread.get("requester_account_id", 0)) != int(requester_account):
+                continue
+            if int(send_time) - int(thread.get("asked_ts", 0)) <= window:
+                return thread
+        return None
+
+    def _on_question_answer(
+        self, data: dict, thread: dict, text: str, send_time: int = 0
+    ) -> str:
+        """総務からの質問に依頼者が答えた → そのまま備品ルームへ返す。"""
+        route = route_for(self._settings, (thread.get("detail") or {}).get("company_id", ""))
+        room_id = int(thread.get("room_id") or route.get("room_id", 0))
+        from .answer import sanitize_for_chatwork
+
+        head = mention_all(route.get("recipients") or [])
+        # 実際に待たせた時間で書き出しを決める。すぐ返せたのに詫びない
+        waited = int(send_time) - int(thread.get("asked_ts", 0) or 0)
+        body = (
+            f"{confirmed_lead(waited)}\n"
+            f"\n"
+            f"{quote_answer(text)}\n"
+            f"\n"
+            f"よろしくお願いいたします。"
+        )
+        try:
+            message_id = self._chatwork.send_message(
+                room_id, head + "\n" + sanitize_for_chatwork(body)
+            )
+        except Exception as exc:
+            raise LetterpackError(
+                "すみません、備品の依頼チャットへの返信に失敗しました。"
+                "お手数ですが、直接お伝えいただけますか。"
+            ) from exc
+        # この投稿への返信も、同じやり取りの続きとして拾えるようにする
+        thread.setdefault("message_ids", []).append(str(message_id))
+        # こちらが答え終えた状態。以後の沈黙は、受け取ってもらえた合図とみなす
+        # （リアクションだけで済ませる人がいるが、APIからは見えない）
+        thread["status"] = "answered"
+        thread["answered_ts"] = int(datetime.now(JST).timestamp())
+        thread.pop("asked_ts", None)
+        self._store.save(data)
+        return self._phrasebook.pick("letterpack_forwarded")
+
+
+def _looks_like_new_request(text: str) -> bool:
+    """別件の依頼（書類作成・予定）なら、質問への答えとして扱わない。"""
+    from .docbuild import looks_like_document_build_request
+    from .scheduletask import looks_like_schedule_request
+
+    return looks_like_document_build_request(text) or looks_like_schedule_request(text)
+
+
+class LetterpackFollower:
+    """総務からの返信を拾って依頼者へ返す（5分ごとの巡回から呼ぶ）。
+
+    備品ルームはメンションの許可ルームに入れていないため、webhookでは
+    受け取れない。総務側にメンションを求めずに済むよう、巡回で拾う。
+    """
+
+    def __init__(
+        self,
+        config: Any,
+        chatwork: Any | None = None,
+        client: Any | None = None,
+        cost: Any | None = None,
+        store: LetterpackStore | None = None,
+    ) -> None:
+        self._config = config
+        if chatwork is None:
+            from .chatwork import ChatworkClient
+
+            chatwork = ChatworkClient(config.chatwork_api_token or "")
+        self._chatwork = chatwork
+        self._client = client
+        self._cost = cost
+        self._store = store or LetterpackStore(
+            config.resolve_path(config.state_dir) / "letterpack.json"
+        )
+
+    # --- 公開API ---
+
+    def run_once(self) -> None:
+        settings = self._config.letterpack
+        if not settings.get("enabled") or not settings.get("follow_up", True):
+            return
+        data = self._store.load()
+        threads = {
+            key: t
+            for key, t in data["threads"].items()
+            if t.get("status") in ("open", "asked", "answered")
+        }
+        if not threads:
+            return  # 追いかけるものが無ければAPIも呼ばない
+
+        changed = self._expire(data, threads, int(settings.get("max_open_days", 7)))
+        agent_id = self._agent_account_id()
+
+        # 会社ごとに備品ルームが違う。やり取りをルーム単位にまとめて見に行く
+        for room_id, room_threads in self._by_room(threads).items():
+            try:
+                messages = self._chatwork.get_recent_messages(room_id, limit=50)
+            except Exception:
+                print(f"[warn] 備品ルーム{room_id}の取得に失敗: " + traceback.format_exc(), flush=True)
+                continue
+            newest = max((int(m.get("message_id", 0)) for m in messages), default=0)
+
+            for message in messages:
+                sender = int((message.get("account") or {}).get("account_id", 0) or 0)
+                key = self._attribute(message, room_threads, room_id, agent_id, sender)
+                if key is None:
+                    continue  # 他の依頼への返事。こちらの件ではない
+                thread = room_threads[key]
+                if int(message.get("message_id", 0)) <= int(thread.get("last_seen", 0)):
+                    continue  # 取次ぎ済み
+                thread["last_seen"] = int(message["message_id"])
+                changed = True
+                try:
+                    self._relay(room_id, thread, message)
+                except Exception:
+                    print("[warn] 返信の取次ぎに失敗: " + traceback.format_exc(), flush=True)
+                data["threads"][key] = thread
+
+            # 拾わなかった発言を毎回見直さないよう、既読位置だけは進めておく
+            for key, thread in room_threads.items():
+                if newest > int(thread.get("last_seen", 0)):
+                    thread["last_seen"] = newest
+                    data["threads"][key] = thread
+                    changed = True
+        if changed:
+            self._store.save(data)
+
+    def _by_room(self, threads: dict) -> dict[int, dict]:
+        """進行中のやり取りを、投稿先の備品ルームごとにまとめる。"""
+        settings = self._config.letterpack
+        grouped: dict[int, dict] = {}
+        for key, thread in threads.items():
+            room_id = int(
+                thread.get("room_id")
+                or route_for(settings, (thread.get("detail") or {}).get("company_id", "")).get(
+                    "room_id", 0
+                )
+            )
+            if room_id:
+                grouped.setdefault(room_id, {})[key] = thread
+        return grouped
+
+    # --- 内部 ---
+
+    def _agent_account_id(self) -> int:
+        """こちら（アシスタント）のアカウントID。宛先タグの突き合わせに使う。"""
+        configured = int(self._config.data.get("agent_account_id") or 0)
+        if configured:
+            return configured
+        try:
+            return int(self._chatwork.get_me())
+        except Exception:
+            print("[warn] 自アカウントIDの取得に失敗: " + traceback.format_exc(), flush=True)
+            return 0
+
+    @staticmethod
+    def _attribute(
+        message: dict, threads: dict, room_id: int, agent_id: int, sender: int
+    ) -> str | None:
+        """依頼先からの発言が、どの依頼への返事かを決める。決められなければ None。
+
+        備品ルームは部署全体の依頼が流れる場なので、依頼先の人の発言というだけで
+        自分あての返事とみなすと、他の人あての連絡を横取りしてしまう。
+        依頼した相手からの発言で、かつこちらのメッセージを名指ししているものだけを拾う。
+        """
+        body = str(message.get("body", ""))
+        addressed = [
+            key
+            for key, thread in threads.items()
+            if sender in [int(i) for i in thread.get("recipient_ids") or []]
+        ]
+        if not addressed:
+            return None  # 依頼していない人の発言
+        for target_room, target_id in _RP_RE.findall(body):
+            if int(target_room) != int(room_id):
+                continue
+            for key in addressed:
+                if target_id in [str(m) for m in threads[key].get("message_ids") or []]:
+                    return key
+        if agent_id and str(agent_id) in _TO_RE.findall(body):
+            if len(addressed) == 1:
+                return addressed[0]  # 進行中が1件なら、宛先タグだけでも判別できる
+            print(
+                "[warn] 返信を特定できませんでした"
+                f"（進行中のやり取りが{len(addressed)}件）",
+                flush=True,
+            )
+        return None
+
+    def _expire(self, data: dict, threads: dict, max_days: int) -> bool:
+        """区切りのついたやり取りを閉じる。
+
+        Chatworkのリアクションはこちらからは見えない（APIが返さない）。
+        「承知しました」と書く代わりにリアクションだけで済ませる人がいるため、
+        沈黙を一律に「返事がない」と扱うと、済んだ話に警告を出してしまう。
+
+        こちらが最後に話し終えている（相手の質問に答えた）なら、沈黙は
+        受け取ってもらえた合図とみなして静かに閉じる。まだ一度も返事を
+        もらえていないときだけ、依頼者へ知らせる。
+        """
+        settings = self._config.letterpack
+        now = datetime.now(JST).timestamp()
+        settle = int(settings.get("settle_hours", 24)) * 3600
+        no_reply_hours = int(settings.get("no_reply_hours", 6))
+        office = settings.get("office_hours") or {}
+        holidays, covers = load_holidays(self._config)
+        if covers and datetime.now(JST).year > max(covers):
+            # 表が切れたまま黙って動くと、祝日に催促が飛ぶ
+            print(
+                f"[warn] 祝日表が{max(covers)}年までです。"
+                "tools/build_holidays.py で作り直してください",
+                flush=True,
+            )
+        limit = now - max_days * 86400
+        changed = False
+        for key, thread in list(threads.items()):
+            # 一度も返事をもらえていない依頼は早めに知らせる。届いていない
+            # 可能性があるため。土日は数えない（週明けまで待つ）
+            if thread.get("status") == "open" and not thread.get("replied_ts"):
+                waited = office_seconds(
+                    int(thread.get("ts", 0)), int(now), holidays,
+                    int(office.get("start", OFFICE_START_HOUR)),
+                    int(office.get("end", OFFICE_END_HOUR)),
+                )
+                if waited >= no_reply_hours * 3600:
+                    data["threads"][key]["status"] = "expired"
+                    threads.pop(key)
+                    changed = True
+                    try:
+                        self._notify_expired(thread, f"{no_reply_hours}時間（平日9時〜18時で計算）")
+                    except Exception:
+                        print("[warn] 未返信の通知に失敗: " + traceback.format_exc(), flush=True)
+                    continue
+            answered_ts = int(thread.get("answered_ts", 0) or 0)
+            if answered_ts and now - answered_ts >= settle:
+                # こちらの回答で話が閉じている。リアクションで済ませた場合もここ
+                data["threads"][key]["status"] = "settled"
+                threads.pop(key)
+                changed = True
+                try:
+                    self._notify_settled(thread)
+                except Exception:
+                    print("[warn] 完了の通知に失敗: " + traceback.format_exc(), flush=True)
+                continue
+            if int(thread.get("ts", 0)) >= limit:
+                continue
+            data["threads"][key]["status"] = "expired"
+            threads.pop(key)
+            changed = True
+            try:
+                self._notify_expired(thread, f"{max_days}日")
+            except Exception:
+                print("[warn] 期限切れの通知に失敗: " + traceback.format_exc(), flush=True)
+        return changed
+
+    def _notify_settled(self, thread: dict) -> None:
+        """こちらの回答のあと動きがないまま区切りがついたときの後始末。
+
+        手配済みと分かっている場合は、依頼者にはすでに伝えてある。
+        重ねて知らせても手間が増えるだけなので黙って閉じる。
+        """
+        if thread.get("arranged"):
+            return
+        from .answer import sanitize_for_chatwork
+
+        self._chatwork.send_message(
+            int(thread["requester_room_id"]),
+            mention(
+                int(thread.get("requester_account_id", 0)),
+                str(thread.get("requester_name") or ""),
+            )
+            + "\n"
+            + sanitize_for_chatwork(
+                "レターパックの件、その後のやり取りがないため、この件は閉じます。"
+                "まだ受け取れていないようでしたら、備品の依頼チャットをご確認ください。\n"
+                + room_link(
+                    int(thread.get("room_id") or 0), thread.get("posted_message_id", "")
+                )
+            ),
+        )
+
+    def _notify_expired(self, thread: dict, waited_label: str) -> None:
+        from .answer import sanitize_for_chatwork
+
+        room_id = int(thread.get("room_id") or 0)
+        self._chatwork.send_message(
+            int(thread["requester_room_id"]),
+            mention(
+                int(thread.get("requester_account_id", 0)),
+                str(thread.get("requester_name") or ""),
+            )
+            + "\n"
+            + sanitize_for_chatwork(
+                f"レターパックの件、依頼から{waited_label}が経ちましたが、"
+                "返信を確認できませんでした。こちらでの追跡は終了します。"
+                "お手数ですが、備品の依頼チャットをご確認ください。\n"
+                "（リアクションだけで返されている場合、こちらでは確認できません）\n"
+                + room_link(room_id, thread.get("posted_message_id", ""))
+            ),
+        )
+
+    def _relay(self, room_id: int, thread: dict, message: dict) -> None:
+        from .answer import sanitize_for_chatwork
+        from .webhook import strip_chatwork_tags
+
+        body = strip_chatwork_tags(str(message.get("body", "")))
+        verdict = self._classify(body)
+        link = room_link(room_id, message.get("message_id", ""))
+        # 返してくれた本人の名前で伝え、お礼もその人に返す（依頼先が複数人のことがある）。
+        # 表示名には勤務状況などが書き足されているため、台帳側の名前を使う
+        replier = int((message.get("account") or {}).get("account_id", 0) or 0)
+        route = route_for(self._config.letterpack, (thread.get("detail") or {}).get("company_id", ""))
+        name = next(
+            (
+                str(r.get("name", ""))
+                for r in route.get("recipients") or []
+                if int(r.get("account_id", 0)) == replier
+            ),
+            str((message.get("account") or {}).get("name") or ""),
+        )
+
+        thread["replied_ts"] = int(datetime.now(JST).timestamp())
+        if verdict.get("arranged"):
+            thread["arranged"] = True  # 閉じるときに、手配済みかどうかで扱いを変える
+        lead = f"レターパックの件、{name}さんから返信がありました。"
+        thanks = "ご手配ありがとうございます。" if verdict.get("arranged") else ""
+        if verdict["kind"] == "完了":
+            note = "手配は完了です。お礼はこちらでお伝えしました。"
+            ack = "ご対応ありがとうございます。依頼者へ申し送りました。引き続きよろしくお願いいたします。"
+            thread["status"] = "done"
+        else:
+            note = "お手数ですが、この返信にそのままお答えください。先方へお伝えします。"
+            # 依頼者の答えを待つ間、相手を放置しない。こちらで勝手に答えず、
+            # 受け取ったことと確認する旨だけを返す
+            ack = f"{thanks}依頼者に確認のうえ、折り返しご連絡します。"
+            thread["status"] = "asked"
+            thread["asked_ts"] = int(datetime.now(JST).timestamp())
+
+        to = mention(
+            int(thread.get("requester_account_id", 0)), str(thread.get("requester_name") or "")
+        )
+        self._chatwork.send_message(
+            int(thread["requester_room_id"]),
+            to
+            + "\n"
+            + sanitize_for_chatwork(f"{lead}\n\n{verdict['summary']}\n\n{note}\n{link}"),
+        )
+        # 返事をもらったら必ず何かを返す。黙っていると、相手からは無視されたように見える
+        self._chatwork.send_message(
+            room_id, mention(replier, name) + "\n" + sanitize_for_chatwork(ack)
+        )
+
+    def _classify(self, body: str) -> dict[str, str]:
+        """返信が「完了」か「質問」かを見る。判断できなければそのまま伝える。"""
+        fallback = {"kind": "その他", "arranged": False, "summary": body[:400], "question": ""}
+        if not body.strip():
+            return fallback
+        if self._client is None:
+            import anthropic
+
+            self._client = anthropic.Anthropic()
+        try:
+            response = self._client.messages.create(
+                model=self._config.model,
+                max_tokens=1000,
+                system=REPLY_SYSTEM,
+                output_config={
+                    "effort": "low",
+                    "format": {"type": "json_schema", "schema": REPLY_SCHEMA},
+                },
+                messages=[{"role": "user", "content": body}],
+            )
+        except Exception:
+            print("[warn] 総務返信の判定に失敗: " + traceback.format_exc(), flush=True)
+            return fallback
+        if self._cost is not None:
+            usage = {}
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            ):
+                value = getattr(getattr(response, "usage", None), key, None)
+                if value:
+                    usage[key] = int(value)
+            self._cost.add_usage(usage)
+        text = next(
+            (b.text for b in getattr(response, "content", []) if getattr(b, "type", "") == "text"),
+            "",
+        )
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return fallback
+        return {
+            "kind": str(parsed.get("kind") or "その他"),
+            "arranged": bool(parsed.get("arranged")),
+            "summary": str(parsed.get("summary") or body[:400]),
+            "question": str(parsed.get("question") or ""),
+        }

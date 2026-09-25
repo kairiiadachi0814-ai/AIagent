@@ -4,12 +4,20 @@
   "effort": "medium",
   "max_tokens": 16000,
   "context_message_count": 20,
-  "allowed_room_ids": [444781726],
-  "admin_room_id": 444781726,
+  "allowed_room_ids": [
+    384793683,
+    444945031,
+    444781726
+  ],
+  "admin_room_id": 444945031,
   "agent_account_id": null,
   "handbook": {
-    "roots": ["."],
-    "include": ["*.md"],
+    "roots": [
+      "."
+    ],
+    "include": [
+      "*.md"
+    ],
     "exclude": [
       "CLAUDE.md",
       "README.md",
@@ -23,11 +31,17 @@
   "prompt_cache_ttl": "1h",
   "fallback_enabled": false,
   "web_fetch_enabled": true,
-  "web_fetch_allowed_domains": ["www.freee.co.jp", "mirasapo-plus.go.jp", "www.nta.go.jp"],
+  "web_fetch_allowed_domains": [
+    "www.freee.co.jp",
+    "mirasapo-plus.go.jp",
+    "www.nta.go.jp"
+  ],
   "web_fetch_max_uses": 3,
   "web_fetch_max_content_tokens": 30000,
   "legal_enabled": true,
-  "body_url_allowlist": ["https://laws.e-gov.go.jp/"],
+  "body_url_allowlist": [
+    "https://laws.e-gov.go.jp/"
+  ],
   "monthly_cost_limit_jpy": 15000,
   "cost_alert_threshold": 0.7,
   "usd_jpy_rate": 155.0,
@@ -44,18 +58,169 @@
   "doc_task": {
     "enabled": true,
     "max_file_mb": 20,
+    "max_pdf_mb": 15,
+    "max_pdf_pages": 50,
     "max_text_chars": 120000,
-    "search_message_count": 60
+    "search_message_count": 60,
+    "remember_minutes": 1440
+  },
+  "doc_build": {
+    "enabled": true,
+    "templates_dir": "templates",
+    "max_items": 20,
+    "attach_to_chatwork": true
+  },
+  "letterpack": {
+    "enabled": true,
+    "_note": "routes は差出人の会社ごとの依頼先。company_id（templates/companies.json のID）で引き、無ければ default。会社が増えたらここに1件足す",
+    "routes": {
+      "default": {
+        "room_id": 345854487,
+        "recipients": [
+          { "account_id": 1160869, "name": "坂口 美代子" }
+        ]
+      },
+      "RAKUTENKEN": {
+        "room_id": 392462780,
+        "recipients": [
+          { "account_id": 9228914, "name": "篠田 笑佳" },
+          { "account_id": 9763216, "name": "福本 明日香" },
+          { "account_id": 10622368, "name": "中浦 祐子" },
+          { "account_id": 10675817, "name": "札葉 美早" }
+        ]
+      }
+    },
+    "follow_up": true,
+    "reply_window_minutes": 120,
+    "answer_window_hours": 48,
+    "settle_hours": 24,
+    "no_reply_hours": 6,
+    "office_hours": { "start": 9, "end": 18 },
+    "max_open_days": 7
   },
   "webhook_async": true,
   "webhook_max_concurrency": 2,
   "webhook_max_queue": 10,
+  "fax_watch": {
+    "enabled": true,
+    "_note": "room_id は許可ルームに入れない（巡回と投稿だけ）。台帳は「リンクを知っている全員が閲覧可」の共有が必要。2026-09-07 テスト完了により宛先を篠田・福本・中浦・札葉へ切替（足立は外れる）。To は各自の勤務日（work_days 0=月）にだけ付ける。通知管理くんは 2026-09-07 からアシスタントへメンション付きで流すが、処理は従来どおり5分ごとの巡回",
+    "room_id": 446282163,
+    "notifier_account_id": 10294683,
+    "notify_recipients": [
+      { "account_id": 9228914, "name": "篠田", "work_days": [0, 3, 4] },
+      { "account_id": 9763216, "name": "福本", "work_days": [0, 1, 2, 3, 4] },
+      { "account_id": 10622368, "name": "中浦", "work_days": [0, 1, 2] },
+      { "account_id": 10675817, "name": "札葉", "work_days": [0, 1, 2, 3, 4] }
+    ],
+    "notify_account_ids": [9228914, 9763216, 10622368, 10675817],
+    "mention_kinds": ["注文", "請求", "見積", "納品", "発注書", "注文書", "請求書", "見積書", "納品書"],
+    "order_words": ["注文", "発注", "直送", "申込", "サンプル", "入荷"],
+    "_quiet_note": "quiet_rules: 差出人（sender）と表題（title）が部分一致したFAXは、注文でも To と対応完了の確認を付けずに置くだけにする。reason は通知に添える理由。既に届いた発注書の確認書や毎日の定例表が対象。増えたらここに1件足す",
+    "quiet_rules": [
+      { "sender": "G7ジャパンフードサービス", "title": "情報確認表", "reason": "既にFAXで届いた発注書の確認書" },
+      { "sender": "キヨスクデリバリーサービス", "title": "棚卸残数日計表", "_note": "都度届くこともあるので理由の注意書きは付けない（2026-09-22）" }
+    ],
+    "_own_note": "own_company_words: こちら（受信側）のグループ会社名。差出人にこれが読まれたら宛先との取り違え（実例 2026-09-07〜10: 47件中9件が「RAKUTENKEN株式会社から発注書が届きました」）。読み直させ、要約からも「当社より」「当社へ発注」を外す。会社が増えたらここに足す",
+    "own_company_words": ["ライズクリエイション", "ライズクリエーション", "RAKUTENKEN", "楽天軒", "樂天軒", "ラクテンケン", "ヤマトライジング", "イノベイト", "ohirome", "ライズホールディングス"],
+    "_urgent_note": "urgent: 発注書などの注文で words の語（急ぎ・至急・早急など）があれば、経理のほかに extra_recipients にも To を付けて知らせる（2026-09-23: 「セール急ぎ分」の発注看板）。G7の定型「最短納品でお願いします」は含めない。語が増えたら words に足す",
+    "urgent": {
+      "words": ["急ぎ", "至急", "早急", "大至急", "緊急", "特急", "急いで", "急ぐ", "ASAP"],
+      "extra_recipients": [
+        { "account_id": 10604615, "name": "森" },
+        { "account_id": 5631017, "name": "藤田" }
+      ]
+    },
+    "_batch_note": "batch:一度に複数件（朝の控え分など）を知らせるときは1通にまとめて番号（①②…）を振る。返事は番号で（「①③ 対応完了」）、全件なら「全て対応完了」。長ければ max_chars ごとに分ける",
+    "batch": { "enabled": true, "max_chars": 6000 },
+    "on_mention": { "enabled": true, "delay_seconds": 5, "retry_seconds": 10 },
+    "directory_csv_url": "https://docs.google.com/spreadsheets/d/1cOIYTuhBV3Je9PZtl8gz4DIbNKES0hrtBn-5nOQgO9M/export?format=csv",
+    "max_pdf_mb": 15,
+    "max_per_day": 50,
+    "notify_window": { "start": "08:30", "end": "19:30" },
+    "follow_up": { "enabled": true, "check_time": "09:00", "recheck_time": "12:00", "evening_time": "19:00", "max_open_days": 14 }
+  },
+  "chat_archive": {
+    "enabled": true,
+    "room_ids": [384793683, 444945031, 444781726],
+    "retention_days": 730,
+    "max_hits": 8
+  },
+  "deadline": {
+    "enabled": true,
+    "_note": "期日の進捗確認は経理財務部業務共有チャットだけ。営業日は平日・祝日除く（FAXの規則とは別）",
+    "room_id": 384793683,
+    "check_days_before": [3, 1, 0],
+    "check_time": "09:00",
+    "overdue_days": 3,
+    "remember_days": 60
+  },
   "discussion_watch": {
     "enabled": true,
-    "room_ids": [444781726],
+    "room_ids": [
+      384793683
+    ],
     "mode": "shadow",
     "max_interventions_per_day": 3,
     "min_message_chars": 10,
-    "max_batch_messages": 30
-  }
+    "max_batch_messages": 30,
+    "max_verifications_per_day": 10
+  },
+  "admin_account_ids": [
+    6945415
+  ],
+  "schedule": {
+    "enabled": true,
+    "owner_name": "足立",
+    "notify_room_id": 384793683,
+    "notify_account_id": 6945415,
+    "notify_weekdays_only": true,
+    "ics_labels": [
+      "トヨクモ スケジューラー"
+    ],
+    "unsynced_source": "Googleカレンダー",
+    "unsynced_note": "（トヨクモ未反映）",
+    "register_note": "※Googleカレンダーに登録しました。トヨクモ スケジューラーにも表示するには、個人設定＞他のカレンダーから読込 で「読込」を押してください（自動では反映されません）。",
+    "greeting": "おはようございます。",
+    "_members_note": "勤務日・勤務時間はChatworkの表示名（2026-09-07時点）から起こした暫定値。本人の予定は /etc/raizuinu/env の SCHEDULE_ICS_URL_<account_id>（トヨクモのiCal出力URL）を足すと読む。work_days は 0=月 … 4=金",
+    "members": [
+      { "name": "足立", "account_id": 6945415, "owner": true, "any_time": true },
+      { "name": "篠田", "account_id": 9228914, "work_days": [0, 3, 4] },
+      { "name": "福本", "account_id": 9763216, "work_days": [0, 1, 2, 3, 4], "skip_holidays": true },
+      { "name": "中浦", "account_id": 10622368, "work_days": [0, 1, 2], "work_hours": { "start": "10:00", "end": "16:30" } },
+      { "name": "札葉", "account_id": 10675817, "work_days": [0, 1, 2, 3, 4], "skip_holidays": true },
+      { "name": "坂田", "account_id": 8681926, "work_days": [0, 1, 2, 3, 4], "skip_holidays": true },
+      { "name": "伊藤", "account_id": 9129422, "work_days": [3, 4] },
+      { "name": "奥田", "account_id": 9773899, "work_days": [0, 1, 2], "skip_holidays": true },
+      { "name": "岩永", "account_id": 11481620, "work_days": [0, 1, 2, 3, 4] }
+    ],
+    "proposal": {
+      "enabled": true,
+      "work_hours": { "start": "09:00", "end": "18:00" },
+      "lunch": { "start": "12:00", "end": "13:00" },
+      "buffer_minutes": 15,
+      "default_minutes": 60,
+      "horizon_days": 14,
+      "max_candidates": 3,
+      "per_day": 2,
+      "skip_holidays": true,
+      "all_day_block_words": ["休", "出張", "外出", "不在", "旅行", "研修", "欠勤", "有給", "年休", "帰省"],
+      "explain_days": 3,
+      "lead_minutes": 60,
+      "grid_minutes": 30,
+      "remember_minutes": 1440,
+      "context_minutes": 120
+    }
+  },
+  "member_account_ids": [
+    6945415,
+    9129422,
+    8681926,
+    9228914,
+    9763216,
+    9773899,
+    10622368,
+    10675817,
+    11481620
+  ],
+  "guest_followup_minutes": 30
 }
