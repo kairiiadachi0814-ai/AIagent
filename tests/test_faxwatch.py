@@ -1342,6 +1342,18 @@ class TestReopening:
         w.run_once()
         return w
 
+    def test_an_older_request_does_not_undo_a_newer_completion(self, tmp_path):
+        # 実例（2026-09-25 16:50）: 16:18 の「戻してほしい」を、16:49 に篠田さんが閉じた分に効かせてしまった
+        w = self.held_over_weekend_open(tmp_path)
+        w._chatwork.messages.append(human(9600, f"[To:{AGENT}] ①はまだ対応完了できていないです。戻してほしい。", FUDABA))
+        w.run_once()  # ①は開いているので戻すものが無い
+        assert w.reopened_last_run == [] and len(w._chatwork.sent) == 1
+        w._chatwork.messages.append(human(9700, f"[rp aid={AGENT} to={FAX_ROOM}-9000]① 対応完了"))  # その後の完了報告
+        w.run_once()
+        assert [t["number"] for t in w._load_state()["open"]] == [2]  # ①は閉じたまま。古い依頼で戻さない
+        assert w.reopened_last_run == []
+        assert "9600" in w._load_state()["reopen_ids"]
+
     def test_nothing_to_bring_back_is_left_to_the_conversation(self, tmp_path):
         # 番号がまだ対応待ちに残っているなら戻すものが無い（会話側で「残っています」と返す）
         w = self.held_over_weekend_open(tmp_path)

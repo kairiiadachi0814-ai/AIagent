@@ -849,7 +849,15 @@ class FaxWatcher:
             mentioned = bool(me and f"[To:{me}]" in body)
             if not targets and not mentioned and not is_short_report(body, me):
                 continue  # 誰宛でもない長い文は運用の連絡として読む
-            fresh = [e for e in log if str(e.get("filename") or "") not in open_files]
+            # 戻せるのは、その依頼より前に閉じた分だけ。依頼より後の完了報告で閉じた分は
+            # 依頼の対象ではない（実例 2026-09-25 16:50: 16:18 の依頼で、16:49 に篠田さんが
+            # 閉じた5件を戻してしまった）
+            fresh = [
+                e for e in log
+                if str(e.get("filename") or "") not in open_files
+                and _as_int(e.get("closer_id")) < _as_int(mid)
+            ]
+            handled.append(mid)  # 一度見た依頼は、あとから閉じた分に効かせない
             named = [e for e in fresh if e.get("filename") and str(e["filename"]) in body]
             numbers = report_numbers(body)
             if named:
@@ -870,7 +878,6 @@ class FaxWatcher:
                 picks = []
             if not picks:
                 continue
-            handled.append(mid)
             restored = []
             for entry in picks:
                 thread = {k: v for k, v in entry.items() if k not in ("closed_at", "closed_by", "closer_id", "via", "thanks_id")}
