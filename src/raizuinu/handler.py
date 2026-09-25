@@ -623,8 +623,14 @@ class RaizuinuHandler:
         question = event.question
         if not question or not self._is_member(event):
             return  # 部外のメンションには応じない
-        from .faxwatch import is_completion
+        from .faxwatch import is_completion, is_reopen_request
 
+        if is_reopen_request(question) and self._fax_watch_factory is not None:
+            # 「㉙はまだ対応できていない、戻してほしい」「全て対応完了は間違いでした」は巡回側が
+            # 閉じた履歴から対応待ちへ戻して返事をする。戻すものが無ければ会話として続ける
+            watcher = self._run_fax_watch_now(event, reason="reopen")
+            if watcher is not None and getattr(watcher, "reopened_last_run", []):
+                return
         if is_completion(question) and self._fax_watch_factory is not None:
             # 「対応完了」の報告は巡回側の処理（閉じて、お礼と残りを1通で返す）に任せる。
             # 実例（2026-09-08）: 会話の返事とお礼が別々に2通届いて分かりにくかった。

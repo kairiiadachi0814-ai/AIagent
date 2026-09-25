@@ -218,6 +218,28 @@ def names_exceptions(body: str) -> bool:
     return bool(_EXCEPT_RE.search(unicodedata.normalize("NFKC", strip_tags(body))))
 
 
+# 閉じた発注書を対応待ちに戻してほしい依頼。実例（2026-09-25 16:18）: 誤って「全て対応完了」と
+# 返したあと「㉙㉚㉛㉜㉝㉞はまだ対応完了できていないです。対応待ちfaxとして復活してほしい。」
+# 強い語（取り消し・復活・間違い）は完了の報告として読まない
+_UNDO_RE = re.compile(r"(復活|戻して|戻し|取り消|取消|間違|誤って|誤り|誤送|キャンセル|やっぱり|やはり)")
+# 「まだ」「できていない」は、番号やファイル名が閉じた分を指しているときだけ戻す依頼と読む
+_NOT_YET_RE = re.compile(
+    r"(まだ|未対応|未処理|未完了|できていない|できてない|終わっていない|終わってない|済んでいない|済んでない|"
+    r"完了していない|完了してない|残っている|残ってる)"
+)
+
+
+def is_undo_request(body: str) -> bool:
+    """「取り消し」「復活してほしい」「間違えた」のように、閉じたのを戻す依頼か（完了とは読まない）。"""
+    return bool(_UNDO_RE.search(unicodedata.normalize("NFKC", strip_tags(body))))
+
+
+def is_reopen_request(body: str) -> bool:
+    """閉じた発注書を対応待ちに戻してほしい依頼として見る文か。"""
+    text = unicodedata.normalize("NFKC", strip_tags(body))
+    return bool(_UNDO_RE.search(text) or _NOT_YET_RE.search(text))
+
+
 # 「以外」の後ろにこれがあれば、済んでいない分の話が混ざっているので受けない
 _PENDING_RE = re.compile(r"(確認中|対応中|処理中|作業中|保留|後で|あとで|後ほど|明日|来週|未|まだ|待ち)")
 # 「以外」の前に番号以外の語が無いことを見る（番号・区切りを除いた残り）
@@ -625,6 +647,8 @@ class FaxWatcher:
         self.closed_last_run: list[dict] = []
         # 直前の run_once で「どの番号が済んだか」を聞き返した報告（同じく二重に返さないため）
         self.asked_last_run: list[dict] = []
+        # 直前の run_once で「戻してほしい」により対応待ちへ戻した発注書
+        self.reopened_last_run: list[dict] = []
         if http_get is None:
             import requests
 
@@ -698,6 +722,7 @@ class FaxWatcher:
         # 週末をまたぐと取りこぼす）。知らせるのは時間帯の中だけ
         self._collect(state, messages, notifier)
         self._close_finished(state, messages, room_id, notifier)
+        self._reopen_requested(state, messages, room_id, notifier)
         self._ack_evening_replies(state, messages, room_id, notifier)
         self._save_state(state)
 
@@ -749,6 +774,9 @@ class FaxWatcher:
                 return 0
             remaining = [t for t in state.get("open") or [] if t not in closed]
             state["open"] = remaining
+            closer_id = str(message.get("message_id", ""))
+            for thread in closed:
+                self._log_closed(state, thread, closer_id=closer_id, by=_account_of(message), via="mention")
             self._save_state(state)
         for thread in closed:
             self._audit(
@@ -763,8 +791,121 @@ class FaxWatcher:
                 }
             )
         self.closed_last_run = closed
-        self._thank(room_id, message, remaining)
+        thanks_id = self._thank(room_id, message, remaining)
+        if thanks_id:
+            # お礼への返信で「取り消し」と言われたときに、この報告で閉じた分と分かるように
+            with self._locked():
+                state = self._load_state()
+                for entry in state.get("closed_log") or []:
+                    if str(entry.get("closer_id")) == closer_id and not entry.get("thanks_id"):
+                        entry["thanks_id"] = thanks_id
+                self._save_state(state)
         return len(closed)
+
+    # --- 閉じた分を戻す ---
+
+    CLOSED_LOG_KEEP = 200
+
+    def _log_closed(
+        self, state: dict, thread: dict, closer_id: str, by: int, via: str, thanks_id: str = ""
+    ) -> None:
+        """閉じた控えを履歴に残す（「まだ対応できていない」「取り消し」で戻せるように）。"""
+        entry = {
+            **thread,
+            "closed_at": self._now().isoformat(),
+            "closed_by": int(by or 0),
+            "closer_id": str(closer_id or ""),
+            "via": via,
+            "thanks_id": str(thanks_id or ""),
+        }
+        log = list(state.get("closed_log") or [])
+        log.append(entry)
+        state["closed_log"] = log[-self.CLOSED_LOG_KEEP:]
+
+    def _reopen_requested(self, state: dict, messages: list[dict], room_id: int, notifier: int) -> None:
+        """「㉙㉚はまだ対応完了できていない、戻してほしい」「全て対応完了は間違いでした」で、
+        閉じた発注書を対応待ちへ戻す。
+
+        どれを戻すかは ファイル名 → 番号 → 「全て」（返信先の完了報告・お礼、または直前の
+        完了報告で閉じた分）の順に決める。戻す先が無ければ何もしない（会話側に任せる）。
+        実例（2026-09-25 16:18）: 誤った「全て対応完了」で閉じた㉙〜㉞を戻してほしいと
+        頼まれ、「このルームでは対応できない」と返してしまった。
+        """
+        self.reopened_last_run = []
+        log = list(state.get("closed_log") or [])
+        if not log:
+            return
+        me = self._me()
+        handled = [str(i) for i in state.get("reopen_ids") or []]
+        open_files = {str(t.get("filename") or "") for t in state.get("open") or []}
+        for message in sorted(messages, key=lambda m: int(m.get("message_id", 0))):
+            mid = str(message.get("message_id", ""))
+            if mid in handled or _account_of(message) in (notifier, me):
+                continue
+            body = str(message.get("body", ""))
+            if _OWN_MARK in body or not is_reopen_request(body):
+                continue
+            targets = reply_targets(body, room_id)
+            mentioned = bool(me and f"[To:{me}]" in body)
+            if not targets and not mentioned and not is_short_report(body, me):
+                continue  # 誰宛でもない長い文は運用の連絡として読む
+            fresh = [e for e in log if str(e.get("filename") or "") not in open_files]
+            named = [e for e in fresh if e.get("filename") and str(e["filename"]) in body]
+            numbers = report_numbers(body)
+            if named:
+                picks = named
+            elif numbers:
+                picks = []
+                for n in numbers:
+                    hits = [e for e in fresh if int(e.get("number") or 0) == n]
+                    if hits:
+                        picks.append(max(hits, key=lambda e: str(e.get("closed_at", ""))))
+            elif mentions_all(body) or is_undo_request(body):
+                if targets:
+                    picks = [e for e in fresh if {str(e.get("closer_id")), str(e.get("thanks_id"))} & targets]
+                else:
+                    last = max((str(e.get("closer_id") or "") for e in fresh), key=lambda c: _as_int(c), default="")
+                    picks = [e for e in fresh if str(e.get("closer_id") or "") == last] if last else []
+            else:
+                picks = []
+            if not picks:
+                continue
+            handled.append(mid)
+            restored = []
+            for entry in picks:
+                thread = {k: v for k, v in entry.items() if k not in ("closed_at", "closed_by", "closer_id", "via", "thanks_id")}
+                thread["since_id"] = mid  # 戻す依頼より前の「対応完了」は当てない
+                state.setdefault("open", []).append(thread)
+                open_files.add(str(thread.get("filename") or ""))
+                restored.append(thread)
+                self._audit(
+                    {
+                        "type": "fax_reopen",
+                        "room_id": room_id,
+                        "message_id": str(thread.get("pdf_id")),
+                        "filename": thread.get("filename"),
+                        "number": int(thread.get("number") or 0),
+                        "by": _account_of(message),
+                        "request_id": mid,
+                    }
+                )
+            keys = {(str(e.get("filename")), str(e.get("closer_id"))) for e in picks}
+            log = [e for e in log if (str(e.get("filename")), str(e.get("closer_id"))) not in keys]
+            state["closed_log"] = log
+            self.reopened_last_run += restored
+            self._confirm_reopen(room_id, message, restored, state.get("open") or [])
+        state["reopen_ids"] = handled[-50:]
+
+    def _confirm_reopen(self, room_id: int, message: dict, restored: list[dict], open_threads: list[dict]) -> None:
+        try:
+            tag = f"[rp aid={_account_of(message)} to={room_id}-{message.get('message_id')}]"
+            labels = self._numbers_of([t for t in restored if t.get("number")])
+            what = labels or "・".join(str(t.get("filename") or "") for t in restored)
+            lines = [f"承知しました。{what}を対応待ちに戻しました。"]
+            lines += self._remaining_lines(open_threads)
+            self._chatwork.send_message(room_id, f"{tag}\n" + "\n".join(lines))
+        except Exception:
+            print("[warn] 戻した旨の返事に失敗: " + traceback.format_exc(), flush=True)
 
     # --- 内部 ---
 
@@ -1187,7 +1328,8 @@ class FaxWatcher:
         asked = [str(i) for i in state.get("asked_ids") or []]
         filenames = [str(t.get("filename") or "") for t in threads if t.get("filename")]
         closed: list[dict] = []
-        closers: dict[str, dict] = {}
+        closers: dict[str, tuple] = {}
+        records: list[tuple] = []  # (控え, 報告のID, 読み方, 報告者) → 閉じた履歴に残す
         for message in sorted(messages, key=lambda m: int(m.get("message_id", 0))):
             mid = int(message.get("message_id", 0))
             if str(mid) in asked or _account_of(message) in (notifier, me):
@@ -1195,13 +1337,17 @@ class FaxWatcher:
             body = str(message.get("body", ""))
             if _OWN_MARK in body:
                 continue  # 自分の投稿（自IDが取れなかったときの保険）
+            if is_undo_request(body):
+                continue  # 「全て対応完了は間違いでした」は完了ではなく戻す依頼（_reopen_requested）
             if not is_completion(body):
                 continue
             targets = reply_targets(body, room_id)
+            # 通知より前の発言は当てない。対応待ちへ戻した控えは、戻す依頼より前の発言も当てない
+            # （戻す前の「全て対応完了」が次の巡回でまた閉じてしまうため）
             candidates = [
                 t for t in threads
                 if t not in closed
-                and mid > _as_int(t.get("posted_id"))
+                and mid > max(_as_int(t.get("posted_id")), _as_int(t.get("since_id")))
                 and (not targets or targets & self._thread_ids(t, evening_ids))
             ]
             if not candidates:
@@ -1268,6 +1414,7 @@ class FaxWatcher:
                     }
                 )
                 closed.append(thread)
+                records.append((thread, str(mid), via, _account_of(message)))
             closers.setdefault(str(mid), (message, note))
         remaining = [t for t in threads if t not in closed]
         state["open"] = remaining
@@ -1276,8 +1423,12 @@ class FaxWatcher:
         # 報告には一言返す。1つの「完了」で複数の発注書が閉じても、お礼は1回。
         # そのとき、まだ対応待ちのFAXがあれば一緒に示す（月曜朝にまとめて届いた
         # 分の処理漏れを防ぐ）
-        for closer, note in closers.values():
-            self._thank(room_id, closer, remaining, note)
+        thanks_ids: dict[str, str] = {}
+        for key, (closer, note) in closers.items():
+            thanks_ids[key] = self._thank(room_id, closer, remaining, note)
+        # 閉じた分は履歴に残す（「まだ対応できていない」「取り消し」で戻せるように）
+        for thread, key, via, by in records:
+            self._log_closed(state, thread, closer_id=key, by=by, via=via, thanks_id=thanks_ids.get(key, ""))
 
     def _replied_to_each(
         self, candidates: list[dict], threads: list[dict], targets: set[str], evening_ids: set[str]
@@ -1354,8 +1505,8 @@ class FaxWatcher:
         numbers = [int(t.get("number") or 0) for t in threads if t.get("number")]
         return f"（例:「{circled(numbers[0])} 対応完了」）" if numbers else ""
 
-    def _thank(self, room_id: int, message: dict, remaining: list[dict], note: str = "") -> None:
-        """完了の報告に、相手のメッセージへの返信で礼を言い、残りを添える（黙って閉じない）。
+    def _thank(self, room_id: int, message: dict, remaining: list[dict], note: str = "") -> str:
+        """完了の報告に、相手のメッセージへの返信で礼を言い、残りを添える（黙って閉じない）。→ 投稿ID
 
         note は「①を残して②③を閉じました」のような、何を閉じたかの明記（除外の形のとき）。
         """
@@ -1369,9 +1520,10 @@ class FaxWatcher:
             if note:
                 lines.append(note)
             lines += self._remaining_lines(remaining)
-            self._chatwork.send_message(room_id, f"{tag}\n" + "\n".join(lines))
+            return str(self._chatwork.send_message(room_id, f"{tag}\n" + "\n".join(lines)) or "")
         except Exception:
             print("[warn] 完了報告への返事に失敗: " + traceback.format_exc(), flush=True)
+            return ""
 
     def _thread_line(self, thread: dict) -> str:
         return thread_line(thread, int(self._config.fax_watch.get("room_id", 0) or 0))
@@ -1867,6 +2019,10 @@ class FaxStatus:
   （「全部でしたら『全て対応完了』とお返事ください」と添える）
 - 「①以外は完了」のような除外の形はプログラム側が扱う。done_all・done_filenames は
   立てず、reply は「済んだ番号を挙げる形でお願いします」と一言添える
+- 「まだ対応できていない」「対応待ちに戻して」「さっきの完了は間違い」もプログラム側が
+  閉じた履歴から戻す。ここへ来たのは戻す先が無かったとき（その番号はまだ対応待ちに
+  残っている、など）なので、done は立てず「○は対応待ちに残っています」のように短く返す。
+  「このルームでは対応できない」とは言わない
 
 いま対応待ちのFAX（番号 / PDF名 / 差出人 / 種類）:
 {open_list}

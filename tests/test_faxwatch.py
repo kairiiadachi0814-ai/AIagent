@@ -1262,6 +1262,123 @@ class TestBatchedNotices:
         assert [circled(n) for n in (1, 20, 21, 35, 36, 50, 51)] == ["①", "⑳", "㉑", "㉟", "㊱", "㊿", "(51)"]
 
 
+class TestReopening:
+    """実例（2026-09-25 16:18）: 誤って「全て対応完了」と返したあと、「㉙㉚㉛㉜㉝㉞はまだ対応完了
+    できていないです。対応待ちfaxとして復活してほしい。」に「このルームでは対応できない」と返した。
+    閉じた分は履歴に残し、番号・ファイル名・「全て」の依頼で対応待ちへ戻す。"""
+
+    def three_closed_by_all(self, tmp_path):
+        msgs = (held("4950_001.pdf", "2026/09/05 10:00:00") + held("4960_001.pdf", "2026/09/06 15:00:00")
+                + held("4970_001.pdf", "2026/09/06 16:00:00"))
+        w = watcher(tmp_path, msgs, ORDER, now=at(2026, 9, 5, 10, 0))
+        prime(w)
+        w.run_once()
+        w.clock.now = at(2026, 9, 7, 8, 30)
+        assert w.run_once() == 3  # まとめ通知 9000 に ①②③
+        w._chatwork.messages.append(human(9500, "全て対応完了"))  # 誤った報告（返信でない一言）
+        w.run_once()
+        assert w._load_state()["open"] == []
+        log = w._load_state()["closed_log"]
+        assert [(e["number"], e["closer_id"], e["thanks_id"]) for e in log] == [(1, "9500", "9001"), (2, "9500", "9001"), (3, "9500", "9001")]
+        return w
+
+    def test_numbers_that_are_not_done_yet_come_back(self, tmp_path):
+        w = self.three_closed_by_all(tmp_path)
+        w._chatwork.messages.append(human(9600, f"[To:{AGENT}] ①③はまだ対応完了できていないです。対応待ちfaxとして復活してほしい。", FUDABA))
+        w.run_once()
+        assert [t["number"] for t in w.reopened_last_run] == [1, 3]
+        assert [(t["number"], t["filename"], t["stage"]) for t in w._load_state()["open"]] == [(1, "4950_001.pdf", 0), (3, "4970_001.pdf", 0)]
+        assert [e["number"] for e in w._load_state()["closed_log"]] == [2]
+        reply = bodies(w)[-1]
+        assert reply.startswith(f"[rp aid={FUDABA} to={FAX_ROOM}-9600]\n承知しました。①③を対応待ちに戻しました。")
+        assert "対応待ちのFAXは、あと2件です。" in reply and "・① 9/5 10:00" in reply and "・③ 9/6 16:00" in reply
+        w.run_once()
+        assert len(w._chatwork.sent) == 3  # 同じ依頼で二度は戻さない。戻す前の「全て対応完了」でまた閉じない
+        assert [t["number"] for t in w._load_state()["open"]] == [1, 3]
+        assert all(t["since_id"] == "9600" for t in w._load_state()["open"])
+        # 戻した後の新しい報告では閉じられる
+        w._chatwork.messages.append(human(9700, f"[rp aid={AGENT} to={FAX_ROOM}-9000]① 対応完了"))
+        w.run_once()
+        assert [t["number"] for t in w._load_state()["open"]] == [3]
+        # 戻した分は見届けも続く（翌営業日の催促。残っている③だけ）
+        w.clock.now = at(2026, 9, 8, 9, 0)
+        w.run_once()
+        assert "次の1件のFAXについて" in bodies(w)[-1] and "・③ 9/6 16:00" in bodies(w)[-1]
+
+    def test_undoing_the_whole_report_brings_everything_back(self, tmp_path):
+        w = self.three_closed_by_all(tmp_path)
+        w._chatwork.messages.append(human(9600, "さっきの全て対応完了は間違いでした"))
+        w.run_once()
+        assert [t["number"] for t in w._load_state()["open"]] == [1, 2, 3]
+        assert w._load_state()["closed_log"] == []
+        assert "①②③を対応待ちに戻しました。" in bodies(w)[-1]
+
+    def test_replying_to_the_thanks_scopes_the_undo(self, tmp_path):
+        # 別の報告で閉じた分は巻き込まない
+        w = self.three_closed_by_all(tmp_path)
+        w._chatwork.messages += held("4980_001.pdf", "2026/09/07 10:00:00")
+        w.clock.now = at(2026, 9, 7, 10, 5)
+        w.run_once()  # ④ = 9002
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9002]対応完了"))
+        w.run_once()  # ④を閉じる（お礼 9003）
+        assert w._load_state()["open"] == []
+        w._chatwork.messages.append(human(9700, f"[rp aid={AGENT} to={FAX_ROOM}-9001]取り消してください"))  # ①②③のお礼への返信
+        w.run_once()
+        assert [t["number"] for t in w._load_state()["open"]] == [1, 2, 3]
+        assert [e["number"] for e in w._load_state()["closed_log"]] == [4]
+
+    def test_an_undo_is_never_read_as_a_completion(self, tmp_path):
+        w = self.held_over_weekend_open(tmp_path)
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]全て対応完了は間違いです、まだです"))
+        w.run_once()
+        assert len(w._load_state()["open"]) == 2  # 閉じない
+
+    def held_over_weekend_open(self, tmp_path):
+        msgs = held("4950_001.pdf", "2026/09/05 10:00:00") + held("4960_001.pdf", "2026/09/06 15:00:00")
+        w = watcher(tmp_path, msgs, ORDER, now=at(2026, 9, 5, 10, 0))
+        prime(w)
+        w.run_once()
+        w.clock.now = at(2026, 9, 7, 8, 30)
+        w.run_once()
+        return w
+
+    def test_nothing_to_bring_back_is_left_to_the_conversation(self, tmp_path):
+        # 番号がまだ対応待ちに残っているなら戻すものが無い（会話側で「残っています」と返す）
+        w = self.held_over_weekend_open(tmp_path)
+        w._chatwork.messages.append(human(9500, f"[To:{AGENT}] ①はまだ対応できていないです"))
+        w.run_once()
+        assert w.reopened_last_run == []
+        assert len(w._chatwork.sent) == 1
+
+    def test_a_long_note_without_a_target_is_not_an_undo(self, tmp_path):
+        w = self.three_closed_by_all(tmp_path)
+        w._chatwork.messages.append(human(9600, "先ほどの件、取り消しの手順を整理して共有します。まだ対応できていない分は各自で確認をお願いします。"))
+        w.run_once()
+        assert w._load_state()["open"] == [] and w.reopened_last_run == []
+
+    def test_close_manually_also_keeps_the_history(self, tmp_path):
+        w = self.held_over_weekend_open(tmp_path)
+        message = {"account": {"account_id": FUDABA}, "message_id": "9500"}
+        assert w.close_manually(FAX_ROOM, message, everything=True) == 2
+        log = w._load_state()["closed_log"]
+        assert [(e["number"], e["closer_id"], e["via"], e["thanks_id"]) for e in log] == [(1, "9500", "mention", "9001"), (2, "9500", "mention", "9001")]
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9001]②はまだです、戻してください"))
+        w.run_once()
+        assert [t["number"] for t in w._load_state()["open"]] == [2]
+
+    @pytest.mark.parametrize("body, undo, reopen", [
+        ("①③はまだ対応完了できていないです。復活してほしい。", True, True),
+        ("さっきの全て対応完了は間違いでした", True, True),
+        ("①はまだです", False, True),
+        ("① 対応完了", False, False),
+        ("了解です", False, False),
+    ])
+    def test_reading_undo_and_reopen_requests(self, body, undo, reopen):
+        from raizuinu.faxwatch import is_reopen_request, is_undo_request
+
+        assert is_undo_request(body) is undo and is_reopen_request(body) is reopen
+
+
 MORI, FUJITA = 10604615, 5631017
 URGENT_CFG = {
     "words": ["急ぎ", "至急", "早急", "大至急", "緊急", "特急", "急いで", "急ぐ", "ASAP"],
@@ -1715,6 +1832,40 @@ class TestQuestionsInTheFaxRoom:
         assert len(chatwork.sent) == 1 and "対応待ちのFAXは、あと1件です。" in chatwork.sent[0][1]
         assert "4958_001.pdf" in handler._fax_status._client.kwargs["system"]  # 一覧を渡して選ばせる
         assert audit.records[-1]["type"] == "fax_status" and "閉じた: 1件" in audit.records[-1]["answer"]
+
+    def test_a_request_to_bring_faxes_back_is_handled_by_the_watcher(self, tmp_path, monkeypatch):
+        # 実例（2026-09-25 16:18）: 「㉙㉚…はまだ対応完了できていない、復活してほしい」に
+        # 「このルームでは対応できない」と返した。巡回側が戻して返事をし、会話の返事は重ねない
+        import time
+
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        handler, chatwork, _, audit = self._handler(tmp_path, monkeypatch, {"open": []})
+        reasons = []
+
+        class FakeRun:
+            closed_last_run = []
+            asked_last_run = []
+            reopened_last_run = [{"filename": "4958_001.pdf", "number": 29}]
+
+            def run_once(self):
+                chatwork.sent.append((FAX_ROOM, "承知しました。㉙を対応待ちに戻しました。\n対応待ちのFAXは、あと1件です。"))
+                return 0
+
+            def has_pending(self):
+                return False
+
+        original = handler._run_fax_watch_now
+
+        def spy(event, reason="notice"):
+            reasons.append(reason)
+            return original(event, reason=reason)
+
+        handler._run_fax_watch_now = spy
+        handler._fax_watch_factory = lambda: FakeRun()
+        self._ask(handler, SHINODA, "㉙はまだ対応完了できていないです。対応待ちfaxとして復活してほしい。", "9600")
+        assert reasons == ["reopen"]
+        assert len(chatwork.sent) == 1 and "対応待ちに戻しました" in chatwork.sent[0][1]
+        assert handler._fax_status._client.kwargs is None  # 会話の返事は重ねない
 
     def test_all_done_hands_the_reply_target_to_the_watcher(self, tmp_path, monkeypatch):
         # 会話側で「全部済んだ」と読んでも、返信先を渡して閉じる範囲を巡回側に決めさせる
