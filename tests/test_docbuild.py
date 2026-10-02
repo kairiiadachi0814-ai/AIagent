@@ -1092,6 +1092,76 @@ class TestSenderStaff:
         assert "担当： 経理財務部　足立" in "".join(docx_texts(meta["artifact"][1]))
         assert "担当者は「" not in reply  # 依頼者本人なので断り書きは出さない
 
+    RAKUTENKEN_REQUEST = (
+        "郵送用の送付状を作成して。\n宛先は、東大阪市職員厚済会　\n担当：坪田　美鈴様\n"
+        "送付内容は、御見積書　1通\n\n差出人は、RAKUTENKEN株式会社\n担当：森　美明"
+    )
+    RAKUTENKEN_FIELDS = {
+        "kind": "送付状", "company_id": "RAKUTENKEN", "sender_hint": "RAKUTENKEN株式会社",
+        "date": "2026年10月2日", "to_company": "東大阪市職員厚済会", "to_person": "坪田 美鈴",
+        "items": [{"name": "御見積書", "qty": "1通"}], "missing": [], "opening": "",
+    }
+
+    def test_a_staff_member_outside_the_roster_named_on_the_sender_side_is_used(self, tmp_path):
+        # 実例（2026-10-02 12:01）: 福本さんが RAKUTENKEN の担当者「森 美明」名義で頼んだ送付状を、
+        # 依頼者（福本）の名前で作ってしまった。森さんは経理財務部の名簿に無い
+        runner = DocBuildRunner(make_config(tmp_path), client=fake_client(self.RAKUTENKEN_FIELDS))
+        reply, meta, _ = runner.run(self.RAKUTENKEN_REQUEST, requester_name="福本　明日香 (休)土日祝")
+        joined = "\n".join(docx_texts(meta["artifact"][1]))
+        assert "担当： 森 美明" in joined and "福本" not in joined
+        assert "坪田 美鈴様" in joined  # 宛先の担当者はそのまま
+        assert meta["staff_override"] == "森 美明"
+        assert "担当者は「森 美明」で作成しています" in reply  # 依頼者以外の名前は黙って通さない
+
+    @pytest.mark.parametrize(
+        "instruction, to_person",
+        [
+            ("送付状を作って。宛先は株式会社A\n担当：山田\n送付内容は請求書1部", "山田"),   # 宛先側の担当（敬称なし）
+            ("株式会社Aあての送付状を作って。担当：山田 太郎。請求書1部を送付", ""),      # 目印が無い
+            ("送付状を作って。差出人は当社。宛先は株式会社A 担当：山田\n請求書1部", ""),   # 宛先側の目印の方が近い
+            ("送付状を作って。差出人は当社\n担当：山田様\n宛先は株式会社A", ""),          # 敬称付きは先方
+        ],
+    )
+    def test_a_contact_that_is_not_clearly_ours_is_left_alone(self, tmp_path, instruction, to_person):
+        fields = {
+            "kind": "送付状", "company_id": "ライズクリエイション", "sender_hint": "",
+            "date": "2026年8月17日", "to_company": "株式会社A", "to_person": to_person,
+            "items": [{"name": "契約書", "qty": "1部"}], "missing": [], "opening": "",
+        }
+        runner = DocBuildRunner(make_config(tmp_path), client=fake_client(fields))
+        reply, meta, _ = runner.run(instruction, requester_name="足立 海里")
+        assert "担当： 経理財務部　足立" in "".join(docx_texts(meta["artifact"][1]))
+        assert meta["staff_override"] == ""
+
+    @pytest.mark.parametrize(
+        "instruction, expected",
+        [
+            ("差出人は、RAKUTENKEN株式会社\n担当：森　美明", "森 美明"),
+            ("差出人はRAKUTENKEN株式会社、担当は森でお願いします", "森"),
+            ("当社担当：森 美明です。宛先は株式会社A", "森 美明"),
+            ("宛先は株式会社A\n担当：坪田　美鈴様\n差出人は当社\n担当者：森", "森"),
+            ("担当：森 美明", ""),
+            ("宛先は株式会社A 担当：坪田", ""),
+        ],
+    )
+    def test_reading_an_explicitly_named_sender_contact(self, instruction, expected):
+        from raizuinu.docbuild import _explicit_staff
+
+        assert _explicit_staff(instruction, ["株式会社A"]) == expected
+
+    def test_enclosures_are_flush_left_in_the_rakutenken_layout(self, tmp_path):
+        # 指摘（2026-10-02）: 送付内容が紙面の真ん中に寄っていた（原本の字下げが残っていた）。左詰めが正しい
+        import io
+        import re
+        import zipfile
+
+        runner = DocBuildRunner(make_config(tmp_path), client=fake_client(self.RAKUTENKEN_FIELDS))
+        _, meta, _ = runner.run(self.RAKUTENKEN_REQUEST, requester_name="福本 明日香")
+        xml = zipfile.ZipFile(io.BytesIO(meta["artifact"][1])).read("word/document.xml").decode("utf-8")
+        paragraph = next(p for p in re.findall(r"<w:p [^>]*>(?:(?!<w:p[ >]).)*?</w:p>", xml, flags=re.S) if "御見積書" in p)
+        assert "・御見積書　1通" in "".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>", paragraph))
+        assert "<w:ind" not in paragraph and "<w:jc" not in paragraph
+
     def test_blank_requester_name_is_asked_for_instead_of_shipping_a_blank_field(
         self, tmp_path
     ):

@@ -91,6 +91,9 @@ SPECS = [
             69: PH_FILLER,  # 以降の空段落は目印1つにまとめる
             **{i: None for i in range(70, 77)},
         },
+        # 送付書類は左詰め。原本は「＜添付書類＞」の見出しに合わせて字下げしてあり、
+        # 見出しを外すと紙面の真ん中に寄って見える（指摘 2026-10-02）
+        "flush_left": (68,),
     },
 ]
 
@@ -150,6 +153,15 @@ _XMLNS_RE = re.compile(r'xmlns:([A-Za-z0-9_]+)="([^"]+)"')
 _ROOT_TAG_RE = re.compile(r"<w:document\b[^>]*>")
 
 
+def strip_indent(p: ET.Element) -> None:
+    """段落の字下げ（w:ind）を外して左詰めにする。"""
+    ppr = p.find(W + "pPr")
+    if ppr is None:
+        return
+    for ind in ppr.findall(W + "ind"):
+        ppr.remove(ind)
+
+
 def build(spec: dict) -> Path:
     src = BOX / spec["src"]
     with zipfile.ZipFile(src) as z:
@@ -188,6 +200,8 @@ def build(spec: dict) -> Path:
         if new_text is None:
             continue
         set_para_text(paras[index], new_text)
+    for index in spec.get("flush_left", ()):
+        strip_indent(paras[index])
     for p in paras[start : end + 1]:
         strip_page_breaks(p)
 
