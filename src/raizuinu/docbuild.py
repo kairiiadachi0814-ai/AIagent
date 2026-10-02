@@ -786,7 +786,8 @@ def _staff_from_text(instruction: str, roster: tuple[str, ...]) -> str:
 
 # 「担当：森　美明」のように担当者を書いた箇所。姓だけでも、姓と名（空白区切り）でも拾う
 _STAFF_LINE_RE = re.compile(
-    r"担当(?:者)?(?:名)?[ \t]*(?:[:：]|は)[ \t]*([^\s、。,，:：]{1,10}(?: [^\s、。,，:：]{1,10})?)"
+    r"担当(?:者)?(?:名)?[ \t　]*(?:[:：]|は)[ \t　]*"
+    r"([^\s、。,，:：]{1,10}(?:[ 　][^\s、。,，:：]{1,10})?)"
 )
 # 直前の目印がどちら側か。差出人側の目印に続く「担当」だけを自社の担当者と読む
 _SENDER_MARK_RE = re.compile(r"(差出人|発信者|発信元|送り主|当社|弊社|自社)")
@@ -802,15 +803,17 @@ def _explicit_staff(instruction: str, to_lines: list[str]) -> str:
     宛先側の担当者を差出人にしないよう、次のものは採らない:
     敬称付きの名前（先方の担当者）、宛先に出てくる名前、差出人側の目印
     （差出人・当社など）より宛先側の目印（宛先・送付先など）の方が近い箇所、目印の無い箇所。
+    名前は依頼文に書かれたとおりに返す（「森　美明」の姓名の間の全角空白もそのまま。
+    正しい版の送付状は全角空白だった）。
     """
-    text = unicodedata.normalize("NFKC", str(instruction or ""))
+    text = str(instruction or "")
     to_folded = re.sub(r"\s+", "", unicodedata.normalize("NFKC", "".join(to_lines)))
     for match in _STAFF_LINE_RE.finditer(text):
         name = match.group(1).strip()
         if _HONORIFIC_AFTER_RE.match(text[match.end():]) or _NAME_HONORIFIC_END_RE.search(name):
             continue  # 「担当：坪田 美鈴様」は先方の担当者
         name = _NAME_TRAILER_RE.sub("", name).strip()
-        folded = re.sub(r"\s+", "", name)
+        folded = re.sub(r"\s+", "", unicodedata.normalize("NFKC", name))
         if not folded or re.search(r"\d", folded) or _ORG_WORD_RE.search(folded):
             continue
         if folded in to_folded:
@@ -820,7 +823,7 @@ def _explicit_staff(instruction: str, to_lines: list[str]) -> str:
         recipient_at = max((m.end() for m in _RECIPIENT_MARK_RE.finditer(before)), default=-1)
         if sender_at <= recipient_at:
             continue  # 目印が無い、または宛先側の話
-        return re.sub(r"\s+", " ", name)
+        return name
     return ""
 
 

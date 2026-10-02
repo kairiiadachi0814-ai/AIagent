@@ -1108,10 +1108,11 @@ class TestSenderStaff:
         runner = DocBuildRunner(make_config(tmp_path), client=fake_client(self.RAKUTENKEN_FIELDS))
         reply, meta, _ = runner.run(self.RAKUTENKEN_REQUEST, requester_name="福本　明日香 (休)土日祝")
         joined = "\n".join(docx_texts(meta["artifact"][1]))
-        assert "担当： 森 美明" in joined and "福本" not in joined
+        # 名前は依頼文に書かれたとおり（姓名の間は全角空白。正しい版の送付状と同じ）
+        assert "担当： 森　美明" in joined and "福本" not in joined
         assert "坪田 美鈴様" in joined  # 宛先の担当者はそのまま
-        assert meta["staff_override"] == "森 美明"
-        assert "担当者は「森 美明」で作成しています" in reply  # 依頼者以外の名前は黙って通さない
+        assert meta["staff_override"] == "森　美明"
+        assert "担当者は「森　美明」で作成しています" in reply  # 依頼者以外の名前は黙って通さない
 
     @pytest.mark.parametrize(
         "instruction, to_person",
@@ -1136,7 +1137,7 @@ class TestSenderStaff:
     @pytest.mark.parametrize(
         "instruction, expected",
         [
-            ("差出人は、RAKUTENKEN株式会社\n担当：森　美明", "森 美明"),
+            ("差出人は、RAKUTENKEN株式会社\n担当：森　美明", "森　美明"),  # 書かれたとおり（全角空白）
             ("差出人はRAKUTENKEN株式会社、担当は森でお願いします", "森"),
             ("当社担当：森 美明です。宛先は株式会社A", "森 美明"),
             ("宛先は株式会社A\n担当：坪田　美鈴様\n差出人は当社\n担当者：森", "森"),
