@@ -229,6 +229,20 @@ ssh -i C:\Users\admin\.ssh\raizuinu_vps ubuntu@tk2-262-40529.vs.sakura.ne.jp "su
   差し込み失敗は `doc_build_failed`）。設定は `config.json` の `doc_build`
 - コストは項目抽出の1回だけ（ハンドブックを載せない軽量フロー。1件あたり数円）
 
+## 自動更新されたハンドブックの取り込み（2026-10-07追加・FR-14）
+
+マニュアルリンク集の更新と新しいマニュアルの転記は、管理者ルームで「承認」すると VPS の
+`/var/lib/raizuinu/handbook/` に書かれる（同名のファイルはリポジトリ側より優先して読まれる）。
+リポジトリにも残すには、作業PCで次を実行してコミットする（承認済みの分だけが置かれている）。
+
+```bash
+scp -i ~/.ssh/raizuinu_vps 'ubuntu@tk2-262-40529.vs.sakura.ne.jp:/var/lib/raizuinu/handbook/*.md' .
+```
+
+- 取り込み先の指定は `config/config.json` の `handbook_sync`（目次シートのID・ファイル名・転記しないタブ・転記の可否）
+- すぐ試す: `sudo -u raizuinu env PYTHONPATH=/opt/raizuinu/app/src RAIZUINU_STATE_DIR=/var/lib/raizuinu ... python -m raizuinu.linksync --now`（`--dry-run` で投稿せず違いだけ表示）
+- 状態は `/var/lib/raizuinu/handbook_sync.json`（提案中の控え・転記済み・見送りの記録）
+
 ## コストの実測・目安
 
 claude-opus-5での実測（2026-08-13、変更前）:

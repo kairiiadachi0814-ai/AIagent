@@ -256,6 +256,18 @@ _DEFAULTS: dict[str, Any] = {
         # 済んだ・取り消した控えを残す日数
         "remember_days": 60,
     },
+    # マニュアルリンク集の自動更新と、新しいマニュアルの転記ファイルの自動作成（linksync.py）。
+    # 目次シート（collections）を毎日 check_time 以降に1回取り込み、違いがあれば更新した
+    # ファイルを管理者ルームへ添付して提示し、「承認」で反映する。新しいGoogleドキュメントの
+    # マニュアルは本文を取り込んで転記ファイルを作り、同じく承認を経て加える。
+    # 反映先は state_dir/handbook（Config.handbook_roots の先頭。同名はリポジトリ側より優先）
+    "handbook_sync": {
+        "enabled": False,
+        "check_time": "07:30",
+        # name・spreadsheet_id・file（リンク集のファイル名）・title・skip_sheets（転記しないタブ）・notes（冒頭の注記）
+        "collections": [],
+        "transcribe": {"enabled": True, "max_per_run": 3, "max_source_chars": 120000},
+    },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {
         "enabled": False,
@@ -308,6 +320,20 @@ class Config:
     def resolve_path(self, relative: str) -> Path:
         p = Path(relative)
         return p if p.is_absolute() else self.base_dir / p
+
+    @property
+    def handbook_sync_dir(self) -> Path:
+        """自動更新されたハンドブック（承認済み）の置き場。状態ディレクトリ配下"""
+        return self.resolve_path(self.state_dir) / "handbook"
+
+    @property
+    def handbook_roots(self) -> list[Path]:
+        """ハンドブックの参照ルート。自動更新が有効なら、その置き場を先頭に置く
+        （同名のファイルはそちらを優先。HandbookLoader は先に見つかった方を採る）"""
+        roots = [self.resolve_path(r) for r in self.handbook["roots"]]
+        if (self.data.get("handbook_sync") or {}).get("enabled"):
+            roots = [self.handbook_sync_dir] + roots
+        return roots
 
     # --- 秘密情報（環境変数のみ。コード・設定ファイルへの直書き禁止） ---
 

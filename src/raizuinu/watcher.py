@@ -95,7 +95,7 @@ class DiscussionWatcher:
             prompt_cache_ttl=cfg.prompt_cache_ttl,
         )
         self._handbook_loader = handbook_loader or HandbookLoader(
-            roots=[cfg.resolve_path(r) for r in cfg.handbook["roots"]],
+            roots=cfg.handbook_roots,
             include=cfg.handbook["include"],
             exclude=cfg.handbook["exclude"],
             cache_ttl_seconds=cfg.handbook_cache_ttl_seconds,
@@ -372,6 +372,12 @@ def main() -> None:
         DeadlineFollower(config, chatwork).run_once()
     except Exception:
         print("[error] 期日の進捗確認に失敗: " + traceback.format_exc(), flush=True)
+    try:
+        from .linksync import HandbookSync
+
+        HandbookSync(config, chatwork).run_once()  # 1日1回だけ動く（check_time 以降）
+    except Exception:
+        print("[error] マニュアルリンク集の取り込みに失敗: " + traceback.format_exc(), flush=True)
     DiscussionWatcher(config, chatwork=chatwork).run_once()
 
 

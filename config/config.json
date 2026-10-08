@@ -154,6 +154,33 @@
     "overdue_days": 3,
     "remember_days": 60
   },
+  "handbook_sync": {
+    "enabled": true,
+    "_note": "マニュアルリンク集の目次シートを毎日 check_time 以降に1回取り込み、違いがあれば更新したファイルを管理者ルームへ添付して提示（「承認」で反映、「取りやめ」で見送り）。目次に新しいGoogleドキュメントのマニュアルが現れたら本文を取り込んで転記ファイルを作り、同じく承認を経てハンドブックに加える。元シート・原本は「リンクを知っている全員が閲覧可」の共有が前提。反映先は /var/lib/raizuinu/handbook（同名はリポジトリ側より優先）。すぐ試すには python -m raizuinu.linksync --now（--dry-run で投稿せず確認）",
+    "check_time": "07:30",
+    "collections": [
+      {
+        "name": "ライズ経理財務",
+        "spreadsheet_id": "1CTUOjMcUzpTUpy6iP69jvYR1O_-M3lOsCTz6C5Ug2IA",
+        "file": "マニュアルリンク集_ライズ経理財務.md",
+        "title": "ライズマニュアルリンク集（経理財務 目次）",
+        "skip_sheets": [],
+        "notes": [],
+        "transcribe": true
+      },
+      {
+        "name": "楽天軒",
+        "spreadsheet_id": "1IcRXd3UPGFHUwIjlnWtp1HYLwF26OEJ8lhlh7SYUkfI",
+        "file": "マニュアルリンク集_楽天軒.md",
+        "title": "楽天軒マニュアルリンク集（目次）",
+        "skip_sheets": ["連絡先"],
+        "notes": ["注意: 元シートに含まれる認証情報（ID・パスワード類）は本ファイルには転記していない（認証情報は管理者に確認すること）。連絡先のタブも転記していない"],
+        "_transcribe_note": "楽天軒のマニュアルはリンクの案内だけ（本文の転記はしない。経理財務部のハンドブックに楽天軒の全マニュアルを載せると回答のたびに読む量と費用が膨らむため）。転記したい場合は true にする",
+        "transcribe": false
+      }
+    ],
+    "transcribe": { "enabled": true, "max_per_run": 3, "max_source_chars": 120000 }
+  },
   "discussion_watch": {
     "enabled": true,
     "room_ids": [

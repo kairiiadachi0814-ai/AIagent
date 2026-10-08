@@ -82,7 +82,7 @@ class RaizuinuHandler:
         cfg = self._config
 
         self._handbook_loader = overrides.get("handbook_loader") or HandbookLoader(
-            roots=[cfg.resolve_path(r) for r in cfg.handbook["roots"]],
+            roots=cfg.handbook_roots,
             include=cfg.handbook["include"],
             exclude=cfg.handbook["exclude"],
             cache_ttl_seconds=cfg.handbook_cache_ttl_seconds,
@@ -175,6 +175,12 @@ class RaizuinuHandler:
             from .announce import Announcer
 
             self._announcer = Announcer(cfg, self._chatwork)
+        # マニュアルリンク集の更新・新しいマニュアルの転記への「承認」「取りやめ」「直し」（管理者ルームだけ）
+        self._handbook_sync = overrides.get("handbook_sync")
+        if self._handbook_sync is None and cfg.admin_room_id and (cfg.data.get("handbook_sync") or {}).get("enabled"):
+            from .linksync import HandbookSync
+
+            self._handbook_sync = HandbookSync(cfg, self._chatwork, cost=self._cost)
         # 通知管理くんのメンションを合図に、その場でFAXを読みに行く（5分の巡回を待たない）
         self._fax_watch_factory = overrides.get("fax_watch_factory")
         if self._fax_watch_factory is None and (cfg.fax_watch or {}).get("enabled"):
@@ -364,6 +370,21 @@ class RaizuinuHandler:
             handled = self._announcer.handle(event.room_id, event.account_id, question)
             if handled is not None:
                 self._reply_and_audit(event, question, handled, "announce")
+                return
+
+        # ハンドブックの自動更新（リンク集・新しいマニュアルの転記）への返事（管理者ルームだけ。提案が無ければ素通り）
+        if self._handbook_sync is not None:
+            from .doctask import reply_target
+
+            handled = self._handbook_sync.handle(
+                event.room_id, event.account_id, question, reply_to=reply_target(event.body or "")
+            )
+            if handled is not None:
+                try:
+                    self._handbook_loader.load(force=True)  # 反映した分を次の回答から使う
+                except Exception:
+                    print("[warn] ハンドブックの読み直しに失敗: " + traceback.format_exc(), flush=True)
+                self._reply_and_audit(event, question, handled, "handbook_sync")
                 return
 
         # レターパック手配のやり取りの続き（要否の返事・文面の確認・総務への回答）。
