@@ -351,6 +351,19 @@ class TestProposingToTheAdmin:
         assert s.run_once() == 0  # 提案が残っている間は出し直さない
         assert len(s._chatwork.sent) == 2
 
+    def test_the_day_is_marked_before_the_slow_work_starts(self, tmp_path):
+        # 実例（2026-10-08）: 手動実行の転記（数分）の途中で5分ごとの巡回が同じ日の分を始め、同じ提案が2通出た
+        s = syncer(tmp_path)
+
+        def boom(url, timeout=60):
+            raise RuntimeError("network down")
+
+        s._http_get = boom
+        assert s.run_once() == 0
+        assert s._load()["last_checked"] == "2026-10-07"  # 取り込みに失敗しても、今日の分は始めたと記録
+        s._http_get = fake_http(build_xlsx([RISE_SHEET]), {DOC_NEW: "x"})
+        assert s.run_once() == 0  # 同じ日にもう一度は見ない（別の実行が重ならない）
+
     def test_already_transcribed_manuals_are_not_proposed_again(self, tmp_path):
         s = syncer(tmp_path)
         s.run_once()

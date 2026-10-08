@@ -441,10 +441,41 @@ class HandbookSync:
         return dict(self._config.handbook_sync or {})
 
     def run_once(self, force: bool = False, dry_run: bool = False) -> int:
-        """1日1回、目次シートを取り込んで提案を出す。→ 出した提案の数（dry_run は出さない）。"""
+        """1日1回、目次シートを取り込んで提案を出す。→ 出した提案の数（dry_run は出さない）。
+
+        手動実行（--now）と5分ごとの巡回が重ならないよう、状態ファイルのロックで直列にし、
+        取り込みを始める前に「今日は見た」と記録する（実例 2026-10-08: 同じ転記の提案が
+        2通出た。転記には数分かかり、その間に巡回が同じ日の分を始めていた）。
+        """
         settings = self.settings
         if not settings.get("enabled"):
             return 0
+        with self._locked():
+            return self._run_once_locked(settings, force, dry_run)
+
+    def _locked(self):
+        """状態ファイルのロック（Linuxの flock。無い環境では何もしない）。"""
+        import contextlib
+
+        try:
+            import fcntl
+        except ImportError:  # Windows（テスト環境）
+            return contextlib.nullcontext()
+
+        @contextlib.contextmanager
+        def lock():
+            path = self._state_path.with_suffix(".lock")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+
+        return lock()
+
+    def _run_once_locked(self, settings: dict, force: bool, dry_run: bool) -> int:
         now = self._now()
         state = self._load()
         today = now.date().isoformat()
@@ -453,6 +484,9 @@ class HandbookSync:
             hour, minute = (int(x) for x in clock.split(":"))
             if state.get("last_checked") == today or now < now.replace(hour=hour, minute=minute, second=0, microsecond=0):
                 return 0
+        if not dry_run:
+            state["last_checked"] = today  # 取り込みを始める前に記録（長い転記の途中で別の実行が始まらないように）
+            self._save(state)
         proposals = 0
         pending_files = {p.get("filename") for p in state.get("proposals") or []}
         all_items: list[tuple[dict, LinkItem]] = []
@@ -486,7 +520,6 @@ class HandbookSync:
             proposals += 1
         proposals += self._propose_new_manuals(state, all_items, now, dry_run)
         if not dry_run:
-            state["last_checked"] = today
             self._save(state)
         return proposals
 
