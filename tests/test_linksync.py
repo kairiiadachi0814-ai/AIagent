@@ -205,7 +205,10 @@ def syncer(tmp_path, now=datetime(2026, 10, 7, 8, 0, tzinfo=JST), docs=None, cli
     s = HandbookSync(
         make_config(tmp_path), FakeChatwork(),
         client=client or fake_client(),
-        http_get=fake_http(build_xlsx(sheets or [RISE_SHEET]), docs or {DOC_NEW: "新しい手順書\n\n1. 取得する\n2. 保存する"}),
+        http_get=fake_http(
+            build_xlsx(sheets or [RISE_SHEET]),
+            docs if docs is not None else {DOC_NEW: "新しい手順書\n\n1. 取得する\n2. 保存する"},
+        ),
         now=clock,
     )
     s.clock = clock
@@ -354,6 +357,19 @@ class TestProposingToTheAdmin:
         titles = [p.get("title") for p in s.pending() if p["kind"] == "transcript"]
         assert titles == ["新しい手順書"]  # 請求書処理１ は出典が既にある
 
+    def test_an_unreadable_manual_is_noted_and_not_retried_every_day(self, tmp_path):
+        # 実例（2026-10-08）: 「YR経費精算処理マニュアル」が「リンクを知っている全員」の共有でなく読めなかった
+        s = syncer(tmp_path, docs={})  # 原本が読めない
+        assert s.run_once() == 1  # リンク集の提案だけ
+        state = s._load()
+        assert DOC_NEW in state["unreachable"] and state["unreachable"][DOC_NEW]["count"] == 1
+        s.clock.now = datetime(2026, 10, 9, 8, 0, tzinfo=JST)
+        s.run_once()
+        assert s._load()["unreachable"][DOC_NEW]["count"] == 1  # 7日は試し直さない
+        s.clock.now = datetime(2026, 10, 16, 8, 0, tzinfo=JST)
+        s.run_once()
+        assert s._load()["unreachable"][DOC_NEW]["count"] == 2
+
     def test_a_links_only_collection_gets_no_transcripts(self, tmp_path):
         # 楽天軒の目次はリンクの案内だけ（本文の転記はしない）
         s = syncer(tmp_path)
@@ -425,8 +441,16 @@ class TestApproval:
         assert s.handle(384793683, ADMIN, "承認") is None
         assert s.handle(ADMIN_ROOM, 9228914, "承認") is None
         assert s.handle(ADMIN_ROOM, ADMIN, "今日の予定は？") is None  # 承認でも取りやめでもない一言
-        assert s.handle(ADMIN_ROOM, ADMIN, "承認", reply_to="123456") is None  # 別の投稿への返事
+        assert s.handle(ADMIN_ROOM, ADMIN, "OKです", reply_to="123456") is None  # 別の投稿への緩い返事
         assert len(s.pending()) == 2
+
+    def test_a_clear_approval_on_an_unknown_reply_target_still_counts(self, tmp_path):
+        # 添付の投稿のIDが控えられないことがあるので、「承認」とはっきり書かれていれば受ける
+        s = self.approved(tmp_path)
+        reply = s.handle(ADMIN_ROOM, ADMIN, "承認", reply_to="123456")
+        assert reply.startswith("どの件のお返事か分からなかったので")  # 2件あるので番号を聞く
+        s.handle(ADMIN_ROOM, ADMIN, "取りやめ", reply_to=s.pending()[1]["ids"][0])
+        assert "反映しました" in s.handle(ADMIN_ROOM, ADMIN, "承認", reply_to="123456")  # 残り1件なら通す
 
     def test_nothing_pending_means_nothing_to_handle(self, tmp_path):
         s = HandbookSync(make_config(tmp_path), FakeChatwork(), client=fake_client(), http_get=fake_http(b"", {}))

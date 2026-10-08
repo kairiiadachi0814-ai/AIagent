@@ -53,6 +53,8 @@ SECRET_PLACEHOLDER = "（認証情報は転記しない）"
 
 _APPROVE_RE = re.compile(r"(承認|反映して|反映お願い|送信|OK|オーケー|お願いします|問題な[いし]|大丈夫|進めて)", re.I)
 _CANCEL_RE = re.compile(r"(取りやめ|取り止め|見送|やめ|キャンセル|却下|不要|中止|ボツ)")
+# 提案の投稿ではなく添付の投稿（IDを控えられないことがある）への返信でも通す、はっきりした言い方
+_STRICT_RE = re.compile(r"(承認|反映|取りやめ|取り止め|見送)")
 
 _SHEET_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 _REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
@@ -504,11 +506,11 @@ class HandbookSync:
         target = None
         if reply_to:
             target = next((p for p in pending if str(reply_to) in [str(i) for i in p.get("ids") or []]), None)
-            if target is None:
-                return None  # 別の投稿への返事
-        elif len(pending) == 1:
+            if target is None and not _STRICT_RE.search(text):
+                return None  # 別の投稿への返事（「承認」「取りやめ」とはっきり書かれていれば、添付の投稿への返信として扱う）
+        if target is None and len(pending) == 1 and (_APPROVE_RE.search(text) or _CANCEL_RE.search(text)):
             target = pending[0]
-        else:
+        if target is None:
             picked = re.search(r"(\d+)", unicodedata.normalize("NFKC", text))
             if picked and 1 <= int(picked.group(1)) <= len(pending):
                 target = pending[int(picked.group(1)) - 1]
@@ -592,6 +594,13 @@ class HandbookSync:
         known |= set((state.get("transcribed") or {}).keys())
         known |= set((state.get("declined") or {}).keys())
         known |= {str(p.get("doc_id")) for p in state.get("proposals") or [] if p.get("doc_id")}
+        # 読めなかった原本（共有設定が「リンクを知っている全員」でない等）は、しばらく置いてから試し直す
+        retry_after = timedelta(days=int(settings.get("unreachable_retry_days", 7)))
+        unreachable = state.get("unreachable") or {}
+        for doc_id, info in unreachable.items():
+            tried = _parse_iso(info.get("at"))
+            if tried and now - tried < retry_after:
+                known.add(doc_id)
         seen: set[str] = set()
         candidates: list[tuple[dict, LinkItem]] = []
         for collection, item in all_items:
@@ -611,7 +620,17 @@ class HandbookSync:
                 print(f"[dry-run] 新しいマニュアル: {collection.get('name')}／{item.section}「{item.name}」 {item.url}", flush=True)
                 continue
             try:
-                text = self._fetch_document(item.doc_id)
+                try:
+                    text = self._fetch_document(item.doc_id)
+                except Exception as exc:
+                    state.setdefault("unreachable", {})[item.doc_id] = {
+                        "title": item.name, "url": item.url, "at": now.isoformat(),
+                        "count": int(unreachable.get(item.doc_id, {}).get("count", 0)) + 1,
+                        "error": str(exc)[:200],
+                    }
+                    self._save(state)
+                    print(f"[warn] 原本を読めませんでした: {item.name} {item.url} — {exc}", flush=True)
+                    continue
                 proposal = {
                     "kind": "transcript",
                     "kind_label": "新しいマニュアルの転記",
@@ -688,16 +707,24 @@ class HandbookSync:
         )
 
     def _find_own_messages(self, room_id: int, filename: str, after: str) -> list[str]:
-        """添付の投稿（アップロードAPIはIDを返さない）を、直近の発言から拾う。"""
+        """添付の投稿（アップロードAPIはIDを返さない）を、直近の発言から拾う（少し待って3回まで）。"""
+        import time
+
         try:
             me = int(self._chatwork.get_me())
-            found = []
-            for message in self._chatwork.get_recent_messages(room_id, limit=20):
-                account = (message.get("account") or {}).get("account_id")
-                mid = str(message.get("message_id", ""))
-                if int(account or 0) == me and filename in str(message.get("body", "")) and mid != after:
-                    found.append(mid)
-            return found[-1:]
+            inner = getattr(self._chatwork, "_client", None) or self._chatwork  # 巡回のキャッシュを通さず取り直す
+            for attempt in range(3):
+                found = []
+                for message in inner.get_recent_messages(room_id, limit=20):
+                    account = (message.get("account") or {}).get("account_id")
+                    mid = str(message.get("message_id", ""))
+                    if int(account or 0) == me and filename in str(message.get("body", "")) and mid != after:
+                        found.append(mid)
+                if found:
+                    return found[-1:]
+                if attempt < 2:
+                    time.sleep(1.5)
+            return []
         except Exception:
             return []
 
@@ -797,6 +824,14 @@ class HandbookSync:
             AuditLogger(log_dir=cfg.resolve_path(cfg.audit_log_dir), retention_days=cfg.audit_log_retention_days).log(record)
         except Exception:
             print("[warn] 監査ログの記録に失敗: " + traceback.format_exc(), flush=True)
+
+
+def _parse_iso(text: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(text))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=JST)
 
 
 def content_hash(text: str) -> str:
