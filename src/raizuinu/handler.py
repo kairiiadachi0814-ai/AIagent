@@ -515,7 +515,25 @@ class RaizuinuHandler:
                     )
                     return
             if document is not None:
-                self._process_doc_task(event, question, document)
+                from .doctask import reply_target, thread_context
+
+                # 返信の連なりなら、これまでのやり取りを文脈として渡し、前に読んだ文書も一緒に見る
+                # （実例 2026-10-26: 印紙税の話の途中で原契約が添付され、無関係な要点整理を返した）
+                context = ""
+                if reply_target(event.body or ""):
+                    context = thread_context(event.body or "", messages, bot_account_id=event.to_account_id)
+                    if (
+                        self._doc_memory is not None
+                        and document.get("kind") == "chatwork_file"
+                        and not document.get("recalled")
+                    ):
+                        earlier = self._doc_memory.thread_files(event.room_id, event.body or "", int(event.send_time))
+                        have = {f.get("file_id") for f in document.get("files") or []}
+                        extra = [f for f in earlier if f.get("file_id") not in have]
+                        if extra:
+                            files = (extra + list(document.get("files") or []))[-5:]
+                            document = {**document, "files": files, "total_files": len(files), "continued": True}
+                self._process_doc_task(event, question, document, context=context)
                 return
         # 生成直前に上限を再確認（コンテキスト取得の間に他リクエストが計上した分を反映）
         status = self._cost.status()
@@ -1146,8 +1164,11 @@ class RaizuinuHandler:
             print("[warn] コスト計上に失敗: " + traceback.format_exc(), flush=True)
             return None
 
-    def _process_doc_task(self, event: MentionEvent, question: str, document: dict) -> None:
-        """文書つき依頼を処理して返信する（ハンドブック・出典検証は使わない）。"""
+    def _process_doc_task(self, event: MentionEvent, question: str, document: dict, context: str = "") -> None:
+        """文書つき依頼を処理して返信する（ハンドブック・出典検証は使わない）。
+
+        context は返信の連なりでたどった「これまでのやり取り」。あれば論点の続きとして扱う。
+        """
         from .answer import sanitize_for_chatwork
 
         # 生成直前の上限再確認（Q&Aフローと同じ扱い）
@@ -1161,7 +1182,7 @@ class RaizuinuHandler:
             )
             return
 
-        reply_text, meta, usage = self._doc_task.run(question, document, event.room_id)
+        reply_text, meta, usage = self._doc_task.run(question, document, event.room_id, context=context)
 
         status = None
         try:

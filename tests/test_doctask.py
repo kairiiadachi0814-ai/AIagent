@@ -638,6 +638,56 @@ class TestHandlerIntegration:
         assert ".docx" in sent  # 依頼の仕方を案内
         assert audit.records[0]["type"] == "doc_task_not_found"
 
+    def test_an_attachment_sent_mid_thread_keeps_the_topic(self, tmp_path, monkeypatch):
+        """実例（2026-10-26 18:43〜18:49）: 「この契約書の印紙税は？」→ 回答 → 「原契約では単価が
+        1,051円…」→ 回答（原契約があれば突き合わせます）→ 「原契約は添付データ。」と添付。
+        ここで論点と無関係な契約書の要点整理を返した。やり取りを文脈として渡し、前の文書も一緒に見る。
+        """
+        import base64, hashlib, hmac
+
+        handler, chatwork, generator, audit, token = self._make(tmp_path, monkeypatch)
+        ids = iter(["9001", "9002", "9003"])
+        sent_ids = []
+
+        def send(room_id, body):
+            chatwork.sent.append((room_id, body))
+            sent_ids.append(next(ids))
+            return sent_ids[-1]
+
+        chatwork.send_message = send
+
+        def post(message_id, body_text):
+            body = json.dumps({
+                "webhook_event_type": "mention_to_me",
+                "webhook_event": {
+                    "from_account_id": 111, "to_account_id": 999,
+                    "room_id": 12345, "message_id": message_id,
+                    "body": body_text, "send_time": 1700000000,
+                },
+            }).encode()
+            digest = hmac.new(base64.b64decode(token), body, hashlib.sha256).digest()
+            handler.handle_webhook(body, base64.b64encode(digest).decode())
+            # 次の投稿が返信の連なりをたどれるよう、やり取りを直近の発言に積む
+            chatwork.messages.append({"message_id": message_id, "account": {"account_id": 111, "name": "足立 海里"}, "body": body_text})
+            chatwork.messages.append({"message_id": sent_ids[-1], "account": {"account_id": 999, "name": "経理財務アシスタント"}, "body": chatwork.sent[-1][1]})
+
+        post("8001", "[To:999] この契約書の印紙税は？ [download:5555]合意解約書.pdf (505 KB)[/download]")
+        assert audit.records[-1]["type"] == "doc_task"
+        post("8002", "[rp aid=999 to=12345-9001] 原契約では、時間当たり1,051円のタイムチャージ方式で計算しているが、解除契約書では1,107円で計算している。")
+        assert audit.records[-1]["type"] == "doc_task"  # 覚えている合意解約書を見に行く
+        post("8003", "[rp aid=999 to=12345-9002][To:999] 原契約は添付データ。[download:6666]業務委託契約_稲田様.pdf (412 KB)[/download]")
+        assert audit.records[-1]["type"] == "doc_task"
+        client = handler._doc_task._client
+        prompt = user_text(client)
+        assert "これまでのやり取り（古い順。今回の依頼はこの続き）" in prompt
+        assert "この契約書の印紙税は？" in prompt and "1,051円" in prompt  # 最初の論点と、その後の指摘
+        assert "（添付: 合意解約書.pdf）" in prompt
+        assert prompt.count("■ファイル「") == 2  # 前の文書（合意解約書）と今回の原契約の両方を渡す
+        assert "論点に戻って答える" in client.kwargs["system"]
+        assert "要点整理や要約を始めない" in client.kwargs["system"]
+        files = json.loads((tmp_path / "state" / "room_documents.json").read_text(encoding="utf-8"))["12345"]["files"]
+        assert [f["file_id"] for f in files] == [5555, 6666]  # 以後の続きでは両方を見る
+
     # --- ヘルパー ---
 
     def _make(self, tmp_path, monkeypatch):
@@ -736,6 +786,73 @@ class TestHandlerIntegration:
         assert generator.calls == []
         assert "倉庫寄託契約書" in chatwork.sent[-1][1]
         assert "添付" not in chatwork.sent[-1][1].split("※")[0]
+
+
+class TestThreadContinuation:
+    """返信の連なりの途中で文書が添付されたら、論点の続きとして扱う（指摘 2026-10-26）。"""
+
+    THREAD = [
+        {"message_id": "8001", "account": {"account_id": 111, "name": "足立 海里"},
+         "body": "[To:999] この契約書の印紙税は？ [download:5555]合意解約書.pdf (505 KB)[/download]"},
+        {"message_id": "9001", "account": {"account_id": 999, "name": "経理財務アシスタント"},
+         "body": "[rp aid=111 to=12345-8001]\nご質問の件、確認しました。" + "第7号文書に当たる可能性があります。" * 40},
+        {"message_id": "8002", "account": {"account_id": 111, "name": "足立 海里"},
+         "body": "[rp aid=999 to=12345-9001] 原契約では、時間当たり1,051円で計算している。"},
+        {"message_id": "9002", "account": {"account_id": 999, "name": "経理財務アシスタント"},
+         "body": "[rp aid=111 to=12345-8002]\n拝見しました。原契約もお手元にあれば、追加で共有いただければ突き合わせます。"},
+        {"message_id": "7777", "account": {"account_id": 222, "name": "坂田"}, "body": "別の話です"},
+    ]
+
+    def test_thread_context_follows_the_reply_chain_oldest_first(self):
+        from raizuinu.doctask import thread_context
+
+        body = "[rp aid=999 to=12345-9002][To:999] 原契約は添付データ。[download:6666]業務委託契約.pdf (412 KB)[/download]"
+        context = thread_context(body, self.THREAD, bot_account_id=999)
+        lines = context.split("\n")
+        assert lines[0].startswith("[足立] この契約書の印紙税は？（添付: 合意解約書.pdf）")
+        assert lines[1].startswith("[アシスタント] ご質問の件、確認しました。") and lines[1].endswith("…")  # 長い回答は切る
+        assert lines[2] == "[足立] 原契約では、時間当たり1,051円で計算している。"
+        assert lines[3].startswith("[アシスタント] 拝見しました。原契約もお手元にあれば")
+        assert "別の話です" not in context  # 連なりに無い発言は入れない
+        assert thread_context("[To:999] 新しい依頼", self.THREAD, bot_account_id=999) == ""  # 返信でなければ無し
+        assert thread_context("[rp aid=999 to=12345-6000] 返信先が古すぎる", self.THREAD, bot_account_id=999) == ""
+
+    def test_the_runner_hands_the_conversation_to_the_model_and_keeps_stamp_duty_in_scope(self, tmp_path):
+        u1 = "https://www.nta.go.jp/taxes/shiraberu/taxanswer/inshi/7140.htm"
+        (tmp_path / "税法リンク集_国税庁.md").write_text(
+            f"# 税法\n| No.7140 印紙税額の一覧表（その1） | 印紙 | {u1} |\n", encoding="utf-8"
+        )
+        runner, client = make_runner(tmp_path, docx_data=make_docx([CONTRACT_TEXT]))
+        runner._config.base_dir = tmp_path
+        runner._config.data["handbook"] = {"roots": ["."], "include": ["*.md"], "exclude": []}
+        runner._config.data["web_fetch_enabled"] = True
+        context = "[足立] この契約書の印紙税は？（添付: 合意解約書.pdf）\n[アシスタント] 第7号文書の可能性\n[足立] 原契約では単価が違う"
+        _, meta, _ = runner.run("原契約は添付データ。", file_doc(filename="業務委託契約書.docx"), 12345, context=context)
+        prompt = user_text(client)
+        assert prompt.index("これまでのやり取り") < prompt.index("依頼: 原契約は添付データ。") < prompt.index("ここから===")
+        assert "印紙税は？" in prompt
+        system = client.kwargs["system"]
+        assert "論点に戻って答える" in system and "突き合わせて答える" in system
+        assert client.kwargs["tools"][0]["allowed_domains"] == ["www.nta.go.jp"]  # 依頼文に無くても、やり取りで印紙税を聞かれている
+        assert "号文書" in system
+        assert meta["context_chars"] == len(context)
+
+    def test_without_a_thread_nothing_changes(self, tmp_path):
+        runner, client = make_runner(tmp_path)
+        runner.run("議事録にして", file_doc(), 12345)
+        assert "これまでのやり取り" not in user_text(client)
+        assert "論点に戻って答える" not in client.kwargs["system"]
+
+    def test_thread_files_come_back_only_for_a_reply_in_the_chain(self, tmp_path):
+        from raizuinu.doctask import DocumentMemory
+
+        memory = DocumentMemory(tmp_path / "m.json", ttl_minutes=60)
+        memory.remember(12345, file_doc(5555, "合意解約書.pdf"), ["8001", "9001"], now=1000)
+        assert memory.thread_files(12345, "[rp aid=999 to=12345-9001] 原契約は添付データ。", 1100) == [{"file_id": 5555, "filename": "合意解約書.pdf"}]
+        assert memory.thread_files(12345, "[To:999] 原契約は添付データ。", 1100) == []  # 返信でない
+        assert memory.thread_files(12345, "[rp aid=999 to=12345-7000] x", 1100) == []  # 別の連なり
+        assert memory.thread_files(99999, "[rp aid=999 to=12345-9001] x", 1100) == []  # 別のルーム
+        assert memory.thread_files(12345, "[rp aid=999 to=12345-9001] x", 1000 + 3601) == []  # 期限切れ
 
 
 class TestDocumentMemory:

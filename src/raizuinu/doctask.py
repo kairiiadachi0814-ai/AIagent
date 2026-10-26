@@ -122,6 +122,7 @@ SYSTEM_PROMPT = """あなたは株式会社ライズクリエイションの社�
 - **待たせていないのに詫びない。**「お待たせしました」「遅くなりました」は、実際に時間がかかったときだけ使うこと。依頼を受けてすぐ返す場面で使うと、取ってつけた言い方になる。
 - ただし**言い方を変えてよいのは書き出しの一言だけ**である。文書から写した数値・日付・人名・条番号・金額、どの文書に基づいたかの断り書きは、言い換えたり省いたりせず毎回同じ厳密さで書くこと。
 - 依頼者のメッセージに質問や補足の相談が含まれている場合は、成果物のあとに短く答えること。
+- **会話の続き（返信）で文書が添付されたときは、それまでのやり取りの論点に答えること。**「要点をまとめて」と頼まれていないのに、文書の要点整理や要約を始めない。前に読んだ文書があれば、新しい文書と突き合わせて論点（最初の質問と、その後に出た指摘）に答える。
 - 話し方は、気さくで頼れる経理の先輩のようなです・ます調（かしこまりすぎない）。冒頭の一言以外に長い前置きや締めの挨拶は不要。
 - ChatworkはMarkdownを表示できない。見出しは「■」、箇条書きは「・」を使い、「- 」「**強調**」「#」等のMarkdown記法は使わないこと。
 - 出力は要点主義で、依頼に見合う長さにとどめる。"""
@@ -290,6 +291,51 @@ _REPLY_TAG_RE = re.compile(r"\[rp\s+aid=\d+\s+to=(\d+)-(\d+)\]")
 _NAME_TOKEN_RE = re.compile(r"[^\W\d_]{4,}", re.UNICODE)
 
 
+CONTINUATION_NOTE = """
+この依頼は、これまでのやり取り（返信の連なり）の続きである。次を守ること。
+- 答えるべきは、やり取りの中で出ている論点（最初の質問と、その後に出た指摘・疑問）。今回の添付は、その論点を確かめるための材料として渡されている
+- 今回のメッセージが「原契約は添付データ。」のように文書を渡すだけの短い文でも、要点整理や要約に切り替えず、論点に戻って答える（要点整理は明示的に頼まれたときだけ）
+- 前に読んだ文書と新しい文書の両方があれば、突き合わせて答える（どちらに何が書いてあるかを分けて示す）
+- やり取りの中でこちらが「原契約があれば突き合わせます」のように言っていた場合は、その約束どおりに答える
+"""
+
+
+def thread_context(body: str, messages: list[dict], bot_account_id: int | None = None, limit: int = 8) -> str:
+    """返信の連なりをたどって、これまでのやり取りを古い順の文にする（文書タスクの文脈に渡す）。
+
+    実例（2026-10-26）: 「この契約書の印紙税は？」→（回答）→「原契約では単価が違う」→（回答）→
+    「原契約は添付データ。」と添付した返信に、論点と無関係な契約書の要点整理を返した。
+    返信先のメッセージが直近の発言に無ければ、たどれたところまでを返す。
+    """
+    from .webhook import strip_chatwork_tags
+
+    by_id = {str(m.get("message_id", "")): m for m in messages or []}
+    chain: list[dict] = []
+    target = reply_target(body)
+    seen: set[str] = set()
+    while target and target in by_id and target not in seen and len(chain) < limit:
+        seen.add(target)
+        message = by_id[target]
+        chain.append(message)
+        target = reply_target(str(message.get("body", "")))
+    if not chain:
+        return ""
+    lines: list[str] = []
+    for message in reversed(chain):  # 古い順
+        account = message.get("account") or {}
+        is_bot = bot_account_id is not None and int(account.get("account_id") or 0) == int(bot_account_id)
+        who = "アシスタント" if is_bot else str(account.get("name") or "依頼者").split()[0]
+        raw = _QUOTE_RE.sub("", str(message.get("body", "")))
+        attachments = [e["filename"] for e in _parse_file_entries(raw)]
+        text = re.sub(r"\s+", " ", strip_chatwork_tags(_FILE_TAG_RE.sub("", raw))).strip()
+        if len(text) > 600:
+            text = text[:600] + "…"
+        if attachments:
+            text += "（添付: " + "、".join(attachments) + "）"
+        lines.append(f"[{who}] {text}")
+    return "\n".join(lines)
+
+
 def reply_target(body: str) -> str:
     """Chatworkの「返信」が指しているメッセージID（返信でなければ空文字）。"""
     match = _REPLY_TAG_RE.search(str(body or ""))
@@ -356,6 +402,21 @@ class DocumentMemory:
             "ts": int(now),
         }
         self._save(data)
+
+    def thread_files(self, room_id: int, body: str, now: int) -> list[dict[str, Any]]:
+        """この返信が、覚えている文書のやり取りの続きなら、その文書（複数可）。違えば空。
+
+        新しい添付と一緒に渡し、前の文書と突き合わせて答えられるようにする
+        （実例 2026-10-26: 合意解約書の印紙税の話の途中で原契約が添付された）。
+        """
+        entry = self._load().get(str(room_id))
+        files = (entry or {}).get("files") or []
+        if not files or int(now) - int(entry.get("ts", 0)) > self._ttl:
+            return []
+        target = reply_target(body)
+        if target and target in (entry.get("message_ids") or []):
+            return [dict(f) for f in files]
+        return []
 
     def recall(
         self, room_id: int, question: str, body: str, now: int
@@ -468,13 +529,17 @@ class DocTaskRunner:
         self._pdf_pages: list[int] = []
 
     def run(
-        self, instruction: str, document: dict[str, Any], room_id: int
+        self, instruction: str, document: dict[str, Any], room_id: int, context: str = ""
     ) -> tuple[str, dict[str, Any], dict[str, int]]:
         """依頼を処理して (返信本文, 監査用メタ, usage) を返す。
 
+        context は、返信の連なりでたどった「これまでのやり取り」（古い順）。あれば、
+        今回の依頼をその続きとして扱い、論点に答えさせる。
         文書を取得できない場合も、利用者向けの案内文を返信本文として返す。
         """
         meta: dict[str, Any] = {"document": document}
+        if context:
+            meta["context_chars"] = len(context)
         self._pdfs: list[tuple[str, bytes]] = []  # この依頼で読み込んだPDF
         self._pdf_pages: list[int] = []
         if document.get("kind") == "unsupported_file":
@@ -504,7 +569,7 @@ class DocTaskRunner:
                 f"「{label}」を開いてみたのですが、中身のテキストを読み取れませんでした。"
                 "文字起こしの本文が入ったファイルかどうか、ご確認いただけますか。"
             ), meta, {}
-        reply, usage = self._generate(instruction, text, label, truncated)
+        reply, usage = self._generate(instruction, text, label, truncated, context)
         if notes:
             reply += "\n" + "\n".join(notes)
         return reply, meta, usage
@@ -633,7 +698,7 @@ class DocTaskRunner:
         return decode_text(data), label, []
 
     def _generate(
-        self, instruction: str, text: str, label: str, truncated: bool
+        self, instruction: str, text: str, label: str, truncated: bool, context: str = ""
     ) -> tuple[str, dict[str, int]]:
         from .answer import _call_with_continuation
 
@@ -646,11 +711,18 @@ class DocTaskRunner:
             else ""
         )
         system = SYSTEM_PROMPT.format(agent_name=cfg.agent_name)
-        user_parts = [f"依頼: {instruction}", note]
+        user_parts: list[str] = []
+        if context:
+            # 返信の連なりの続き。論点（最初の質問・その後の指摘）を先に渡し、今回の依頼はその続きと明示する
+            system += "\n" + CONTINUATION_NOTE
+            user_parts.append(
+                "これまでのやり取り（古い順。今回の依頼はこの続き）:\n" + context + "\n"
+            )
+        user_parts += [f"依頼: {instruction}", note]
 
         # 契約書の場合は要点の構成を指定し、法的な妥当性判断は行わせない。
-        # PDFは本文を持たないため、ファイル名・依頼文からも契約書らしさを判定する
-        contract_hint = label + " " + instruction
+        # PDFは本文を持たないため、ファイル名・依頼文・やり取りからも契約書らしさを判定する
+        contract_hint = label + " " + instruction + " " + context
         if looks_like_contract(text) or (
             self._pdfs and any(k in contract_hint for k in ("契約", "覚書", "注文請書", "印紙"))
         ):
@@ -661,10 +733,10 @@ class DocTaskRunner:
             "max_tokens": int(cfg.max_tokens),
             "output_config": {"effort": cfg.effort},
         }
-        # 印紙税を聞かれた場合のみ、国税庁の税額表を取得できるようにする
+        # 印紙税を聞かれた場合（やり取りの中で聞かれている場合を含む）のみ、国税庁の税額表を取得できるようにする
         stamp_urls = (
             stamp_table_urls(cfg)
-            if (wants_stamp_duty(instruction) and cfg.web_fetch_enabled)
+            if (wants_stamp_duty(instruction + " " + context) and cfg.web_fetch_enabled)
             else []
         )
         if stamp_urls:
