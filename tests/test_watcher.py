@@ -214,3 +214,37 @@ class TestIntervention:
         watcher.run_once()
         assert screen.calls == 0  # 上限到達日は評価もしない
         assert chatwork.sent == []
+
+
+class TestVerificationBudget:
+    """2段目（ハンドブック全文を載せる裏取り）の日次上限。"""
+
+    def test_verify_stops_at_the_daily_budget(self, tmp_path):
+        watcher, chatwork, generator, screen = make_watcher(
+            tmp_path, DISCUSSION, preset_last_seen=1
+        )
+        watcher._config.data["discussion_watch"]["max_verifications_per_day"] = 2
+
+        # 3回巡回させる。毎回「疑いあり」だが裏取りは2回で打ち止め
+        for round_no in range(3):
+            chatwork.messages = [
+                message(200 + round_no, 111, "坂田", "経費精算の締めは月末までですよね？")
+            ]
+            watcher.run_once()
+
+        assert len(generator.calls) == 2  # 3回目は裏取りに入らない
+        # 裏取りできないなら選別しても使い道が無いので、1段目も走らせない
+        assert screen.calls == 2
+        assert watcher._load_state(12345)["verified"] == 2
+
+    def test_budget_resets_next_day(self, tmp_path):
+        watcher, chatwork, generator, screen = make_watcher(
+            tmp_path, [message(201, 111, "坂田", "経費精算の締めは月末までですよね？")]
+        )
+        watcher._config.data["discussion_watch"]["max_verifications_per_day"] = 1
+        # 前日ぶんで使い切った状態を作る
+        watcher._save_state(
+            12345, {"last_seen": 1, "date": "20200101", "verified": 5, "count": 0}
+        )
+        watcher.run_once()
+        assert len(generator.calls) == 1  # 日付が変わればリセットされる
