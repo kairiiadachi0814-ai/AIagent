@@ -693,7 +693,12 @@ class RaizuinuHandler:
 
                     closed = self._fax_watch_factory().close_manually(
                         event.room_id,
-                        {"account": {"account_id": event.account_id}, "message_id": event.message_id},
+                        # 本文も渡す（番号があればモデルの読みより番号を正とする）
+                        {
+                            "account": {"account_id": event.account_id},
+                            "message_id": event.message_id,
+                            "body": event.body or "",
+                        },
                         filenames=done.get("filenames") or None,
                         everything=bool(done.get("all")),
                         # 「全て」は返信先の通知・聞き返しの範囲に限る（無ければ対応待ち全部）
@@ -713,6 +718,9 @@ class RaizuinuHandler:
                             }
                         )
                         return
+                    # 済んだ報告と読めたのに閉じるものが無い（番号の打ち間違い・既に閉じた分など）。
+                    # お礼だけ返すと閉じたように見えるので、見当たらない旨と今の対応待ちを返す
+                    text = "いただいた報告に当たる対応待ちのFAXが見当たりませんでした。\n" + self._fax_status.status()
             cost_status = self._add_usage_safely(usage) if usage else None
             self._reply_and_audit(event, question, text, "fax_status")
             if cost_status is not None:

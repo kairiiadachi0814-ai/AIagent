@@ -1248,6 +1248,7 @@ class TestBatchedNotices:
         ("2番と 5番 済みました", [2, 5]), ("㉑ 済", [21]), ("１と２ 対応完了", [1, 2]),
         ("9/12納品分 対応完了", []), ("2件とも対応完了", []), ("4950_001.pdf 対応完了", []),
         ("10時に対応完了しました", []), (f"[rp aid={AGENT} to={FAX_ROOM}-9000]①対応完了", [1]),
+        ("3つとも対応完了", []), ("2通とも済みです", []), ("㉞㊳対応完了", [34, 38]),
     ])
     def test_reading_numbers_from_a_reply(self, body, expected):
         from raizuinu.faxwatch import report_numbers
@@ -1389,6 +1390,106 @@ class TestReopening:
         from raizuinu.faxwatch import is_reopen_request, is_undo_request
 
         assert is_undo_request(body) is undo and is_reopen_request(body) is reopen
+
+
+class TestRepliesToOwnListings:
+    """実例（2026-11-02 10:29）: 残り㉞㊳を載せたお礼への返信「㉞㊳対応完了」が、どの控えにも
+    結び付かず巡回側を素通りし、会話側の読み（全部済んだ）で㊺まで閉じて「これでありません」と返した。
+
+    お礼・戻した旨の返事も、そこに載せた控えに結び付ける。番号を挙げた報告は、返信先が
+    別の投稿でも番号で閉じる。会話側（モデルの読み）も本文に番号があれば番号を正とする。
+    """
+
+    def thanks_listing_two_then_a_new_one(self, tmp_path):
+        # ①②（まとめ 9000）→ ③（9001）→ ③の完了でお礼 9002（残り①②を載せる）→ ④（9003）
+        w = TestBatchedNotices().held_over_weekend(tmp_path)
+        w._chatwork.messages += held("4970_001.pdf", "2026/09/07 10:00:00")
+        w.clock.now = at(2026, 9, 7, 10, 5)
+        w.run_once()
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9001]対応完了"))
+        w.run_once()
+        assert "対応待ちのFAXは、あと2件です。" in bodies(w)[2]
+        assert [(t["number"], t["check_ids"]) for t in w._load_state()["open"]] == [(1, ["9002"]), (2, ["9002"])]
+        w._chatwork.messages += held("4980_001.pdf", "2026/09/07 10:30:00")
+        w.clock.now = at(2026, 9, 7, 10, 35)
+        w.run_once()
+        assert [(t["number"], t["posted_id"]) for t in w._load_state()["open"]] == [(1, "9000"), (2, "9000"), (4, "9003")]
+        return w
+
+    def test_numbers_replied_to_the_thanks_close_only_those(self, tmp_path):
+        w = self.thanks_listing_two_then_a_new_one(tmp_path)
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9002]①②対応完了"))
+        w.run_once()
+        assert [t["number"] for t in w.closed_last_run] == [1, 2]
+        assert [t["number"] for t in w._load_state()["open"]] == [4]  # ④は残る
+        thanks = bodies(w)[-1]
+        assert thanks.startswith(f"[rp aid={SHINODA} to={FAX_ROOM}-9600]\n")
+        assert "対応待ちのFAXは、あと1件です。" in thanks and "・④ 9/7 10:30" in thanks
+        assert [t["check_ids"] for t in w._load_state()["open"]] == [["9004"]]  # このお礼も④に結び付く
+
+    def test_numbers_replied_to_another_notice_still_close_those_numbers(self, tmp_path):
+        # ④の通知に返信して「①②対応完了」。番号は明示の指定なので、返信先に関係なく①②を閉じる
+        w = self.thanks_listing_two_then_a_new_one(tmp_path)
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9003]①② 対応完了"))
+        w.run_once()
+        assert [t["number"] for t in w.closed_last_run] == [1, 2]
+        assert [t["number"] for t in w._load_state()["open"]] == [4]
+
+    def test_all_done_replied_to_the_thanks_closes_what_it_listed(self, tmp_path):
+        w = self.thanks_listing_two_then_a_new_one(tmp_path)
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9002]全て対応完了"))
+        w.run_once()
+        assert [t["number"] for t in w.closed_last_run] == [1, 2]
+        assert [t["number"] for t in w._load_state()["open"]] == [4]
+
+    def test_a_bare_done_replied_to_the_thanks_still_asks_which(self, tmp_path):
+        w = self.thanks_listing_two_then_a_new_one(tmp_path)
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9002]対応完了"))
+        w.run_once()
+        assert w.closed_last_run == [] and [m["message_id"] for m in w.asked_last_run] == ["9600"]
+        assert "対応待ちが2件あるので" in bodies(w)[-1] and "・④" not in bodies(w)[-1]
+
+    def test_a_bare_done_to_an_unlinked_post_is_left_to_the_conversation(self, tmp_path):
+        w = self.thanks_listing_two_then_a_new_one(tmp_path)
+        sent = len(w._chatwork.sent)
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-8888]対応完了"))
+        w.run_once()
+        assert w.closed_last_run == [] and w.asked_last_run == [] and len(w._chatwork.sent) == sent
+        assert [t["number"] for t in w._load_state()["open"]] == [1, 2, 4]
+
+    def test_a_done_replied_to_the_reopen_confirmation_closes_the_listed_one(self, tmp_path):
+        # 実例（2026-11-02 10:38）: 「㊺を対応待ちに戻しました（あと1件 ㊺）」への「対応完了」
+        w = TestReopening().three_closed_by_all(tmp_path)  # まとめ 9000、お礼 9001
+        w._chatwork.messages.append(human(9600, f"[To:{AGENT}] ①はまだ終わっていません。対応待ちに戻してください。"))
+        w.run_once()  # 戻した旨の返事 9002（残り①）
+        assert [(t["number"], t["check_ids"]) for t in w._load_state()["open"]] == [(1, ["9002"])]
+        w._chatwork.messages.append(human(9700, f"[rp aid={AGENT} to={FAX_ROOM}-9002]対応完了"))
+        w.run_once()
+        assert [t["number"] for t in w.closed_last_run] == [1]
+        assert w._load_state()["open"] == [] and "これでありません" in bodies(w)[-1]
+
+    def test_close_manually_prefers_the_numbers_in_the_body(self, tmp_path):
+        # 会話側が「全部済んだ」と読んでも、本文に番号があればその番号だけ
+        w = self.thanks_listing_two_then_a_new_one(tmp_path)
+        message = {"account": {"account_id": SHINODA}, "message_id": "9600",
+                   "body": f"[rp aid={AGENT} to={FAX_ROOM}-9002]①②対応完了"}
+        assert w.close_manually(FAX_ROOM, message, everything=True, targets={"9002"}) == 2
+        assert [t["number"] for t in w._load_state()["open"]] == [4]
+        assert "・④ 9/7 10:30" in bodies(w)[-1]
+        assert [t["check_ids"] for t in w._load_state()["open"]] == [["9004"]]  # お礼を残りに結び付ける
+        # 番号に当たる控えが無ければ、何も閉じない（打ち間違いで全部閉じない）
+        message = {"account": {"account_id": SHINODA}, "message_id": "9700", "body": "⑨ 対応完了"}
+        assert w.close_manually(FAX_ROOM, message, everything=True) == 0
+        assert [t["number"] for t in w._load_state()["open"]] == [4]
+
+    def test_linking_keeps_the_newest_ids_only(self):
+        thread = {"check_ids": [str(i) for i in range(FaxWatcher.CHECK_IDS_KEEP)]}
+        FaxWatcher._link([thread], "new")
+        assert len(thread["check_ids"]) == FaxWatcher.CHECK_IDS_KEEP and thread["check_ids"][-1] == "new"
+        FaxWatcher._link([thread], "new")
+        assert thread["check_ids"].count("new") == 1
+        FaxWatcher._link([thread], "")
+        assert thread["check_ids"].count("") == 0
 
 
 MORI, FUJITA = 10604615, 5631017
@@ -1899,13 +2000,42 @@ class TestQuestionsInTheFaxRoom:
                 return False
 
             def close_manually(self, room_id, message, filenames=None, everything=False, targets=None):
-                calls.append((everything, set(targets or ())))
+                calls.append((everything, set(targets or ()), "全て対応完了" in message.get("body", "")))
                 chatwork.sent.append((room_id, "ご対応ありがとうございます。\n対応待ちのFAXは、あと1件です。"))
                 return 1
 
         handler._fax_watch_factory = lambda: FakeRun()
         self._ask(handler, ADACHI, f"[rp aid=999 to={FAX_ROOM}-9002]全て対応完了", "9600")
-        assert calls == [(True, {"9002"})]
+        assert calls == [(True, {"9002"}, True)]  # 本文も渡す（番号があれば巡回側が番号を正とする）
+
+    def test_a_done_that_closes_nothing_says_so_with_the_list(self, tmp_path, monkeypatch):
+        # 会話側が済んだと読んだのに閉じるものが無い（番号の打ち間違いなど）。お礼だけ返すと
+        # 閉じたように見えるので、見当たらない旨と今の対応待ちを返す
+        import time
+
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        handler, chatwork, _, _ = self._handler(tmp_path, monkeypatch, {"open": self.OPEN})
+        handler._fax_status._client = fake_client({"reply": "ご対応ありがとうございます。", "done_all": True, "done_filenames": []})
+
+        class FakeRun:
+            closed_last_run = []
+            asked_last_run = []
+
+            def run_once(self):
+                return 0
+
+            def has_pending(self):
+                return False
+
+            def close_manually(self, room_id, message, filenames=None, everything=False, targets=None):
+                return 0
+
+        handler._fax_watch_factory = lambda: FakeRun()
+        self._ask(handler, ADACHI, "⑨ 対応完了", "9600")
+        body = chatwork.sent[0][1]
+        assert "いただいた報告に当たる対応待ちのFAXが見当たりませんでした。" in body
+        assert "いま対応完了の返信をいただいていないのは2件です。" in body and "4958_001.pdf" in body
+        assert "ご対応ありがとうございます。" not in body
 
     def test_an_operational_note_with_a_mention_gets_a_plain_reply(self, tmp_path, monkeypatch):
         import time

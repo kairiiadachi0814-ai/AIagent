@@ -178,8 +178,8 @@ def _circled_value(ch: str) -> int:
 
 
 _NUM_FORMS_RE = re.compile(r"(?:No\.?\s*|[#＃])(\d{1,2})|(\d{1,2})\s*番|[(（](\d{1,2})[)）]", re.IGNORECASE)
-# 日付・時刻・件数・ファイル名の一部（9/12、10時、2件、4950_001）は番号と読まない
-_BARE_NUM_RE = re.compile(r"(?<![\d/:.\-_A-Za-z])(\d{1,2})(?![\d/:.\-_月日円件時分個枚人%])")
+# 日付・時刻・件数・ファイル名の一部（9/12、10時、2件、3つとも、4950_001）は番号と読まない
+_BARE_NUM_RE = re.compile(r"(?<![\d/:.\-_A-Za-z])(\d{1,2})(?![\d/:.\-_月日円件時分個枚人つ通%])")
 _ALL_RE = re.compile(r"(全て|すべて|全部|全件|一式|まとめて|両方|どちらも|いずれも|件とも|つとも|とも(対応|完了|済|確認))")
 _EXCEPT_RE = re.compile(r"(以外|除い|除き|のぞい|のぞき)")
 
@@ -754,14 +754,20 @@ class FaxWatcher:
         everything（「全て対応完了」）は、返信先（targets）が特定の通知や聞き返しを指していれば
         その分だけ、そうでなければ対応待ち全部。実例（2026-09-24 11:35）: 聞き返し（3件）への
         「全て対応完了」で、聞いていない⑨まで閉じた。
+        本文（message["body"]）に番号（㉞㊳）があれば、モデルの読みより番号を正とし、その番号だけ閉じる。
+        番号に当たる控えが無ければ何も閉じない。実例（2026-11-02 10:29）: 「㉞㊳対応完了」を
+        「全部済んだ」と読んで、㊺まで閉じた。
         """
         wanted = {str(f).strip().lower() for f in (filenames or []) if str(f).strip()}
         if not everything and not wanted:
             return 0
+        numbers = report_numbers(str(message.get("body") or ""))
         with self._locked():
             state = self._load_state()
             open_threads = list(state.get("open") or [])
-            if everything:
+            if numbers:
+                closed = pick_by_number(open_threads, numbers)
+            elif everything:
                 evening_ids = {str(i) for i in state.get("evening_ids") or []}
                 linked = [
                     t for t in open_threads
@@ -793,12 +799,18 @@ class FaxWatcher:
         self.closed_last_run = closed
         thanks_id = self._thank(room_id, message, remaining)
         if thanks_id:
-            # お礼への返信で「取り消し」と言われたときに、この報告で閉じた分と分かるように
+            # お礼への返信で「取り消し」と言われたときに、この報告で閉じた分と分かるように。
+            # お礼に載せた残りの控えにも、お礼の投稿を結び付ける（その返信が残りの話として読めるように）
             with self._locked():
                 state = self._load_state()
                 for entry in state.get("closed_log") or []:
                     if str(entry.get("closer_id")) == closer_id and not entry.get("thanks_id"):
                         entry["thanks_id"] = thanks_id
+                keys = {(str(t.get("pdf_id")), str(t.get("posted_id"))) for t in remaining}
+                self._link(
+                    [t for t in state.get("open") or [] if (str(t.get("pdf_id")), str(t.get("posted_id"))) in keys],
+                    thanks_id,
+                )
                 self._save_state(state)
         return len(closed)
 
@@ -904,13 +916,16 @@ class FaxWatcher:
         state["reopen_ids"] = handled[-50:]
 
     def _confirm_reopen(self, room_id: int, message: dict, restored: list[dict], open_threads: list[dict]) -> None:
+        """戻した旨と対応待ちの一覧を返す。一覧に載せた控えにはこの投稿を結び付ける
+        （実例 2026-11-02 10:38: 戻した旨の返事への「対応完了」を巡回側が読めず、会話側の読みに頼った）。"""
         try:
             tag = f"[rp aid={_account_of(message)} to={room_id}-{message.get('message_id')}]"
             labels = self._numbers_of([t for t in restored if t.get("number")])
             what = labels or "・".join(str(t.get("filename") or "") for t in restored)
             lines = [f"承知しました。{what}を対応待ちに戻しました。"]
             lines += self._remaining_lines(open_threads)
-            self._chatwork.send_message(room_id, f"{tag}\n" + "\n".join(lines))
+            mid = str(self._chatwork.send_message(room_id, f"{tag}\n" + "\n".join(lines)) or "")
+            self._link(open_threads, mid)
         except Exception:
             print("[warn] 戻した旨の返事に失敗: " + traceback.format_exc(), flush=True)
 
@@ -1312,10 +1327,40 @@ class FaxWatcher:
 
     @staticmethod
     def _thread_ids(thread: dict, evening_ids: set[str]) -> set[str]:
-        """この控えへの返事とみなすメッセージID（通知・PDF・催促・夕方の一覧）。"""
+        """この控えへの返事とみなすメッセージID（通知・PDF・催促・聞き返し・お礼・夕方の一覧）。"""
         return {str(thread.get("posted_id")), str(thread.get("pdf_id"))} | {
             str(c) for c in thread.get("check_ids") or []
         } | evening_ids
+
+    CHECK_IDS_KEEP = 30
+
+    @classmethod
+    def _link(cls, threads: list[dict], mid: str) -> None:
+        """自分の投稿（聞き返し・お礼・戻した旨の返事）を、そこに載せた控えに結び付ける。
+
+        その投稿への返信（「㉞㊳対応完了」「全て対応完了」「対応完了」）が、載せた分の話として
+        読めるようにするため。実例（2026-11-02 10:29）: 残り㉞㊳を載せたお礼への返信「㉞㊳対応完了」が
+        どの控えにも結び付かず巡回側が素通りし、会話側の読み（全部済んだ）で㊺まで閉じた。
+        """
+        if not mid:
+            return
+        for thread in threads:
+            ids = [str(c) for c in thread.get("check_ids") or []]
+            if str(mid) not in ids:
+                ids.append(str(mid))
+            thread["check_ids"] = ids[-cls.CHECK_IDS_KEEP :]
+
+    @staticmethod
+    def _pick_numbers(candidates: list[dict], live: list[dict], numbers: list[int]) -> list[dict]:
+        """番号で挙げられた控え。返信先に結び付く候補を先に見て、無い番号は対応待ち全体から採る。
+
+        番号は人が明示した指定なので、返信先が別の投稿（新しい通知や別の控えのお礼）でも
+        その番号を閉じる。同じ番号が別の日にもあるときだけ、返信先で決める。
+        """
+        chosen = pick_by_number(candidates, numbers)
+        found = {int(t.get("number") or 0) for t in chosen}
+        rest = [t for t in live if t not in chosen]
+        return chosen + pick_by_number(rest, [n for n in numbers if n not in found])
 
     def _close_finished(self, state: dict, messages: list[dict], room_id: int, notifier: int) -> None:
         """「対応完了」の返事があった発注書を、見届けの対象から外す。
@@ -1351,20 +1396,23 @@ class FaxWatcher:
             targets = reply_targets(body, room_id)
             # 通知より前の発言は当てない。対応待ちへ戻した控えは、戻す依頼より前の発言も当てない
             # （戻す前の「全て対応完了」が次の巡回でまた閉じてしまうため）
-            candidates = [
+            live = [
                 t for t in threads
-                if t not in closed
-                and mid > max(_as_int(t.get("posted_id")), _as_int(t.get("since_id")))
-                and (not targets or targets & self._thread_ids(t, evening_ids))
+                if t not in closed and mid > max(_as_int(t.get("posted_id")), _as_int(t.get("since_id")))
             ]
-            if not candidates:
-                continue  # 別のFAXへの返事、または通知より前の発言
+            # 返信先に結び付く控え。結び付かない返信（別の控えの通知・お礼など）でも、
+            # ファイル名や番号を挙げていればその指定を正とする（下で live から採る）
+            candidates = [t for t in live if not targets or targets & self._thread_ids(t, evening_ids)]
+            if not live:
+                continue  # 通知より前の発言
             # ファイル名を挙げて書かれた報告は、そのFAXだけの話として読む
             named = [f for f in filenames if f and f in body]
             note = ""
             via = "reply"
             if named:
-                chosen = [t for t in candidates if str(t.get("filename") or "") in named]
+                chosen = [t for t in candidates if str(t.get("filename") or "") in named] or [
+                    t for t in live if str(t.get("filename") or "") in named
+                ]
                 via = "filename"
             else:
                 # 返信でもファイル名指定でもない文は、短い報告（「2件とも対応完了です」）だけを
@@ -1373,7 +1421,11 @@ class FaxWatcher:
                 if not targets and not is_short_report(body, me):
                     continue
                 numbers = report_numbers(body)
+                if not candidates and not numbers:
+                    continue  # 結び付かない投稿への返信で、番号も無い（会話側に任せる）
                 if names_exceptions(body):
+                    if not candidates:
+                        continue  # 「以外」の範囲は返信先で決まる。結び付かなければ受けない
                     # 「①以外は対応完了」。挙げなかった分を全部閉じるので、条件を全部満たす
                     # ときだけ受け、外れたら番号を聞き返す（取り違えが複数件の取りこぼしになる）
                     kept = self._exclusion_targets(body, candidates, targets)
@@ -1390,7 +1442,9 @@ class FaxWatcher:
                         )
                     via = "exclusion"
                 elif numbers:
-                    chosen = pick_by_number(candidates, numbers)
+                    # 実例（2026-11-02 10:29）: 残り㉞㊳を載せたお礼への返信「㉞㊳対応完了」。
+                    # 返信先がどの控えにも結び付かず素通りし、会話側の読みで㊺まで閉じた
+                    chosen = self._pick_numbers(candidates, live, numbers)
                     via = "number"
                 elif (
                     mentions_all(body)
@@ -1500,9 +1554,7 @@ class FaxWatcher:
                 )
             lines = [opening] + ["・" + self._thread_line(t) for t in candidates]
             mid = str(self._chatwork.send_message(room_id, f"{tag}\n" + "\n".join(lines)) or "")
-            if mid:
-                for thread in candidates:
-                    thread.setdefault("check_ids", []).append(mid)
+            self._link(candidates, mid)
         except Exception:
             print("[warn] 番号の聞き返しに失敗: " + traceback.format_exc(), flush=True)
 
@@ -1516,6 +1568,7 @@ class FaxWatcher:
         """完了の報告に、相手のメッセージへの返信で礼を言い、残りを添える（黙って閉じない）。→ 投稿ID
 
         note は「①を残して②③を閉じました」のような、何を閉じたかの明記（除外の形のとき）。
+        お礼に載せた残りの控えには、このお礼の投稿IDを結び付ける（お礼への返信が残りの話として読めるように）。
         """
         try:
             if self._phrasebook is None:
@@ -1527,7 +1580,9 @@ class FaxWatcher:
             if note:
                 lines.append(note)
             lines += self._remaining_lines(remaining)
-            return str(self._chatwork.send_message(room_id, f"{tag}\n" + "\n".join(lines)) or "")
+            mid = str(self._chatwork.send_message(room_id, f"{tag}\n" + "\n".join(lines)) or "")
+            self._link(remaining, mid)
+            return mid
         except Exception:
             print("[warn] 完了報告への返事に失敗: " + traceback.format_exc(), flush=True)
             return ""
@@ -2070,6 +2125,10 @@ class FaxStatus:
         except (OSError, ValueError):
             return []
         return list(state.get("open") or [])
+
+    def status(self) -> str:
+        """対応待ちの一覧（状態ファイルから。モデルは使わない）。"""
+        return self._status()
 
     def reply(self, question: str, replied_to: str = "") -> tuple[str, dict]:
         """→ (返信, usage)。対応状況の問い合わせはコードで、それ以外の会話はモデルで返す。"""
