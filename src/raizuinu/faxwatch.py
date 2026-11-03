@@ -143,16 +143,28 @@ _TO_RE = re.compile(r"\[To:(\d+)\]")
 SHORT_REPORT_CHARS = 20
 
 
+def strip_own_mention(body: str, me: int = 0) -> str:
+    """自分宛の To・返信タグと、Chatwork がその直後に入れる宛名（「経理財務アシスタントさん」）を外す。
+
+    宛名は本文ではないので、短い一言かどうかの長さに数えない（実例 2026-11-02: 「44対応完了」
+    の前に12字の宛名が付く。宛名を数えると「44番 対応完了です」程度で20字を超えて素通りする）。
+    """
+    if not me:
+        return str(body or "")
+    pattern = re.compile(rf"\[(?:To:{int(me)}|rp aid={int(me)}\s[^\]]*)\][^\S\n]*(?:[^\n\[]*?さん)?")
+    return pattern.sub("", str(body or ""))
+
+
 def is_short_report(body: str, me: int = 0) -> bool:
     """返信でもファイル名指定でもない文を、完了の報告として受けてよいか。
 
     「2件とも対応完了です」のような短い一言だけ。誰か（自分以外）へのメンションが
-    付いた文や長い文は、周知や別の話なので受けない。
+    付いた文や長い文は、周知や別の話なので受けない。自分宛の宛名は長さに数えない。
     """
     others = [int(a) for a in _TO_RE.findall(str(body or "")) if int(a) != int(me or 0)]
     if others:
         return False
-    return len(strip_tags(body).strip()) <= SHORT_REPORT_CHARS
+    return len(strip_tags(strip_own_mention(body, me)).strip()) <= SHORT_REPORT_CHARS
 
 
 # --- 通知の番号（①②…）---
@@ -2076,7 +2088,9 @@ class FaxStatus:
   （「〜の件、修正しました」「〜に変更しました」など）は報告ではないので示さない。
   報告のときの reply は短いお礼だけでよい（残りの一覧はプログラム側が添える）
 - 対応待ちには番号（①②…）が付いている。「①と③が済みました」のように番号で
-  報告されたら、その番号のPDF名を done_filenames に入れる。番号も「全て」も無い
+  報告されたら、その番号のPDF名を done_filenames に入れる。番号は「44」「44番」「No.44」
+  のように普通の数字で書かれることも多く、㊹と同じ番号である（一覧の（44）と照合する。
+  「44番は見当たらない」と返さない）。番号も「全て」も無い
   「対応完了」で対象が複数あるときは閉じず、どの番号か聞き返す
   （「全部でしたら『全て対応完了』とお返事ください」と添える）
 - 「①以外は完了」のような除外の形はプログラム側が扱う。done_all・done_filenames は
@@ -2086,7 +2100,7 @@ class FaxStatus:
   残っている、など）なので、done は立てず「○は対応待ちに残っています」のように短く返す。
   「このルームでは対応できない」とは言わない
 
-いま対応待ちのFAX（番号 / PDF名 / 差出人 / 種類）:
+いま対応待ちのFAX（番号（数字） / PDF名 / 差出人 / 種類）:
 {open_list}
 
 例:
@@ -2154,8 +2168,10 @@ class FaxStatus:
 
                 self._client = anthropic.Anthropic()
             cfg = self._config
+            # 番号は ㊹（44） の形で渡す。人は「44対応完了」と普通の数字でも書く
+            # （実例 2026-11-02 09:48: 「44番は対応待ちの一覧に見当たらない」と返した）
             open_list = "\n".join(
-                f"- {circled(int(t.get('number') or 0)) if t.get('number') else '（番号なし）'} / "
+                f"- {circled(int(t['number'])) + '（' + str(int(t['number'])) + '）' if t.get('number') else '（番号なし）'} / "
                 f"{t.get('filename', '')} / {t.get('sender') or '差出人不明'} / {t.get('kind', '')}"
                 for t in self.open_threads()
             ) or "（なし）"

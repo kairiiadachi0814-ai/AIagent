@@ -1249,6 +1249,8 @@ class TestBatchedNotices:
         ("9/12納品分 対応完了", []), ("2件とも対応完了", []), ("4950_001.pdf 対応完了", []),
         ("10時に対応完了しました", []), (f"[rp aid={AGENT} to={FAX_ROOM}-9000]①対応完了", [1]),
         ("3つとも対応完了", []), ("2通とも済みです", []), ("㉞㊳対応完了", [34, 38]),
+        ("44対応完了", [44]), ("44番 対応完了", [44]), ("No.44 対応完了", [44]), ("44と45 対応完了", [44, 45]),
+        (f"[rp aid={AGENT} to={FAX_ROOM}-9002]経理財務アシスタントさん\n44対応完了", [44]),
     ])
     def test_reading_numbers_from_a_reply(self, body, expected):
         from raizuinu.faxwatch import report_numbers
@@ -1481,6 +1483,52 @@ class TestRepliesToOwnListings:
         message = {"account": {"account_id": SHINODA}, "message_id": "9700", "body": "⑨ 対応完了"}
         assert w.close_manually(FAX_ROOM, message, everything=True) == 0
         assert [t["number"] for t in w._load_state()["open"]] == [4]
+
+    def test_plain_digits_replied_to_the_thanks_close_that_number(self, tmp_path):
+        # 実例（2026-11-02 09:48）: お礼への返信「44対応完了」に「44番は対応待ちの一覧に見当たらない」と返した
+        w = self.thanks_listing_two_then_a_new_one(tmp_path)
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9002]経理財務アシスタントさん\n4対応完了", FUDABA))
+        w.run_once()
+        assert [t["number"] for t in w.closed_last_run] == [4]
+        assert [t["number"] for t in w._load_state()["open"]] == [1, 2]
+        assert bodies(w)[-1].startswith(f"[rp aid={FUDABA} to={FAX_ROOM}-9600]\n")
+
+    def test_a_mention_with_the_display_name_is_still_a_short_report(self, tmp_path):
+        # 宛名「経理財務アシスタントさん」（12字）は一言の長さに数えない
+        w = self.thanks_listing_two_then_a_new_one(tmp_path)
+        w._chatwork.messages.append(human(9600, f"[To:{AGENT}]経理財務アシスタントさん\n4番 対応完了です", FUDABA))
+        w.run_once()
+        assert [t["number"] for t in w.closed_last_run] == [4]
+        assert [t["number"] for t in w._load_state()["open"]] == [1, 2]
+
+    @pytest.mark.parametrize("body, short", [
+        (f"[To:{AGENT}]経理財務アシスタントさん\n44番 対応完了です", True),
+        (f"[To:{AGENT}]経理財務アシスタントさん\n対応完了に対する返信と対応待ちFAXの共有が分かれてしまっていた件、修正しております。", False),
+        (f"[To:{SHINODA}]篠田さん\n44対応完了", False),  # 他人宛の文は周知
+        ("2件とも対応完了です", True),
+    ])
+    def test_the_display_name_does_not_count_toward_the_short_report(self, body, short):
+        from raizuinu.faxwatch import is_short_report
+
+        assert is_short_report(body, AGENT) is short
+
+    def test_the_model_is_told_that_plain_digits_are_the_same_numbers(self, tmp_path):
+        # 会話側に回ったときも「44」を㊹と結び付けられるよう、一覧に数字を併記し、言い添える
+        from raizuinu.faxwatch import FaxStatus
+
+        config = make_config(tmp_path)
+        (tmp_path / "state").mkdir(exist_ok=True)
+        (tmp_path / "state" / "faxwatch.json").write_text(json.dumps({"open": [
+            {"posted_id": "9000", "pdf_id": "2", "filename": "0966_001.pdf", "sender": "ジャポニックス",
+             "kind": "直送依頼書", "number": 44, "received_at": "2026/11/02 09:10:00", "stage": 0, "check_ids": []},
+        ]}, ensure_ascii=False), encoding="utf-8")
+        status = FaxStatus(config, now=lambda: at(2026, 11, 2, 9, 48),
+                           client=fake_client({"reply": "ご対応ありがとうございます。", "done_all": False, "done_filenames": ["0966_001.pdf"]}))
+        _, _, done = status.converse("44対応完了")
+        system = status._client.kwargs["system"]
+        assert "- ㊹（44） / 0966_001.pdf / ジャポニックス / 直送依頼書" in system
+        assert "「44番は見当たらない」と返さない" in system
+        assert done == {"all": False, "filenames": ["0966_001.pdf"]}
 
     def test_linking_keeps_the_newest_ids_only(self):
         thread = {"check_ids": [str(i) for i in range(FaxWatcher.CHECK_IDS_KEEP)]}
