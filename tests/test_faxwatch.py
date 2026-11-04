@@ -908,6 +908,8 @@ class TestBatchedNotices:
     @pytest.mark.parametrize("reply, left", [
         ("①② 対応完了", []), ("1と2 対応完了", []), ("No.2 完了です", [1]), ("2番 済みました", [1]),
         ("2件とも対応完了です", []), ("全部済みました", []), ("(1) 対応完了", [2]),
+        ("1/2 済み", []),  # ①②が対応待ちにあるので日付ではなく番号（指示 2026-11-04）
+        ("1.2 済み", []), ("1〜2 完了", []),
     ])
     def test_numbers_and_all_in_several_wordings(self, tmp_path, reply, left):
         w = self.held_over_weekend(tmp_path)
@@ -1263,12 +1265,25 @@ class TestBatchedNotices:
         # 2026-11-04 問い合わせの形。範囲は先に読むので「1/2/3,4~8」は 4〜8 が先に並ぶ
         ("1~12迄完了", list(range(1, 13))), ("1-12完了", list(range(1, 13))), ("①~⑫迄完了", list(range(1, 13))),
         ("1/2/3,4~8済み", [4, 5, 6, 7, 8, 1, 2, 3]), ("1〜3、5〜7完了", [1, 2, 3, 5, 6, 7]),
-        ("1/2済み", []),  # 「/」区切り2つで月日に収まるものは日付と読む（1月2日）。番号なら「1.2」「1,2」「①②」
+        ("1/2済み", []),  # 対応待ちの番号が分からなければ「/」区切り2つで月日に収まるものは日付と読む（1月2日）
     ])
     def test_reading_numbers_from_a_reply(self, body, expected):
         from raizuinu.faxwatch import report_numbers
 
         assert report_numbers(body) == expected
+
+    @pytest.mark.parametrize("body, known, expected", [
+        ("1/2済み", [1, 2, 3], [1, 2]),  # 指示 2026-11-04: 両方の番号が対応待ちにあれば番号
+        ("1/2済み", [1, 3], []),  # 片方しか無ければ日付のまま（聞き返す）
+        ("1/2済み", [], []),
+        ("9/12納品分 対応完了", [9, 12], []),  # 「納品分」が続けば日付
+        ("9/12 対応完了", [9, 12], [9, 12]),
+        ("1/2/3 済み", [], [1, 2, 3]),  # 3つ以上は対応待ちに関係なく番号
+    ])
+    def test_a_slash_pair_is_numbers_when_both_are_open(self, body, known, expected):
+        from raizuinu.faxwatch import report_numbers
+
+        assert report_numbers(body, known) == expected
 
     def test_wording_for_all_and_the_circled_numbers(self):
         from raizuinu.faxwatch import circled, mentions_all

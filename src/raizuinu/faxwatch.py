@@ -31,7 +31,7 @@ import traceback
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 JST = timezone(timedelta(hours=9))
 WEEKDAYS = "月火水木金土日"
@@ -204,20 +204,30 @@ _RUN_SPLIT_RE = re.compile(r"[.,/、・\s]+")
 MAX_RANGE_SPAN = 30  # 「1〜80」のような打ち間違いで対応待ち全部を閉じない
 
 
-def _looks_like_date(separator_text: str, parts: list[int]) -> bool:
+def _looks_like_date(separator_text: str, parts: list[int], known: set[int] | None) -> bool:
     """「9/12」のような月/日か。「/」区切りで2つだけ、月日の範囲に収まるときは日付と読む。
-    「.」「,」区切りはこのルームでは番号の並びとして使われるので日付とみなさない。"""
-    return "/" in separator_text and len(parts) == 2 and 1 <= parts[0] <= 12 and 1 <= parts[1] <= 31
+
+    ただし両方の番号が対応待ち（known）にあれば番号の並びと読む（指示 2026-11-04: 「1/2済み」で
+    ①②が対応待ちなら番号として受ける）。「.」「,」区切りはこのルームでは番号の並びとして
+    使われるので日付とみなさない。
+    """
+    if not ("/" in separator_text and len(parts) == 2 and 1 <= parts[0] <= 12 and 1 <= parts[1] <= 31):
+        return False
+    return not (known and all(p in known for p in parts))
+
+
 _ALL_RE = re.compile(r"(全て|すべて|全部|全件|一式|まとめて|両方|どちらも|いずれも|件とも|つとも|とも(対応|完了|済|確認))")
 _EXCEPT_RE = re.compile(r"(以外|除い|除き|のぞい|のぞき)")
 
 
-def report_numbers(body: str) -> list[int]:
+def report_numbers(body: str, known: Iterable[int] | None = None) -> list[int]:
     """返事に書かれた通知の番号。重複なし。
 
     読める形: ①③、1と3、No.2、(4)、57.58.64.65、57,58、57/58/64、①〜⑤、57〜60、57から60まで。
     日付（9/12）・時刻（10時）・件数（2件）・金額（5,280円）・ファイル名の一部は番号と読まない。
+    known はいま対応待ちの番号。「1/2」のように日付とも読める形は、両方が known にあれば番号と読む。
     """
+    known_set = {int(n) for n in known if n} if known is not None else None
     # 丸数字は数字に置き換えて（前後に空白）、並びや範囲の形もそのまま読めるようにする
     text = "".join(f" {_circled_value(ch)} " if _circled_value(ch) else ch for ch in strip_tags(body))
     plain = unicodedata.normalize("NFKC", text)
@@ -232,7 +242,7 @@ def report_numbers(body: str) -> list[int]:
 
     def take_run(match: re.Match) -> str:
         parts = [int(p) for p in _RUN_SPLIT_RE.split(match.group(1)) if p]
-        if _looks_like_date(match.group(1), parts):
+        if _looks_like_date(match.group(1), parts, known_set):
             return match.group(0)
         found.extend(parts)
         return " "
@@ -290,12 +300,13 @@ _NUMBER_SEPARATORS_RE = re.compile(
 )
 
 
-def exclusion_numbers(body: str) -> list[int] | None:
+def exclusion_numbers(body: str, known: Iterable[int] | None = None) -> list[int] | None:
     """「①③以外は対応完了」の①③。形が崩れていれば None（聞き返す）。
 
     「以外」は挙げなかった分を全部閉じるので、読み違いが複数件の取りこぼしになる。
     受けるのは、「以外」の前が番号だけで、後ろに番号や保留の語（確認中・明日など）が
     無いときだけ。「光パックスの①以外」「①以外は完了、③は確認中」は受けない。
+    known は report_numbers と同じ（対応待ちの番号）。
     """
     text = strip_tags(body).strip()
     match = _EXCEPT_RE.search(unicodedata.normalize("NFKC", text))
@@ -306,8 +317,8 @@ def exclusion_numbers(body: str) -> list[int] | None:
     if not raw:
         return None
     before, after = text[: raw.start()], text[raw.end():]
-    numbers = report_numbers(before)
-    if not numbers or report_numbers(after):
+    numbers = report_numbers(before, known)
+    if not numbers or report_numbers(after, known):
         return None
     rest = "".join(" " if _circled_value(ch) else ch for ch in before)
     rest = re.sub(r"\d", " ", unicodedata.normalize("NFKC", rest))
@@ -805,10 +816,11 @@ class FaxWatcher:
         wanted = {str(f).strip().lower() for f in (filenames or []) if str(f).strip()}
         if not everything and not wanted:
             return 0
-        numbers = report_numbers(str(message.get("body") or ""))
+        body_text = str(message.get("body") or "")
         with self._locked():
             state = self._load_state()
             open_threads = list(state.get("open") or [])
+            numbers = report_numbers(body_text, [t.get("number") for t in open_threads])
             if numbers:
                 closed = pick_by_number(open_threads, numbers)
             elif everything:
@@ -915,7 +927,7 @@ class FaxWatcher:
             ]
             handled.append(mid)  # 一度見た依頼は、あとから閉じた分に効かせない
             named = [e for e in fresh if e.get("filename") and str(e["filename"]) in body]
-            numbers = report_numbers(body)
+            numbers = report_numbers(body, [e.get("number") for e in fresh])
             if named:
                 picks = named
             elif numbers:
@@ -1464,7 +1476,7 @@ class FaxWatcher:
                 # とあり、開いていた発注書を閉じてお礼を返してしまった
                 if not targets and not is_short_report(body, me):
                     continue
-                numbers = report_numbers(body)
+                numbers = report_numbers(body, [t.get("number") for t in live])
                 if not candidates and not numbers:
                     continue  # 結び付かない投稿への返信で、番号も無い（会話側に任せる）
                 if names_exceptions(body):
@@ -1571,7 +1583,7 @@ class FaxWatcher:
         numbers = [int(t.get("number") or 0) for t in candidates]
         if any(n <= 0 for n in numbers) or len(set(numbers)) != len(numbers):
             return None
-        excluded = exclusion_numbers(body)
+        excluded = exclusion_numbers(body, numbers)
         if excluded is None or any(n not in numbers for n in excluded):
             return None
         return [t for t in candidates if int(t.get("number") or 0) in excluded]
