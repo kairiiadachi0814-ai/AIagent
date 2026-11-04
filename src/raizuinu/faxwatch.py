@@ -190,25 +190,55 @@ def _circled_value(ch: str) -> int:
 
 
 _NUM_FORMS_RE = re.compile(r"(?:No\.?\s*|[#＃])(\d{1,2})|(\d{1,2})\s*番|[(（](\d{1,2})[)）]", re.IGNORECASE)
-# 日付・時刻・件数・ファイル名の一部（9/12、10時、2件、3つとも、4950_001）は番号と読まない
-_BARE_NUM_RE = re.compile(r"(?<![\d/:.\-_A-Za-z])(\d{1,2})(?![\d/:.\-_月日円件時分個枚人つ通%])")
+# 日付・時刻・件数・金額・ファイル名の一部（9/12、10時、2件、3つとも、5,280円、4950_001）は番号と読まない
+_BARE_NUM_RE = re.compile(r"(?<![\d/:.\-_A-Za-z])(\d{1,2})(?!,\d{3}(?!\d))(?![\d/:.\-_月日円件時分個枚人つ通%])")
+# 番号の並び（57.58.64.65、57,58、57/58/64）と範囲（①〜⑤、57〜60、57から60まで）。
+# 実例 2026-11-04 12:41: 「57.58.64.65対応完了」をピリオド区切りのため1つも読めず、番号を聞き返した。
+# 「①〜⑤」は①と⑤だけを閉じていた（黙って3件取りこぼす形）
+_NUM_HEAD = r"(?<![\d_\-A-Za-z])"
+_NUM_TAIL = r"(?![\d/:.\-_月日円件時分個枚人つ通%受着届納])"
+_RANGE_SEP = r"(?:〜|～|~|-|–|—|ー|から)"
+_NUM_RANGE_RE = re.compile(rf"{_NUM_HEAD}(\d{{1,2}})\s*{_RANGE_SEP}\s*(\d{{1,2}})(?:\s*まで)?{_NUM_TAIL}")
+_NUM_RUN_RE = re.compile(rf"{_NUM_HEAD}(\d{{1,2}}(?:\s*[.,/、・]\s*\d{{1,2}})+){_NUM_TAIL}")
+_RUN_SPLIT_RE = re.compile(r"[.,/、・\s]+")
+MAX_RANGE_SPAN = 30  # 「1〜80」のような打ち間違いで対応待ち全部を閉じない
+
+
+def _looks_like_date(separator_text: str, parts: list[int]) -> bool:
+    """「9/12」のような月/日か。「/」区切りで2つだけ、月日の範囲に収まるときは日付と読む。
+    「.」「,」区切りはこのルームでは番号の並びとして使われるので日付とみなさない。"""
+    return "/" in separator_text and len(parts) == 2 and 1 <= parts[0] <= 12 and 1 <= parts[1] <= 31
 _ALL_RE = re.compile(r"(全て|すべて|全部|全件|一式|まとめて|両方|どちらも|いずれも|件とも|つとも|とも(対応|完了|済|確認))")
 _EXCEPT_RE = re.compile(r"(以外|除い|除き|のぞい|のぞき)")
 
 
 def report_numbers(body: str) -> list[int]:
-    """返事に書かれた通知の番号（①③、1と3、No.2、(4)）。順番どおり、重複なし。"""
-    text = strip_tags(body)
+    """返事に書かれた通知の番号。重複なし。
+
+    読める形: ①③、1と3、No.2、(4)、57.58.64.65、57,58、57/58/64、①〜⑤、57〜60、57から60まで。
+    日付（9/12）・時刻（10時）・件数（2件）・金額（5,280円）・ファイル名の一部は番号と読まない。
+    """
+    # 丸数字は数字に置き換えて（前後に空白）、並びや範囲の形もそのまま読めるようにする
+    text = "".join(f" {_circled_value(ch)} " if _circled_value(ch) else ch for ch in strip_tags(body))
+    plain = unicodedata.normalize("NFKC", text)
     found: list[int] = []
-    kept: list[str] = []
-    for ch in text:
-        value = _circled_value(ch)
-        if value:
-            found.append(value)
-            kept.append(" ")
-        else:
-            kept.append(ch)
-    plain = unicodedata.normalize("NFKC", "".join(kept))
+
+    def take_range(match: re.Match) -> str:
+        lo, hi = int(match.group(1)), int(match.group(2))
+        if 1 <= lo <= hi and hi - lo <= MAX_RANGE_SPAN:
+            found.extend(range(lo, hi + 1))
+        # 範囲と読めない（81-49、1〜80 など）ものは番号として拾わない（両端だけ閉じるより聞き返す方が安全）
+        return " "
+
+    def take_run(match: re.Match) -> str:
+        parts = [int(p) for p in _RUN_SPLIT_RE.split(match.group(1)) if p]
+        if _looks_like_date(match.group(1), parts):
+            return match.group(0)
+        found.extend(parts)
+        return " "
+
+    plain = _NUM_RANGE_RE.sub(take_range, plain)
+    plain = _NUM_RUN_RE.sub(take_run, plain)
     for match in _NUM_FORMS_RE.finditer(plain):
         found.append(int(next(g for g in match.groups() if g)))
     plain = _NUM_FORMS_RE.sub(" ", plain)
@@ -254,8 +284,10 @@ def is_reopen_request(body: str) -> bool:
 
 # 「以外」の後ろにこれがあれば、済んでいない分の話が混ざっているので受けない
 _PENDING_RE = re.compile(r"(確認中|対応中|処理中|作業中|保留|後で|あとで|後ほど|明日|来週|未|まだ|待ち)")
-# 「以外」の前に番号以外の語が無いことを見る（番号・区切りを除いた残り）
-_NUMBER_SEPARATORS_RE = re.compile(r"^[\s、,，・/／とや及びおよび番No.()（）#＃]*$", re.IGNORECASE)
+# 「以外」の前に番号以外の語が無いことを見る（番号・区切り・範囲の語を除いた残り）
+_NUMBER_SEPARATORS_RE = re.compile(
+    r"^(?:[\s、,，・/／とや及びおよび番No.()（）#＃〜～~\-–—ー]|から|まで)*$", re.IGNORECASE
+)
 
 
 def exclusion_numbers(body: str) -> list[int] | None:
@@ -2090,7 +2122,8 @@ class FaxStatus:
 - 対応待ちには番号（①②…）が付いている。「①と③が済みました」のように番号で
   報告されたら、その番号のPDF名を done_filenames に入れる。番号は「44」「44番」「No.44」
   のように普通の数字で書かれることも多く、㊹と同じ番号である（一覧の（44）と照合する。
-  「44番は見当たらない」と返さない）。番号も「全て」も無い
+  「44番は見当たらない」と返さない）。「57.58.64.65」のように区切って並べたり、
+  「①〜⑤」「57〜60」と範囲で書かれることもある（範囲は間の番号も全部）。番号も「全て」も無い
   「対応完了」で対象が複数あるときは閉じず、どの番号か聞き返す
   （「全部でしたら『全て対応完了』とお返事ください」と添える）
 - 「①以外は完了」のような除外の形はプログラム側が扱う。done_all・done_filenames は

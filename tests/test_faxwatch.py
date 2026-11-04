@@ -1074,6 +1074,7 @@ class TestBatchedNotices:
         (f"[rp aid={AGENT} to={FAX_ROOM}-9000]①以外は対応完了", [1]),
         ("①以外は対応完了、③は確認中", None), ("光パックスの①以外は完了", None), ("全て以外", None),
         ("①以外は明日対応します", None), ("対応完了", None), ("①以外は後ほど", None),
+        ("①〜③以外は対応完了", [1, 2, 3]), ("57.58以外は対応完了", [57, 58]),
     ])
     def test_reading_the_excluded_numbers(self, body, expected):
         from raizuinu.faxwatch import exclusion_numbers
@@ -1251,6 +1252,14 @@ class TestBatchedNotices:
         ("3つとも対応完了", []), ("2通とも済みです", []), ("㉞㊳対応完了", [34, 38]),
         ("44対応完了", [44]), ("44番 対応完了", [44]), ("No.44 対応完了", [44]), ("44と45 対応完了", [44, 45]),
         (f"[rp aid={AGENT} to={FAX_ROOM}-9002]経理財務アシスタントさん\n44対応完了", [44]),
+        # 実例（2026-11-04 12:41）: ピリオド区切りを1つも読めず聞き返した
+        ("57.58.64.65対応完了", [57, 58, 64, 65]), ("57,58,64,65 対応完了", [57, 58, 64, 65]),
+        ("57/58/64/65 対応完了", [57, 58, 64, 65]), ("57/58 対応完了", [57, 58]), ("５７．５８ 対応完了", [57, 58]),
+        ("11/4 対応完了", []), ("11/4受信分 対応完了", []), ("No.57.58 対応完了", [57, 58]),
+        ("①〜⑤ 対応完了", [1, 2, 3, 4, 5]), ("57〜60対応完了", [57, 58, 59, 60]), ("57-60 対応完了", [57, 58, 59, 60]),
+        ("57から60まで対応完了", [57, 58, 59, 60]), ("①〜③と⑤ 対応完了", [1, 2, 3, 5]),
+        ("1〜80対応完了", []), ("81-49 対応完了", []), ("5,280円 対応完了", []), ("0742-81-4930 対応完了", []),
+        ("10:00-12:00に対応完了", []), ("10-12時に対応完了", []),
     ])
     def test_reading_numbers_from_a_reply(self, body, expected):
         from raizuinu.faxwatch import report_numbers
@@ -1529,6 +1538,22 @@ class TestRepliesToOwnListings:
         assert "- ㊹（44） / 0966_001.pdf / ジャポニックス / 直送依頼書" in system
         assert "「44番は見当たらない」と返さない" in system
         assert done == {"all": False, "filenames": ["0966_001.pdf"]}
+
+    def test_dot_separated_numbers_close_those(self, tmp_path):
+        # 実例（2026-11-04 12:41）: 「57.58.64.65対応完了」に、対応待ちが5件あるので番号を、と聞き返した
+        w = self.thanks_listing_two_then_a_new_one(tmp_path)
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9002]経理財務アシスタントさん\n1.2対応完了", NAKAURA_ID))
+        w.run_once()
+        assert [t["number"] for t in w.closed_last_run] == [1, 2] and w.asked_last_run == []
+        assert [t["number"] for t in w._load_state()["open"]] == [4]
+
+    def test_a_range_closes_everything_in_between(self, tmp_path):
+        # ①〜④（③は無い）→ ①②④。両端だけ閉じて間を取りこぼさない
+        w = self.thanks_listing_two_then_a_new_one(tmp_path)
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9003]①〜④ 対応完了"))
+        w.run_once()
+        assert sorted(t["number"] for t in w.closed_last_run) == [1, 2, 4]  # 返信先の④が先、①②は対応待ち全体から
+        assert w._load_state()["open"] == [] and "これでありません" in bodies(w)[-1]
 
     def test_linking_keeps_the_newest_ids_only(self):
         thread = {"check_ids": [str(i) for i in range(FaxWatcher.CHECK_IDS_KEEP)]}
