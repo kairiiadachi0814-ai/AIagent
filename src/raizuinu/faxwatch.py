@@ -198,7 +198,7 @@ _BARE_NUM_RE = re.compile(r"(?<![\d/:.\-_A-Za-z])(\d{1,2})(?!,\d{3}(?!\d))(?![\d
 _NUM_HEAD = r"(?<![\d_\-A-Za-z])"
 _NUM_TAIL = r"(?![\d/:.\-_月日円件時分個枚人つ通%受着届納])"
 _RANGE_SEP = r"(?:〜|～|~|-|–|—|ー|から)"
-_NUM_RANGE_RE = re.compile(rf"{_NUM_HEAD}(\d{{1,2}})\s*{_RANGE_SEP}\s*(\d{{1,2}})(?:\s*まで)?{_NUM_TAIL}")
+_NUM_RANGE_RE = re.compile(rf"{_NUM_HEAD}(\d{{1,2}})\s*{_RANGE_SEP}\s*(\d{{1,2}})(?:\s*(?:まで|迄))?{_NUM_TAIL}")
 _NUM_RUN_RE = re.compile(rf"{_NUM_HEAD}(\d{{1,2}}(?:\s*[.,/、・]\s*\d{{1,2}})+){_NUM_TAIL}")
 _RUN_SPLIT_RE = re.compile(r"[.,/、・\s]+")
 MAX_RANGE_SPAN = 30  # 「1〜80」のような打ち間違いで対応待ち全部を閉じない
@@ -286,7 +286,7 @@ def is_reopen_request(body: str) -> bool:
 _PENDING_RE = re.compile(r"(確認中|対応中|処理中|作業中|保留|後で|あとで|後ほど|明日|来週|未|まだ|待ち)")
 # 「以外」の前に番号以外の語が無いことを見る（番号・区切り・範囲の語を除いた残り）
 _NUMBER_SEPARATORS_RE = re.compile(
-    r"^(?:[\s、,，・/／とや及びおよび番No.()（）#＃〜～~\-–—ー]|から|まで)*$", re.IGNORECASE
+    r"^(?:[\s、,，・/／とや及びおよび番No.()（）#＃〜～~\-–—ー迄]|から|まで)*$", re.IGNORECASE
 )
 
 
