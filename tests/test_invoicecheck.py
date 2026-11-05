@@ -748,6 +748,26 @@ class TestReader:
         InvoiceReader(make_config(tmp_path), client=client).read_source("契約書.pdf", b"%PDF-1.4")
         assert client.calls == 1
 
+    def test_a_spaced_title_or_the_file_name_also_triggers_the_second_reading(self, tmp_path):
+        # 実例（2026-11-05）: 表題が「注　文　書（直送依頼書）」と字間の空いた文書を見逃した
+        line_15 = [{"code": "S0384-H-M", "quantity": 5, "unit_price": 1312, "amount": 6560}]
+        wrong = {"readable": True, "doc_type": DOC_CONTRACT, "title": "注　文　書 （直送依頼書）", "lines": [], "subtotal": 0, "total": 0}
+        client = fake_client([wrong, {**wrong, "lines": line_15}])
+        result = InvoiceReader(make_config(tmp_path), client=client).read_source("③J33.pdf", b"%PDF-1.4")
+        assert client.calls == 2 and result["doc_type"] == DOC_ORDER
+        # 表題に出ていなくても、フォルダ名・ファイル名が注文書なら確かめ直す（注文書と答えたときだけ受ける）
+        untitled = {"readable": True, "doc_type": DOC_CONTRACT, "title": "ユーコープ10-2", "lines": [], "subtotal": 0, "total": 0}
+        client = fake_client([untitled, {**untitled, "doc_type": DOC_ORDER, "lines": line_15}])
+        result = InvoiceReader(make_config(tmp_path), client=client).read_source("注文書/③J33.pdf", b"%PDF-1.4")
+        assert client.calls == 2 and result["doc_type"] == DOC_ORDER and "注文書の可能性があります" in client.content[-1]["text"]
+        client = fake_client([untitled, {**untitled, "lines": line_15}])  # 2回目も注文書と言わなければそのまま
+        result = InvoiceReader(make_config(tmp_path), client=client).read_source("注文書/単価表.pdf", b"%PDF-1.4")
+        assert client.calls == 2 and result["doc_type"] == DOC_CONTRACT and result["lines"] == []
+        # 当社の請求書（旧版）は、フォルダ名が注文書でも読み直さない
+        client = fake_client({"readable": True, "doc_type": DOC_INVOICE, "title": "御請求書", "lines": [], "subtotal": 0, "total": 0})
+        InvoiceReader(make_config(tmp_path), client=client).read_source("発注書/×旧請求書.pdf", b"%PDF-1.4")
+        assert client.calls == 1
+
     def test_a_reading_whose_lines_do_not_add_up_is_read_again(self, tmp_path):
         short = {"readable": True, "lines": [{"amount": 100}], "subtotal": 300, "total": 330}
         full = {"readable": True, "lines": [{"amount": 100}, {"amount": 200}], "subtotal": 300, "total": 330}

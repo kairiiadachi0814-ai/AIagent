@@ -21,7 +21,7 @@ from typing import Any
 
 import re
 
-from .invoicematch import BACKORDER_STATUSES, DOC_ORDER, DOC_TYPES, LINE_STATUSES, SEVERITIES, to_int
+from .invoicematch import BACKORDER_STATUSES, DOC_INVOICE, DOC_ORDER, DOC_TYPES, LINE_STATUSES, SEVERITIES, to_int
 
 PROMPT_VERSION = "2"
 
@@ -32,6 +32,18 @@ REREAD_ORDER_HINT = (
     "この文書は表題から注文書です。doc_type は「注文書」とし、品名と数量のある行を lines に1行も省かず"
     "書き出してください（notes や terms にまとめて書かない）。"
 )
+REREAD_ORDER_SOFT_HINT = (
+    "ファイル名・フォルダ名から、この文書は注文書の可能性があります。相手が当社に商品を注文している文書なら、"
+    "doc_type を「注文書」にして、品名と数量のある行を lines に1行も省かず書き出してください。"
+    "個別の注文ではない契約書・単価表・管理表であれば、そのままで構いません。"
+)
+
+
+def _says_order(text: Any) -> bool:
+    """表題やファイル名が注文書のものか（「注　文　書」のように字間が空いていても）。"""
+    import unicodedata
+
+    return bool(_ORDER_TITLE_RE.search(re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(text or "")))))
 REREAD_LINES_HINT = "前回の読み取りでは、行の金額の合計が文書の小計と合いませんでした。行を1行も省かず、金額を1字ずつ確かめて書き出してください。"
 
 FEE_OK, FEE_MISMATCH, FEE_UNKNOWN = "根拠どおり", "資料と不一致", "根拠が見当たらない"
@@ -339,10 +351,12 @@ class InvoiceReader:
         ask = f"この資料（ファイル名: {name}）の内容を書き出してください。"
         found = self._read("source", name, data, SOURCE_SYSTEM, SOURCE_SCHEMA, ask)
         if found.get("readable"):
-            is_order_title = bool(_ORDER_TITLE_RE.search(str(found.get("title") or "")))
-            if is_order_title and (found.get("doc_type") != DOC_ORDER or not found.get("lines")):
-                again = self._read("source", name, data, SOURCE_SYSTEM, SOURCE_SCHEMA, ask + "\n" + REREAD_ORDER_HINT, "reread-order")
-                if again.get("readable") and again.get("lines"):
+            by_title, by_name = _says_order(found.get("title")), _says_order(name)
+            misread = found.get("doc_type") != DOC_ORDER or not found.get("lines")
+            if found.get("doc_type") != DOC_INVOICE and (by_title or by_name) and misread:
+                hint = REREAD_ORDER_HINT if by_title else REREAD_ORDER_SOFT_HINT
+                again = self._read("source", name, data, SOURCE_SYSTEM, SOURCE_SCHEMA, ask + "\n" + hint, "reread-order")
+                if again.get("readable") and again.get("lines") and (by_title or again.get("doc_type") == DOC_ORDER):
                     found = {**again, "doc_type": DOC_ORDER}
             elif found.get("doc_type") == DOC_ORDER and not _lines_add_up(found, "subtotal"):
                 again = self._read("source", name, data, SOURCE_SYSTEM, SOURCE_SCHEMA, ask + "\n" + REREAD_LINES_HINT, "reread-lines")
