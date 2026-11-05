@@ -26,7 +26,7 @@ from raizuinu.invoicematch import (
     GroupCheck, build_order_book, check_arithmetic, check_requirements, code_tokens, codes_related, line_kind,
     month_end, norm_code, ship_tasks, task_ships, to_int, weekday_gap,
 )
-from raizuinu.invoiceread import FEE_MISMATCH, FEE_OK, FEE_UNKNOWN, InvoiceReader, file_blocks
+from raizuinu.invoiceread import FEE_MISMATCH, FEE_OK, FEE_UNKNOWN, REVIEW_SYSTEM, InvoiceReader, file_blocks
 from raizuinu.invoicereport import legal_notes, render_reply, render_report, summary_rows
 
 JST = timezone(timedelta(hours=9))
@@ -687,6 +687,27 @@ class TestShipmentLog:
         for mode, expected in (("note", [NOTE]), ("off", [])):
             _, result = run(*simple_case(), shipments=ship_tasks(rows), settings={**SETTINGS, "shipment_log": {"unattributed": mode}})
             assert [f["severity"] for f in found(result, "unattributed_shipment")] == expected
+
+    def test_questions_are_put_to_the_person_who_made_the_invoice(self):
+        # 指示（2026-11-05）: 営業担当者ではなく坂田さん（請求書を作った担当者）に確認する流れとする
+        rows = [ship_row(3, "2026-10-16", "2026-10-20", done=False), ship_row(92, "2026-10-26", "2026-10-28", tracking="67598350890")]
+        _, loose = run(*simple_case(), shipments=ship_tasks(rows))
+        assert found(loose, "unattributed_shipment")[0]["detail"].endswith("請求漏れ）の可能性があります。どの注文の出荷かをご確認ください")
+        assert found(loose, "shipping_evidence")[0]["detail"].endswith("出荷済みかをご確認のうえ、未出荷なら外してください")
+        invoices, sources, tasks = restock_case()
+        _, held = run(invoices, sources, shipments=tasks)
+        assert found(held, "not_shipped")[0]["detail"].endswith("当月中に出荷したかをご確認のうえ、未出荷なら外してください")
+        invoices, sources = split_shipment_case()
+        _, conflict = run(invoices, sources, shipments=tasks[:1])
+        assert found(conflict, "ship_conflict")[0]["detail"].endswith("どちらが正しいかをご確認ください")
+        invoices, sources = backorder_case()
+        probe = GroupCheck("テスト商事", invoices, sources, SETTINGS)
+        probe.prepare()
+        _, risky = run(invoices, sources, mapping=out_of_stock(probe))
+        for result in (loose, held, conflict, risky, run(*split_shipment_case())[1]):
+            assert all("営業担当に確認" not in f["detail"] for f in result["findings"])
+            assert "営業担当に確認" not in render_reply(result_of([result]))
+        assert "別の人への確認を求める書き方はしない" in REVIEW_SYSTEM
 
     def test_rows_that_straddle_the_month_are_left_to_the_other_month(self):
         rows = [

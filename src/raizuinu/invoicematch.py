@@ -172,7 +172,12 @@ def finding(
     severity: str, code: str, title: str, detail: str, invoice: str = "", amount: int = 0,
     lines: list[str] | None = None, brief: str = "",
 ) -> dict:
-    """指摘1件。invoice は対象の請求書ファイル（取引先全体の指摘なら空）。brief は返信案に載せる短い言い方。"""
+    """指摘1件。invoice は対象の請求書ファイル（取引先全体の指摘なら空）。brief は返信案に載せる短い言い方。
+
+    detail は、請求書を作った担当者（返信案の宛先）にそのまま尋ねる文にする。確認の相手は
+    その担当者で、「営業担当に確認してください」とは書かない（指示 2026-11-05: 営業担当者ではなく
+    坂田さんに確認する流れとする）。
+    """
     return {
         "severity": severity, "code": code, "title": title, "detail": detail,
         "invoice": invoice, "amount": int(amount), "lines": list(lines or []), "by": "照合", "brief": brief,
@@ -1046,7 +1051,7 @@ class GroupCheck:
         if conflicts:
             self.findings.append(finding(
                 CONFIRM, "ship_conflict", "資料では出荷済み、出荷管理表では未発送の記載",
-                "、".join(conflicts[:6]) + "。どちらが正しいかを営業担当に確認してください", "",
+                "、".join(conflicts[:6]) + "。どちらが正しいかをご確認ください", "",
             ))
         unread = [t for links in self.ship_links.values() for t in links if not t["read"] and str(t.get("team_comment") or "").strip()]
         if unread:
@@ -1125,7 +1130,7 @@ class GroupCheck:
         self.findings.append(finding(
             NOTE if mode == "note" else CONFIRM, "unattributed_shipment", "出荷管理表にあるのに、対応する注文書が資料に無い出荷",
             f"{len(found)} 件: {listing}。資料のどの注文の出荷か特定できません。入荷待ち分の後日の出荷か、"
-            "資料に無い注文（請求漏れ）の可能性があります。営業担当に確認してください", "",
+            "資料に無い注文（請求漏れ）の可能性があります。どの注文の出荷かをご確認ください", "",
             brief=f"出荷管理表に、対応する注文書が資料に無い出荷が {len(found)} 件あります（{'、'.join(t['label'] for t in found[:8])}）",
         ))
 
@@ -1218,7 +1223,7 @@ class GroupCheck:
             if state == NOT_SHIPPED:
                 self.findings.append(finding(
                     CONFIRM, "not_shipped", "出荷した記録の無い行を請求している",
-                    f"{len(lines)} 行・{yen(total)}（{listing}）は、出荷した記録がありません（{reasons}）。当月中に出荷したかを営業担当に確認し、未出荷なら外してください",
+                    f"{len(lines)} 行・{yen(total)}（{listing}）は、出荷した記録がありません（{reasons}）。当月中に出荷したかをご確認のうえ、未出荷なら外してください",
                     name, total, [l["id"] for l in lines],
                 ))
             else:
@@ -1261,7 +1266,7 @@ class GroupCheck:
                 # 出荷管理表があれば、どの注文も出荷を確かめられる。確かめられない注文は発行前に聞く
                 self.findings.append(finding(
                     CONFIRM, "shipping_evidence", "出荷管理表で出荷を確かめられない注文（発行前に出荷確認）",
-                    "。".join(unproven) + "。出荷済みかを営業担当に確認し、未出荷なら外してください",
+                    "。".join(unproven) + "。出荷済みかをご確認のうえ、未出荷なら外してください",
                     name, sum(l["amount"] for lines in by_order.values() for l in lines),
                     [l["id"] for lines in by_order.values() for l in lines],
                 ))
@@ -1269,7 +1274,7 @@ class GroupCheck:
                 why = "同じ注文に品切・入荷待ち・取消の行があり、残りの行も在庫の影響を受けている可能性があります。" if mode != "always" else ""
                 self.findings.append(finding(
                     CONFIRM, "shipping_evidence", "出荷の裏付けが無い行（発行前に出荷確認）",
-                    f"注文 {'、'.join(risky)} は、資料が注文書だけで出荷の記録がありません。{why}出荷済みかを営業担当に確認してください",
+                    f"注文 {'、'.join(risky)} は、資料が注文書だけで出荷の記録がありません。{why}出荷済みかをご確認ください",
                     name,
                 ))
             if plain:
