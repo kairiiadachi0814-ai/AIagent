@@ -835,6 +835,7 @@ class GroupCheck:
         self._check_dates()
         self._check_unbilled()
         self._check_figures()
+        self._ground_fees_by_file_names()
         self._check_identity()
         self._check_sources()
         for item in per_invoice:
@@ -1393,6 +1394,28 @@ class GroupCheck:
                         str(invoice.get("file") or ""),
                     ))
 
+    def _ground_fees_by_file_names(self) -> None:
+        """付随費用の根拠が資料の名前に書かれていれば、それを根拠にする。
+
+        条件をファイル名に書いて残す運用がある（リマーク: 「…商品提案書←原価の金額で請求、送料は
+        1pdfごと税抜き780円.xlsx」。大きくて中身を読んでいない資料）。費目の語と金額の両方が名前に
+        あるときだけ受ける。モデルの所見に任せると、同じ資料でも認めたり認めなかったりした
+        （実例 2026-11-05: 読み直したら「中身が空で確認できない」と4行とも要確認にした）。
+        """
+        names = [str(s.get("file") or "") for s in self.sources] + [str(u.get("file") or "") for u in self.unread]
+        flat = [(name, unicodedata.normalize("NFKC", name).replace(",", "")) for name in names]
+        for line in self.lines:
+            if line["kind"] != KIND_FEE or self.fee_basis.get(line["id"]) or line["id"] in self.pairs:
+                continue
+            word = _FEE_RE.search(str(line.get("description") or ""))
+            amounts = {abs(line["amount"]), abs(line["unit_price"])} - {0}
+            if not word or not amounts:
+                continue
+            for name, text in flat:
+                if word.group(1) in text and any(re.search(rf"(?<!\d){amount}(?!\d)", text) for amount in amounts):
+                    self.fee_basis[line["id"]] = f"資料名「{name}」"
+                    break
+
     def _check_identity(self) -> None:
         """品番は合うがJANが違う行（どちらかの誤記）。"""
         odd = []
@@ -1433,6 +1456,7 @@ class GroupCheck:
         """
         files = {str(i.get("file") or "") for i in self.invoices}
         checks = {str(c.get("invoice_line_id") or ""): c for c in review.get("fee_checks") or []}
+        ungrounded: dict[tuple[str, str, str], list[dict]] = {}
         for line in self.fee_lines():
             check = checks.get(line["id"])
             verdict, basis = (str(check.get("verdict") or ""), _one_line(check.get("basis"))) if check else ("", "")
@@ -1442,11 +1466,14 @@ class GroupCheck:
             elif verdict == fee_ok and basis:
                 self.fee_basis[line["id"]] = basis
             elif not self.fee_basis.get(line["id"]):
-                self.findings.append(finding(
-                    CONFIRM, "fee", "付随費用の根拠が資料に見当たらない",
-                    f"{label} の根拠（契約条件・指示）を資料から確かめられませんでした" + (f"（{basis}）" if basis else ""),
-                    line["invoice"], line["amount"], [line["id"]],
-                ))
+                ungrounded.setdefault((line["invoice"], label, basis), []).append(line)
+        for (invoice, label, basis), lines in ungrounded.items():  # 同じ内容の行は1件にまとめる
+            count = f"（{len(lines)} 行）" if len(lines) > 1 else ""
+            self.findings.append(finding(
+                CONFIRM, "fee", "付随費用の根拠が資料に見当たらない",
+                f"{label}{count} の根拠（契約条件・指示）を資料から確かめられませんでした" + (f"（{basis}）" if basis else ""),
+                invoice, sum(l["amount"] for l in lines), [l["id"] for l in lines],
+            ))
         for item in review.get("findings") or []:
             severity, evidence = str(item.get("severity") or ""), _one_line(item.get("evidence"))
             title, detail = _one_line(item.get("title")), _one_line(item.get("detail"))

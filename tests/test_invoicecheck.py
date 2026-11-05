@@ -402,6 +402,34 @@ class TestGroupedLinesFeesAndDates:
         fee = found(result, "fee")
         assert len(fee) == 1 and fee[0]["severity"] == CONFIRM and "名入代" in fee[0]["detail"]
 
+    def remark_case(self):
+        """リマークの形: 注文ごとに送料780円。条件は、中身を読んでいない資料の名前に書かれている。"""
+        sources = [order(f"発注書/10.{day} 発注書.xlsx", "", f"2026-10-{day:02d}", [oline("C017-A", 5, 1380)]) for day in (5, 8)]
+        lines = []
+        for day in (5, 8):
+            lines += [line(f"2026-10-{day:02d}", "C017-A", 5, 1380), line(f"2026-10-{day:02d}", "SOU01", 1, 780, "送料")]
+        return [invoice("請求書.pdf", lines)], sources
+
+    def test_a_fee_written_in_a_file_name_is_grounded_by_code(self):
+        # 実例（2026-11-05）: モデルに任せると、同じ資料名を根拠と認めたり「中身が空で確認できない」と
+        # 4行とも要確認にしたりした。費目の語と金額が資料名にあれば、コードで根拠にする
+        unread = [{"file": "株式会社リマーク様商品提案書←原価の金額で請求、送料は1pdfごと税抜き780円.xlsx", "reason": "中身が空"}]
+        unknown = {"fee_checks": [{"invoice_line_id": i, "verdict": FEE_UNKNOWN, "basis": "中身が空で確認できない"} for i in ("I2", "I4")], "findings": []}
+        check, result = run(*self.remark_case(), review=unknown, unread=unread)
+        assert found(result, "fee") == [] and result["invoices"][0]["verdict"] == VERDICT_OK
+        fees = [row for row in result["lines"] if row["kind"] == "付随費用"]
+        assert [(row["result"], row["source"]) for row in fees] == [("根拠あり", f"資料名「{unread[0]['file']}」")] * 2
+        # 金額が違う・費目の語が無い名前は根拠にしない。同じ内容の行は1件にまとめて聞く
+        for name in ("提案書←送料は1pdfごと税抜き1,780円.xlsx", "提案書←名入代780円.xlsx", "提案書.xlsx"):
+            _, result = run(*self.remark_case(), review=unknown, unread=[{"file": name, "reason": "中身が空"}])
+            fee = found(result, "fee")
+            assert len(fee) == 1 and fee[0]["severity"] == CONFIRM and fee[0]["amount"] == 1560 and len(fee[0]["lines"]) == 2
+            assert "「送料」780円（2 行） の根拠（契約条件・指示）を資料から確かめられませんでした（中身が空で確認できない）" in fee[0]["detail"]
+        # 桁区切りのある金額、資料（読めたもの）の名前でも受ける
+        sources = self.remark_case()[1] + [other("送料 1件 ７８０円（税抜）の覚書.pdf", DOC_CONTRACT)]
+        _, result = run(self.remark_case()[0], sources, review=unknown)
+        assert found(result, "fee") == []
+
     def test_a_fee_the_model_says_contradicts_the_terms_is_asked_about(self):
         review = {"fee_checks": [{"invoice_line_id": "I2", "verdict": FEE_MISMATCH, "basis": "契約書M.pdf では300枚の名入代は1,500円ではなく2,000円"}], "findings": []}
         _, result = run(*calendar_case(), mapping=calendar_mapping(), review=review)
