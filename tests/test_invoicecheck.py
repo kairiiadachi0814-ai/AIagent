@@ -684,12 +684,15 @@ class TestChecker:
 
 
 def fake_client(payload):
+    """payload は1つの答えか、呼び出し順に返す答えのリスト（最後を繰り返す）。"""
+    payloads = payload if isinstance(payload, list) else [payload]
     client = SimpleNamespace(calls=0, kwargs=None, content=None)
 
     def create(messages, **kwargs):
+        answer = payloads[min(client.calls, len(payloads) - 1)]
         client.calls += 1
         client.kwargs, client.content = kwargs, messages[0]["content"]
-        text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+        text = answer if isinstance(answer, str) else json.dumps(answer, ensure_ascii=False)
         return SimpleNamespace(
             stop_reason="end_turn", content=[SimpleNamespace(type="text", text=text)],
             usage=SimpleNamespace(input_tokens=3000, output_tokens=500, cache_creation_input_tokens=0, cache_read_input_tokens=0),
@@ -729,6 +732,37 @@ class TestReader:
         # 中身が違えば読み直す
         again.read_invoice("請求書.pdf", b"%PDF-1.4 other")
         assert client.calls == 2
+
+    def test_an_order_misread_as_another_kind_is_read_again(self, tmp_path):
+        # 実例（2026-11-05）: 表題「注文書（直送依頼書）」を「契約書・取引条件」と読み、行を書き出さなかった
+        wrong = {"readable": True, "doc_type": DOC_CONTRACT, "title": "注文書（直送依頼書）", "lines": [], "subtotal": 0, "total": 0}
+        right = {"readable": True, "doc_type": DOC_CONTRACT, "title": "注文書（直送依頼書）",
+                 "lines": [{"code": "S0384-H-M", "quantity": 15, "unit_price": 1312, "amount": 19680}], "subtotal": 19680, "total": 21648}
+        client = fake_client([wrong, right])
+        reader = InvoiceReader(make_config(tmp_path), client=client)
+        result = reader.read_source("②K12079.pdf", b"%PDF-1.4")
+        assert client.calls == 2 and result["doc_type"] == DOC_ORDER and len(result["lines"]) == 1
+        assert "この文書は表題から注文書です" in client.content[-1]["text"]
+        # 契約書の表題なら読み直さない
+        client = fake_client({"readable": True, "doc_type": DOC_CONTRACT, "title": "商品契約書", "lines": [], "subtotal": 0, "total": 0})
+        InvoiceReader(make_config(tmp_path), client=client).read_source("契約書.pdf", b"%PDF-1.4")
+        assert client.calls == 1
+
+    def test_a_reading_whose_lines_do_not_add_up_is_read_again(self, tmp_path):
+        short = {"readable": True, "lines": [{"amount": 100}], "subtotal": 300, "total": 330}
+        full = {"readable": True, "lines": [{"amount": 100}, {"amount": 200}], "subtotal": 300, "total": 330}
+        client = fake_client([short, full])
+        result = InvoiceReader(make_config(tmp_path), client=client).read_invoice("請求書.pdf", b"%PDF-1.4")
+        assert client.calls == 2 and len(result["lines"]) == 2
+        assert "行の金額の合計が文書の小計と合いませんでした" in client.content[-1]["text"]
+        # 読み直しても合わなければ最初の読み取りのまま（請求書そのものの誤りとして検算で出る）
+        client = fake_client([short, short])
+        result = InvoiceReader(make_config(tmp_path), client=client).read_invoice("請求書.pdf", b"%PDF-1.4")
+        assert client.calls == 2 and len(result["lines"]) == 1
+        # 合っていれば読み直さない。相殺で小計が0円の請求書も読み直さない
+        client = fake_client({"readable": True, "lines": [{"amount": 79771}, {"amount": -79771}], "subtotal": 0, "total": 0})
+        InvoiceReader(make_config(tmp_path), client=client).read_invoice("請求書.pdf", b"%PDF-1.4")
+        assert client.calls == 1
 
     def test_an_answer_that_is_not_json_is_unreadable(self, tmp_path):
         reader = InvoiceReader(make_config(tmp_path), client=fake_client("読めませんでした"))

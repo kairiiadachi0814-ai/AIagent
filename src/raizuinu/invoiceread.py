@@ -19,9 +19,20 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from .invoicematch import BACKORDER_STATUSES, DOC_TYPES, LINE_STATUSES, SEVERITIES
+import re
 
-PROMPT_VERSION = "1"
+from .invoicematch import BACKORDER_STATUSES, DOC_ORDER, DOC_TYPES, LINE_STATUSES, SEVERITIES, to_int
+
+PROMPT_VERSION = "2"
+
+# 表題がこれなら注文書。実例（2026-11-05）: 表題「注文書（直送依頼書）」の文書を「契約書・取引条件」と
+# 読み、行を書き出さなかった（請求書の行が「資料に対応なし」になった）。読み違いは読み直す
+_ORDER_TITLE_RE = re.compile(r"(注文書|発注書|注文伝票|発注伝票|直送依頼|注文表)")
+REREAD_ORDER_HINT = (
+    "この文書は表題から注文書です。doc_type は「注文書」とし、品名と数量のある行を lines に1行も省かず"
+    "書き出してください（notes や terms にまとめて書かない）。"
+)
+REREAD_LINES_HINT = "前回の読み取りでは、行の金額の合計が文書の小計と合いませんでした。行を1行も省かず、金額を1字ずつ確かめて書き出してください。"
 
 FEE_OK, FEE_MISMATCH, FEE_UNKNOWN = "根拠どおり", "資料と不一致", "根拠が見当たらない"
 
@@ -184,12 +195,14 @@ INVOICE_SYSTEM = _COMMON + """
 SOURCE_SYSTEM = _COMMON + """
 今回は、請求書の作成元資料（注文書・発注書、契約書、売上報告書、管理表など）を読み、内容を
 決まった形に書き出します。ファイル名にも意味がある（①②の番号、「発送分」「請求無し」「返信」など）。
-- doc_type:
-  注文書 … 相手が当社に商品を注文している文書（発注書・直送依頼書・注文伝票を含む）
-  契約書・取引条件 … 商品契約書、単価表、送料の条件
+- doc_type は表題と中身で決める:
+  注文書 … 相手が当社に商品を注文している文書。表題が「注文書」「発注書」「直送依頼書」「注文伝票」なら
+  必ずこれ（納品の注意書きや押印欄があっても注文書）
+  契約書・取引条件 … 商品契約書、単価表、送料の条件を定めた文書（個別の注文ではないもの）
   売上報告書／相殺・残高の管理表／欠品・入荷待ちの管理表／出荷記録
   請求書 … 当社が発行した請求書（旧版や控えを含む）
-- 注文書は lines に全行を書く。単価・金額が書かれていなければ 0
+- 注文書は、品名と数量のある行を lines に1行も省かず書く（notes にまとめて書かない）。単価・金額が
+  書かれていなければ 0。送り状の書き方や梱包の指示のような注意書きは terms に入れない
 - 行に手書きや赤い線で消し線が引かれていれば status は「消し線」、枠や丸で囲まれていれば「囲み」、
   それ以外は「通常」。大きな×や斜線で複数の行がまとめて消されていれば、その範囲の行はすべて「消し線」
   （枠で囲まれた行は消されていない）
@@ -197,7 +210,8 @@ SOURCE_SYSTEM = _COMMON + """
   true（ファイル名に「発送分」「出荷分」とあるもの）。そのとき ship_date は出荷した日
   （ファイル名の 261009 は 2026-10-09）。消し線が「取消・欠品」を表すだけの注文書は false
 - shipping_evidence は、送り状番号・運送会社名の書き込みなど、実際に出荷したことが分かる記載。
-  出荷日の指定や納期の希望は出荷の証拠ではない
+  出荷日の指定や納期の希望は出荷の証拠ではない。欄が空いているだけのときは空文字にし、
+  「未記入だから出荷していない」のような推測を notes にも書かない
 - order_date は文書の日付（注文日）、ship_date は出荷日の指定、delivery_date は納品期日・着日指定
 - 契約書・取引条件は terms に、請求額の根拠になる条件（商品名と単価、数量ごとの名入れ代、
   送料の条件、元払の条件など）を原文に近い短い文で1条件ずつ
@@ -224,25 +238,36 @@ INTERPRET_SYSTEM = _COMMON + """
 """
 
 REVIEW_SYSTEM = _COMMON + """
-コードによる照合（行の突合・検算・適格請求書の記載要件）は済んでいます。あなたは、コードでは
-判断できない点だけを確認し、所見を書きます。
-確認する点:
-- 送料・名入代など注文書の行以外の請求（fee_lines）が、契約書・取引条件・依頼文・資料名の記載
-  どおりか。行ごとに fee_checks へ（資料名に条件が書かれていることがある。読めなかった資料の
-  名前も渡される）
-- 注文書に単価が無い取引先で、単価が契約書・取引条件どおりか
-- 備考・注記の内容が、資料や依頼文と食い違っていないか
-- 依頼文にある営業担当の指示（修正の依頼など）が請求書に反映されているか
-- 確認事項の一覧（checklist）にあって、上に無い点
+コードによる照合（行の突合・検算・適格請求書の記載要件・出荷状況）は済んでいます。あなたは、
+コードでは判断できない次の点だけを確認します。
+1. 送料・名入代など注文書の行以外の請求（fee_lines）が、契約書・取引条件・依頼文・資料名の記載
+   どおりか。行ごとに fee_checks へ書く（資料名に条件が書かれていることがある。読めなかった資料の
+   名前も渡される）。fee_lines が空なら fee_checks も空
+2. 注文書に単価が書かれていない取引先で、請求書の単価が契約書・取引条件の単価と食い違っていないか
+3. 備考・注記に書かれた内容（納品先・送料負担・相殺の説明など）が、資料や依頼文と食い違っていないか
+4. 依頼文にある営業担当の指示（修正の依頼）が、請求書に反映されていないものが無いか
+findings に書いてよいのは、上の2〜4で、資料または依頼文の記載と請求書の記載の食い違いを、
+両方を引用して示せるときだけ。次のことは書かない:
+- 出荷したかどうか（コードが判定している。資料の空欄や書き込みから推測しない）
+- 資料に記載が無いというだけの指摘（振込先・振込手数料・支払期日・挨拶文など請求書の定型の文言を含む）
+- コードが既に出した指摘（code_findings）と同じこと、良い点の列挙、一般的な注意
+- 営業担当が「このままでよい」と答えている点
 守ること:
-- コードが既に出した指摘（code_findings）と同じことは書かない
-- evidence に、根拠の資料名と該当の記載を必ず書く。根拠を示せないことは書かない
+- evidence に、根拠の資料名と該当の記載を必ず書く
 - 金額を自分で計算し直して別の数字を作らない。資料と請求書に書かれた数字だけを使う
-- severity: 資料の記載と請求書が明確に食い違う → 要修正。資料からは確かめられない・根拠が
-  見当たらない → 要確認。問題は無いが知らせる価値がある → 留意
-- 営業担当が「このままでよい」と答えている点は、問題にしない
-- 問題が無ければ findings は空でよい。良い点の列挙や一般論は書かない
+- severity: 資料の記載と請求書が明確に食い違う → 要修正。契約書に無い単価など、資料では
+  確かめられない点 → 要確認。問題ではないが管理者が知っておくとよい食い違い → 留意
+- 該当が無ければ findings は空にする（空が普通）
 """
+
+
+def _lines_add_up(found: dict, total_key: str) -> bool:
+    """行の金額の合計が、文書に書かれた小計と合っているか（小計が無い文書は合っている扱い）。"""
+    lines = found.get("lines") or []
+    total = to_int(found.get(total_key))
+    if not total:
+        return bool(lines) or total_key != "subtotal" or not found.get("total")
+    return sum(to_int(l.get("amount")) for l in lines) == total
 
 
 def file_blocks(name: str, data: bytes, settings: dict) -> tuple[list[dict] | None, str]:
@@ -299,15 +324,30 @@ class InvoiceReader:
     # --- 公開API ---
 
     def read_invoice(self, name: str, data: bytes) -> dict:
-        found = self._read("invoice", name, data, INVOICE_SYSTEM, INVOICE_SCHEMA,
-                           f"この請求書（{name}）の内容を書き出してください。")
+        ask = f"この請求書（{name}）の内容を書き出してください。"
+        found = self._read("invoice", name, data, INVOICE_SYSTEM, INVOICE_SCHEMA, ask)
+        if found.get("readable") and not _lines_add_up(found, "subtotal"):
+            # 行を落とす・金額を読み違えると、検算で「合計が合わない」という誤った指摘になる。一度だけ読み直す
+            again = self._read("invoice", name, data, INVOICE_SYSTEM, INVOICE_SCHEMA, ask + "\n" + REREAD_LINES_HINT, "reread")
+            if again.get("readable") and _lines_add_up(again, "subtotal"):
+                found = again
         found.setdefault("readable", False)
         found["file"] = name
         return found
 
     def read_source(self, name: str, data: bytes) -> dict:
-        found = self._read("source", name, data, SOURCE_SYSTEM, SOURCE_SCHEMA,
-                           f"この資料（ファイル名: {name}）の内容を書き出してください。")
+        ask = f"この資料（ファイル名: {name}）の内容を書き出してください。"
+        found = self._read("source", name, data, SOURCE_SYSTEM, SOURCE_SCHEMA, ask)
+        if found.get("readable"):
+            is_order_title = bool(_ORDER_TITLE_RE.search(str(found.get("title") or "")))
+            if is_order_title and (found.get("doc_type") != DOC_ORDER or not found.get("lines")):
+                again = self._read("source", name, data, SOURCE_SYSTEM, SOURCE_SCHEMA, ask + "\n" + REREAD_ORDER_HINT, "reread-order")
+                if again.get("readable") and again.get("lines"):
+                    found = {**again, "doc_type": DOC_ORDER}
+            elif found.get("doc_type") == DOC_ORDER and not _lines_add_up(found, "subtotal"):
+                again = self._read("source", name, data, SOURCE_SYSTEM, SOURCE_SCHEMA, ask + "\n" + REREAD_LINES_HINT, "reread-lines")
+                if again.get("readable") and _lines_add_up(again, "subtotal"):
+                    found = again
         found.setdefault("readable", False)
         found["file"] = name
         return found
@@ -325,11 +365,11 @@ class InvoiceReader:
 
     # --- 内部 ---
 
-    def _read(self, kind: str, name: str, data: bytes, system: str, schema: dict, ask: str) -> dict:
+    def _read(self, kind: str, name: str, data: bytes, system: str, schema: dict, ask: str, attempt: str = "") -> dict:
         blocks, reason = file_blocks(name, data, self.settings)
         if blocks is None:
             return {"readable": False, "unread_reason": reason}
-        key = hashlib.sha1(data).hexdigest() + "|" + name
+        key = hashlib.sha1(data).hexdigest() + "|" + name + "|" + attempt
         found = self._ask(kind, system, schema, blocks + [{"type": "text", "text": ask}], key)
         return found if found is not None else {"readable": False, "unread_reason": "読み取りに失敗"}
 
