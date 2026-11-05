@@ -21,10 +21,12 @@ from typing import Any
 
 import re
 
-from .invoicematch import BACKORDER_STATUSES, DOC_INVOICE, DOC_ORDER, DOC_TYPES, LINE_STATUSES, SEVERITIES, to_int
+from .invoicematch import (
+    BACKORDER_STATUSES, DOC_INVOICE, DOC_ORDER, DOC_TYPES, LINE_STATUSES, SEVERITIES, SHIP_PURPOSES, to_int,
+)
 
 # 読み取り結果の控えは、指示文の版ごとに持つ（指示を直した種類だけ読み直す）
-PROMPT_VERSIONS = {"invoice": "2", "source": "2", "interpret": "2", "review": "3"}
+PROMPT_VERSIONS = {"invoice": "2", "source": "2", "interpret": "2", "review": "3", "shiplog": "1"}
 
 # 表題がこれなら注文書。実例（2026-11-05）: 表題「注文書（直送依頼書）」の文書を「契約書・取引条件」と
 # 読み、行を書き出さなかった（請求書の行が「資料に対応なし」になった）。読み違いは読み直す
@@ -185,6 +187,25 @@ REVIEW_SCHEMA: dict[str, Any] = _obj({
     })),
 })
 
+_SHIP_ITEM = {"code": _s("品番。無ければ空"), "description": _s("品名。無ければ空")}
+
+SHIPLOG_SCHEMA: dict[str, Any] = _obj({
+    "rows": _arr(_obj({
+        "id": _s("渡された行の id をそのまま"),
+        "items": _arr(_obj({**_SHIP_ITEM, "quantity": _n("書かれていなければ 0")}), "発送を頼まれた商品。書かれていなければ空"),
+        "unshipped": _arr(
+            _obj({**_SHIP_ITEM, "quote": _s("根拠の記載をそのまま")}),
+            "発送できなかった商品、後日の発送になった商品。書かれていなければ空",
+        ),
+        "nothing_shipped": _b("この依頼では何も発送していないと書かれているか"),
+        "partial": _b("在庫のある分だけ発送する依頼か"),
+        "quote": _s("nothing_shipped・partial の根拠の記載をそのまま。どちらも false なら空"),
+        "shipped_on": _s("期日と違う日に発送したと書かれていればその日 YYYY-MM-DD。無ければ空"),
+        "arrival_date": _s("着日の指定 YYYY-MM-DD。無ければ空"),
+        "purpose": {"type": "string", "enum": SHIP_PURPOSES},
+    })),
+})
+
 _COMMON = """あなたは株式会社ライズクリエイション経理財務部のアシスタントです。
 当社が取引先へ発行する請求書を、発行前に作成元の資料と照合する作業の一部を担当します。
 - 文書に書かれていることだけを使う。書かれていないことを推測で補わない
@@ -248,6 +269,30 @@ INTERPRET_SYSTEM = _COMMON + """
    「キャンセル」などの説明があるもの。reason にその根拠の文言を引用する。説明が見当たらない行は
    書かない（請求漏れとして人が確認する）
 依頼文で「同じ商品」と説明されている品番の違い（枝番の有無など）は、その説明に従う。
+"""
+
+SHIPLOG_SYSTEM = _COMMON + """
+今回は、卸の出荷管理表（営業担当が納品チームへ出した発送依頼の一覧）の行を読み、コメント欄に
+書かれた内容を決まった形に書き出します。1行が1件の発送依頼です。
+- comment は依頼者（営業担当）のコメント、team_comment は納品チーム（倉庫）のコメント、
+  tracking は伝票番号の欄。年の無い日付は、その行の依頼日・期日の年で補う
+- items: 発送を頼まれた商品が品番や品名で書かれていれば、1商品ずつ（品番・品名・数量）。
+  「R0528-A→R0528-A-A で発送」のような読み替えは、発送する側（R0528-A-A）を書く。
+  在庫数や確保数など、発送の数量ではない数字は入れない
+- unshipped: 発送できなかった商品、後日の発送になった商品（「在庫なし」「入荷待ち」
+  「在庫補充され次第発送」と書かれた品番）。「上記4品番以外発送済」は、挙げられた4品番が
+  未発送という意味。quote に根拠の記載をそのまま写す
+- nothing_shipped: この依頼では何も発送していないと書かれていれば true
+  （「全商品在庫ありません」など）。quote に根拠の記載をそのまま写す
+- partial: 「在庫のある分だけ発送」のように、一部だけの発送になり得る依頼なら true。
+  quote に根拠の記載をそのまま写す
+- shipped_on: 期日と違う日に発送したと書かれていれば（「13日に発送完了」）その日。無ければ空
+- arrival_date: 着日の指定（「10/7着依頼」「10/10AM必着」）。無ければ空
+- purpose: サンプルだけの発送なら「サンプル」、クレーム・不良・不足分への対応の発送なら
+  「クレーム・不良対応」、それ以外は「通常の出荷」（注文の発送にサンプルを同梱するだけなら
+  「通常の出荷」）
+- 伝票番号の欄が空いているだけで未発送と決めない。書かれていないことは空のままにする
+- 渡された行は、id をそのまま付けてすべて返す
 """
 
 REVIEW_SYSTEM = _COMMON + """
@@ -382,6 +427,17 @@ class InvoiceReader:
     def review(self, payload: dict) -> dict:
         text = "照合の結果と資料:\n" + json.dumps(payload, ensure_ascii=False, indent=1)
         return self._ask("review", REVIEW_SYSTEM, REVIEW_SCHEMA, [{"type": "text", "text": text}], text) or {}
+
+    def read_shiplog(self, name: str, rows: list[dict]) -> dict:
+        """出荷管理表の行のコメント欄を読む。読めなければ空（依頼日・期日・伝票番号だけで照合する）。"""
+        if not rows:
+            return {}
+        payload = [
+            {k: row.get(k) for k in ("id", "request_date", "due_date", "done", "comment", "tracking", "team_comment")}
+            for row in rows
+        ]
+        text = f"取引先「{name}」あての発送依頼の行:\n" + json.dumps(payload, ensure_ascii=False, indent=1)
+        return self._ask("shiplog", SHIPLOG_SYSTEM, SHIPLOG_SCHEMA, [{"type": "text", "text": text}], text) or {}
 
     # --- 内部 ---
 

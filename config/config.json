@@ -247,6 +247,16 @@
       { "name": "株式会社ライズクリエイション", "registration_number": "T8150001018250" }
     ],
     "shipping_evidence": "risk",
+    "shipment_log": {
+      "_note": "卸の出荷管理表（Googleスプレッドシート「タスク管理」。月ごとのタブ）。卸の請求書確認で、注文書・請求書の内容を出荷の実績と突き合わせる（指示 2026-11-05）。共有は「リンクを知っている全員」が前提",
+      "enabled": true,
+      "spreadsheet_id": "1e1PeI1kJ2nS3rK4uDvvWq_Wx-BTUAQbqfmKdvcuAa3o",
+      "case_file": "出荷管理表.xlsx",
+      "aliases": {},
+      "days_before": 7,
+      "days_after": 14,
+      "unattributed": "confirm"
+    },
     "max_file_mb": 20,
     "max_source_files": 40,
     "checklist": [

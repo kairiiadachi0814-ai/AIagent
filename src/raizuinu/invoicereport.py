@@ -75,11 +75,47 @@ def _line_table(lines: list[dict]) -> list[str]:
     return out
 
 
+def _ship_table(shipments: dict) -> list[str]:
+    """出荷管理表との照合（注文ごとの出荷の行）。"""
+    out = ["**出荷管理表との照合**", "", "| 注文 | 出荷管理表の行 | 依頼日 | 期日 | 伝票番号 | コメント |", "|---|---|---|---|---|---|"]
+    for order in shipments.get("orders") or []:
+        tasks = order.get("tasks") or []
+        if not tasks:
+            out.append(f"| {_cell(order.get('order'))} | 出荷の行なし | | | | |")
+        for task in tasks:
+            label = str(task.get("label") or "") + ("（他の注文と同じ出荷）" if order.get("shared") else "")
+            tracking = task.get("tracking") or ("完了・記載なし" if task.get("done") else "未完了")
+            comment = "／".join(
+                text for text in (
+                    f"納品チーム「{task['team_comment']}」" if task.get("team_comment") else "",
+                    f"依頼者「{task['comment']}」" if task.get("comment") else "",
+                ) if text
+            )
+            out.append(
+                f"| {_cell(order.get('order'))} | {_cell(label)} | {short_date(task.get('request_date'))} "
+                f"| {short_date(task.get('due_date'))} | {_cell(tracking)} | {_cell(comment)} |"
+            )
+    out.append("")
+    loose = shipments.get("unattributed") or []
+    if loose:
+        out.append("どの注文とも結べなかった出荷の行: " + "、".join(
+            f"{t.get('label')}（依頼 {short_date(t.get('request_date'))}・期日 {short_date(t.get('due_date'))}）" for t in loose
+        ) + "。")
+    others = shipments.get("others") or []
+    if others:
+        out.append("請求の対象外とみた行: " + "、".join(
+            f"{t.get('label')}（{short_date(t.get('due_date'))} {t.get('purpose')}）" for t in others
+        ) + "。")
+    if loose or others:
+        out.append("")
+    return out
+
+
 def legal_notes(result: dict) -> list[str]:
     """税法・法的リスクの欄。結果に応じて足す。"""
     notes: list[str] = []
     findings = [f for g in result.get("groups") or [] for f in g.get("findings") or []]
-    if any(f.get("code") in ("duplicate", "not_billable", "not_shipped", "shipping_evidence") and f.get("severity") in (FIX, CONFIRM) for f in findings):
+    if any(f.get("code") in ("duplicate", "not_billable", "not_shipped", "shipping_evidence", "cutoff") and f.get("severity") in (FIX, CONFIRM) for f in findings):
         notes.append("過大請求・未出荷分の請求: そのまま発行すると、先方への過大請求と課税売上の早すぎる計上になります。発行前に修正・確認が必要です。")
     returned = 0
     for group in result.get("groups") or []:
@@ -104,6 +140,11 @@ def render_report(result: dict) -> str:
     if result.get("case"):
         out.append(f"- 対象: {result.get('case')}")
     out.append(f"- 請求書: {len(rows)} 通（取引先 {len(result.get('groups') or [])} 社）")
+    log = result.get("shipment_log") or {}
+    if log.get("used"):
+        out.append("- 出荷管理表: 注文ごとに出荷の行（期日・伝票番号・納品チームコメント）と突き合わせ")
+    elif log.get("note"):
+        out.append(f"- 出荷管理表: {log.get('note')}")
     out.append("- 最終承認: 足立さん（この報告は確認の結果であり、発行の判断ではありません）")
     out += ["", "## 結論", ""]
     need = [r for r in rows if r["verdict"] != VERDICT_OK]
@@ -153,6 +194,9 @@ def render_report(result: dict) -> str:
                 reason = item.get("reason") or "理由の記載なし"
                 out.append(f"- {item.get('order_number') or item.get('file')} {what} {item['quantity']:g}（{reason}）")
             out.append("")
+        shipments = group.get("shipments") or {}
+        if shipments.get("used"):
+            out += _ship_table(shipments)
         basis = group.get("date_basis") or {}
         if basis:
             out.append("明細の日付の基準: " + "、".join(f"{k} {v} 行" for k, v in basis.items()) + "。")

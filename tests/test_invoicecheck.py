@@ -6,6 +6,8 @@
 - 2026-11-04 新日本カレンダー: 訂正前の納期の日付が明細に残っていた
 - 2026-10-02 ナガセ 9月分: 入荷待ちの2行を請求（承認後に営業の連絡で削除）
 - 2026-11-05 サクラマチ: 問題なし（出荷の記録が無い注文は留意どまり）
+- 2026-11-05 出荷管理表（卸の発送依頼の一覧）との突き合わせ: ナガセ 9月分の「全商品在庫ありません」、
+  10月分の「上記4品番以外発送済」と後日の発送、11/2 期日の出荷、どの注文とも結べない出荷
 """
 
 from __future__ import annotations
@@ -20,8 +22,9 @@ from raizuinu.config import Config
 from raizuinu.invoicecheck import InvoiceChecker, load_case
 from raizuinu.invoicematch import (
     BACKORDER_WAITING, CONFIRM, DOC_BACKORDER, DOC_CONTRACT, DOC_INVOICE, DOC_LEDGER, DOC_ORDER, DOC_SALES,
-    FIX, LINE_BOXED, LINE_NORMAL, LINE_STRUCK, NOTE, VERDICT_OK,
-    GroupCheck, build_order_book, check_arithmetic, check_requirements, line_kind, norm_code, to_int,
+    FIX, LINE_BOXED, LINE_NORMAL, LINE_STRUCK, NOTE, PURPOSE_CLAIM, PURPOSE_NORMAL, PURPOSE_SAMPLE, VERDICT_OK,
+    GroupCheck, build_order_book, check_arithmetic, check_requirements, code_tokens, codes_related, line_kind,
+    month_end, norm_code, ship_tasks, task_ships, to_int, weekday_gap,
 )
 from raizuinu.invoiceread import FEE_MISMATCH, FEE_OK, FEE_UNKNOWN, InvoiceReader, file_blocks
 from raizuinu.invoicereport import legal_notes, render_reply, render_report, summary_rows
@@ -73,8 +76,8 @@ def other(file, doc_type, **over):
     return order(file, "", "", [], doc_type=doc_type, **over)
 
 
-def run(invoices, sources, mapping=None, review=None, settings=None, unread=None):
-    check = GroupCheck("テスト商事", invoices, sources, settings or SETTINGS, unread)
+def run(invoices, sources, mapping=None, review=None, settings=None, unread=None, shipments=None):
+    check = GroupCheck("テスト商事", invoices, sources, settings or SETTINGS, unread, shipments)
     check.prepare()
     if mapping is not None:
         check.apply_interpretation(mapping)
@@ -525,6 +528,286 @@ class TestArithmeticAndRequirements:
         assert norm_code("ｒ０４０６－black") == norm_code("R0406-BLACK") == "R0406-BLACK"
 
 
+# --- 出荷管理表との突き合わせ ---
+
+
+def ship_row(number, requested, due, comment="", tracking="", team="", done=True, task="商品発送", vendor="テスト商事"):
+    """出荷管理表の1行（shiplog.parse_workbook が返す形）。"""
+    month = requested[:7]
+    return {
+        "id": f"{month}#{number}", "label": f"{int(month[5:])}月 No.{number}", "number": str(number), "month": month,
+        "request_date": requested, "vendor": vendor, "owner": "山田", "due_date": due, "task": task, "link": "",
+        "comment": comment, "handler": "竹内", "done": done, "stock": "", "tracking": tracking, "team_comment": team,
+    }
+
+
+def fact(row, **over):
+    """コメント欄の読み取り（モデルの答えに当たるもの）。"""
+    return {"id": row["id"], "items": [], "unshipped": [], "nothing_shipped": False, "partial": False, "quote": "",
+            "shipped_on": "", "arrival_date": "", "purpose": PURPOSE_NORMAL, **over}
+
+
+def simple_case(order_date="2026-10-16", line_date=None, **over):
+    """注文1件・請求1行。"""
+    sources = [order("⑤注文書.pdf", "ORD-1016", order_date, [oline("R0830-A", 1, 6170)], **over)]
+    return [invoice("請求書.pdf", [line(line_date or order_date, "R0830-A", 1, 6170)])], sources
+
+
+HELD = "R0560-A\nR0528-A\n上記2品番以外発送済　※R0560-Aは在庫補充され次第発送予定※"
+
+
+def restock_case():
+    """ナガセ 10月分の形（出荷分の控えは無く、出荷管理表だけで出荷を見る）。"""
+    sources = [order("①注文書.pdf", "ORD-1001", "2026-10-01", ORDER_1001)]
+    lines = [line("2026-10-01", o["code"], o["quantity"], o["unit_price"]) for o in ORDER_1001[1:]]
+    lines.append(line("2026-10-13", "R0560-A", 100, 177))
+    first = ship_row(7, "2026-10-02", "2026-10-06", "10/7着依頼です。", "675-9154-5711", HELD)
+    later = ship_row(38, "2026-10-09", "2026-10-13", "R0560-A　サニタリーボックス キヅカイ 5枚　×　100", "福山通運\n67592444684")
+    facts = {"rows": [
+        fact(first, arrival_date="2026-10-07", unshipped=[
+            {"code": "R0560-A", "description": "", "quote": "上記2品番以外発送済"},
+            {"code": "R0528-A", "description": "", "quote": "上記2品番以外発送済"},
+        ]),
+        fact(later, items=[{"code": "R0560-A", "description": "サニタリーボックス キヅカイ 5枚", "quantity": 100}]),
+    ]}
+    return [invoice("請求書.pdf", lines)], sources, ship_tasks([first, later], facts)
+
+
+class TestShipmentLog:
+    def test_a_row_with_a_tracking_number_proves_the_shipment(self):
+        # 実例: ナガセ NTS261016-A。依頼日が注文日と同じ行（10月 No.62）に伝票番号
+        row = ship_row(62, "2026-10-16", "2026-10-20", "19→20発送先方了承済み", "福山通運\n67595104452\n67595104463", "10/16ピック済（本田）")
+        check, result = run(*simple_case(), shipments=ship_tasks([row], {"rows": [fact(row)]}))
+        assert found(result, "shipping_evidence") == [] and result["invoices"][0]["verdict"] == VERDICT_OK
+        assert check.order_lines[0]["state"] == "出荷済"
+        assert check.order_lines[0]["state_reason"] == "出荷管理表 10月 No.62（期日 10/20、福山通運 67595104452 67595104463）"
+        assert result["shipments"]["orders"][0]["tasks"][0]["label"] == "10月 No.62"
+
+    def test_without_the_table_the_old_rule_stays(self):
+        _, result = run(*simple_case())
+        assert [f["severity"] for f in found(result, "shipping_evidence")] == [NOTE]
+        assert result["shipments"] == {"used": False, "rows": 0}
+
+    def test_a_customer_missing_from_the_table_is_noted_and_the_old_rule_stays(self):
+        _, result = run(*simple_case(), shipments=[])
+        assert [f["severity"] for f in found(result, "no_ship_rows")] == [NOTE]
+        assert [f["title"] for f in found(result, "shipping_evidence")] == ["出荷の記録が資料に無い注文"]
+
+    def test_done_without_a_number_or_a_remark_still_counts(self):
+        # 実例: ナガセの1個だけの発送（10月 No.9・18・21）は伝票番号の欄が空
+        row = ship_row(9, "2026-10-16", "2026-10-19", "R0830-A\n豆乳メーカー　1個")
+        check, result = run(*simple_case(), shipments=ship_tasks([row]))
+        assert found(result, "shipping_evidence") == []
+        assert check.order_lines[0]["state_reason"] == "出荷管理表 10月 No.9（期日 10/19、完了・伝票番号の記載なし）"
+
+    def test_done_is_not_shipped_when_the_warehouse_says_nothing_was_in_stock(self):
+        # 実例（2026-09-18 ナガセ NTS260918-A）: 完了・伝票番号なし・「全商品在庫ありません。」。
+        # この注文の2行を請求し、承認後に営業の連絡で削除した
+        row = ship_row(75, "2026-09-18", "2026-09-22", "商品発送依頼\n期日　9月22日", "", "全商品在庫ありません。")
+        facts = {"rows": [fact(row, nothing_shipped=True, quote="全商品在庫ありません。")]}
+        check, result = run(*simple_case("2026-09-18"), shipments=ship_tasks([row], facts))
+        asked = found(result, "not_shipped")
+        assert len(asked) == 1 and asked[0]["severity"] == CONFIRM and asked[0]["amount"] == 6170
+        assert "出荷した記録がありません（出荷管理表 9月 No.75「全商品在庫ありません。」）" in asked[0]["detail"]
+        assert result["lines"][0]["result"] == "一致（未出荷）" and result["invoices"][0]["verdict"] == CONFIRM
+
+    def test_the_same_row_is_still_caught_when_the_remarks_could_not_be_read(self):
+        row = ship_row(75, "2026-09-18", "2026-09-22", "", "", "全商品在庫ありません。")
+        _, result = run(*simple_case("2026-09-18"), shipments=ship_tasks([row]))
+        asked = found(result, "shipping_evidence")
+        assert [f["severity"] for f in asked] == [CONFIRM] and asked[0]["title"].startswith("出荷管理表で出荷を確かめられない注文")
+        assert "出荷管理表 9月 No.75（期日 9/22）は伝票番号が無く、納品チームコメントに「全商品在庫ありません。」とあります" in asked[0]["detail"]
+        assert [f["severity"] for f in found(result, "ship_comment")] == [CONFIRM]
+
+    def test_a_row_that_is_not_done_proves_nothing(self):
+        row = ship_row(3, "2026-10-16", "2026-10-20", done=False)
+        _, result = run(*simple_case(), shipments=ship_tasks([row]))
+        assert "出荷管理表 10月 No.3（期日 10/20）は完了になっていません" in found(result, "shipping_evidence", CONFIRM)[0]["detail"]
+
+    def test_an_order_with_no_row_is_asked_about(self):
+        other_order = ship_row(88, "2026-10-22", "2026-10-26", tracking="福山通運\n67597763973")
+        _, result = run(*simple_case(), shipments=ship_tasks([other_order]))
+        assert "ORD-1016（1 行・6,170円）: 出荷管理表に、この注文の出荷の行が見当たりません" in found(result, "shipping_evidence", CONFIRM)[0]["detail"]
+
+    def test_goods_held_back_are_unshipped_until_a_later_row_ships_them(self):
+        # 実例: ナガセ NTS261001-A。10月 No.7「上記4品番以外発送済 ※R0560-Aは在庫補充され次第発送予定」、
+        # No.38 で R0560-A を発送
+        invoices, sources, tasks = restock_case()
+        check, result = run(invoices, sources, shipments=tasks)
+        states = {l["code"]: (l["state"], l["state_reason"]) for l in check.order_lines}
+        assert states["R0528-A"] == ("未出荷", "出荷管理表 10月 No.7「上記2品番以外発送済」")
+        assert states["R0560-A"] == ("出荷済", "出荷管理表 10月 No.38（期日 10/13、福山通運 67592444684）。10月 No.7 では未発送")
+        assert states["R0406-BK"][0] == "出荷済" and "10月 No.7（期日 10/6、675-9154-5711）" in states["R0406-BK"][1]
+        asked = found(result, "not_shipped")
+        assert len(asked) == 1 and asked[0]["amount"] == 14560 and "R0528-A 8" in asked[0]["detail"]
+        assert found(result, "line_date_basis") == []  # 10/13付の行は、出荷管理表の期日が根拠
+        assert result["date_basis"] == {"注文日": 4, "出荷日": 1}
+        assert [t["label"] for t in result["shipments"]["orders"][0]["tasks"]] == ["10月 No.7", "10月 No.38"]
+
+    def test_the_table_adds_to_what_the_shipment_copies_already_say(self):
+        invoices, sources = split_shipment_case()
+        _, _, tasks = restock_case()
+        check, result = run(invoices, sources, shipments=tasks)
+        held = next(l for l in check.order_lines if l["code"] == "R0528-A")
+        assert held["state_reason"] == "出荷分の控えで消し線。出荷管理表 10月 No.7「上記2品番以外発送済」"
+        assert found(result, "ship_conflict") == [] and len(found(result, "duplicate")) == 1
+
+    def test_a_copy_that_says_shipped_against_a_table_that_says_not_is_asked_about(self):
+        invoices, sources = split_shipment_case()
+        _, _, tasks = restock_case()
+        _, result = run(invoices, sources, shipments=tasks[:1])  # 後日の発送の行が無い
+        conflict = found(result, "ship_conflict")
+        assert [f["severity"] for f in conflict] == [CONFIRM] and "ORD-1001 R0560-A" in conflict[0]["detail"]
+
+    def test_a_shipment_due_next_month_is_asked_about(self):
+        # 実例: ナガセ NTS261029-A。10月 No.96「在庫ある分のみ発送」、期日 11/2
+        row = ship_row(96, "2026-10-29", "2026-11-02", "在庫ある分のみ発送お願い致します。", "福山通運\n67599333815")
+        facts = {"rows": [fact(row, partial=True, quote="在庫ある分のみ発送")]}
+        _, result = run(*simple_case("2026-10-29"), shipments=ship_tasks([row], facts))
+        late = found(result, "cutoff")
+        assert [f["severity"] for f in late] == [CONFIRM] and late[0]["amount"] == 6170
+        assert "注文 ORD-1016（1 行・6,170円）は、出荷管理表 10月 No.96（期日 11/2、福山通運 67599333815）の出荷です" in late[0]["detail"]
+        assert "依頼者コメント「在庫ある分のみ発送お願い致します。」" in late[0]["detail"] and "10月分の請求から外してください" in late[0]["detail"]
+        assert legal_notes(result_of([result]))[0].startswith("過大請求・未出荷分の請求")
+
+    def test_a_shipment_within_the_month_is_not_a_cutoff_problem(self):
+        row = ship_row(90, "2026-10-29", "2026-10-30", tracking="67597763984")
+        _, result = run(*simple_case("2026-10-29"), shipments=ship_tasks([row]))
+        assert found(result, "cutoff") == [] and result["invoices"][0]["verdict"] == VERDICT_OK
+
+    def test_a_shipment_no_order_explains_may_be_a_missed_billing(self):
+        # 実例: ナガセ 10月 No.92（依頼 10/26・期日 10/28）。資料の注文は 10/22・10/23・10/29
+        rows = [ship_row(62, "2026-10-16", "2026-10-20", tracking="67595104452"), ship_row(92, "2026-10-26", "2026-10-28", tracking="福山通運\n67598350890")]
+        _, result = run(*simple_case(), shipments=ship_tasks(rows))
+        loose = found(result, "unattributed_shipment")
+        assert [f["severity"] for f in loose] == [CONFIRM] and loose[0]["invoice"] == ""
+        assert "1 件: 10月 No.92（依頼 10/26・期日 10/28、福山通運 67598350890）" in loose[0]["detail"]
+        assert "請求漏れ" in loose[0]["detail"] and result["invoices"][0]["verdict"] == CONFIRM
+        assert [t["label"] for t in result["shipments"]["unattributed"]] == ["10月 No.92"]
+        for mode, expected in (("note", [NOTE]), ("off", [])):
+            _, result = run(*simple_case(), shipments=ship_tasks(rows), settings={**SETTINGS, "shipment_log": {"unattributed": mode}})
+            assert [f["severity"] for f in found(result, "unattributed_shipment")] == expected
+
+    def test_rows_that_straddle_the_month_are_left_to_the_other_month(self):
+        rows = [
+            ship_row(62, "2026-10-16", "2026-10-20", tracking="67595104452"),
+            ship_row(87, "2026-09-29", "2026-10-01", tracking="67582044121"),  # 9月の注文の出荷
+            ship_row(98, "2026-10-30", "2026-11-03", tracking="391553065606"),  # 11月の出荷
+        ]
+        _, result = run(*simple_case(), shipments=ship_tasks(rows))
+        assert found(result, "unattributed_shipment") == [] and result["shipments"]["unattributed"] == []
+
+    def test_samples_and_claim_shipments_are_not_billing(self):
+        rows = [
+            ship_row(62, "2026-10-16", "2026-10-20", tracking="67595104452"),
+            ship_row(68, "2026-10-17", "2026-10-20", "サンプル納品依頼です。", "福山通運\n67595104522"),
+            ship_row(5, "2026-10-20", "2026-10-21", "クレーム不足分72個対応分"),
+        ]
+        facts = {"rows": [fact(rows[0]), fact(rows[1], purpose=PURPOSE_SAMPLE), fact(rows[2], purpose=PURPOSE_CLAIM)]}
+        for tasks in (ship_tasks(rows, facts), ship_tasks(rows)):  # 読み取りが無くても語で見分ける
+            _, result = run(*simple_case(), shipments=tasks)
+            assert found(result, "unattributed_shipment") == []
+            assert [(t["label"], t["purpose"]) for t in result["shipments"]["others"]] == [("10月 No.68", PURPOSE_SAMPLE), ("10月 No.5", PURPOSE_CLAIM)]
+
+    def test_an_order_shipped_with_samples_is_still_an_ordinary_shipment(self):
+        # 実例: リマーク 9月 No.3「あと併せてサンプルで1つづつ発送お願いいたします」
+        row = ship_row(3, "2026-10-16", "2026-10-19", "在庫確保分から発送お願いします。\nあと併せてサンプルで1つづつ発送", "67569307234")
+        assert ship_tasks([row], {"rows": [fact(row)]})[0]["purpose"] == PURPOSE_NORMAL
+        assert ship_tasks([row], {"rows": [fact(row, purpose=PURPOSE_CLAIM)]})[0]["purpose"] == PURPOSE_NORMAL  # 語が無い
+
+    def test_rows_naming_the_goods_go_to_the_order_that_has_them(self):
+        # 実例: サクラマチ K12079（15個）と J33（5個）。どちらも S0384-H-M、依頼日は 10/6 と 10/8
+        invoices, sources = clean_case()
+        rows = [
+            ship_row(6, "2026-10-01", "2026-10-05", "10/6AM必着です。", "391399216272\n391399200695"),
+            ship_row(27, "2026-10-06", "2026-10-08", "キャミソールエプロン チャコールグレー M\n【品番:S0384-H-M】15個\n10月10日AM必着", "391422171965"),
+            ship_row(29, "2026-10-08", "2026-10-09", "S0384-H-M\n注文数：5\n10/10（土）AM着希望", "ヤマト運輸\n3914-2220-6991"),
+        ]
+        facts = {"rows": [
+            fact(rows[0], arrival_date="2026-10-06"),
+            fact(rows[1], arrival_date="2026-10-10", items=[{"code": "S0384-H-M", "description": "キャミソールエプロン", "quantity": 15}]),
+            fact(rows[2], arrival_date="2026-10-10", items=[{"code": "S0384-H-M", "description": "", "quantity": 5}]),
+        ]}
+        _, result = run(invoices, sources, shipments=ship_tasks(rows, facts))
+        linked = {o["order"]: [t["label"] for t in o["tasks"]] for o in result["shipments"]["orders"]}
+        assert linked == {"K12073": ["10月 No.6"], "K12079": ["10月 No.27"], "J33": ["10月 No.29"]}
+        assert result["findings"] == [] and result["invoices"][0]["verdict"] == VERDICT_OK  # 留意も無くなる
+
+    def test_the_due_date_links_orders_shipped_weeks_after_they_were_placed(self):
+        # 実例: 新日本カレンダー。注文 10/2・出荷 10/23・納品 10/26 に、依頼 10/20・期日 10/23 の行
+        invoices, sources = simple_case("2026-10-02", "2026-10-23", ship_date="2026-10-23", delivery_date="2026-10-26")
+        row = ship_row(75, "2026-10-20", "2026-10-23", "第35回ペタンク大会※着日指定・出荷主指定あり", "ヤマト：391494558453")
+        _, result = run(invoices, sources, shipments=ship_tasks([row]))
+        assert result["shipments"]["orders"][0]["tasks"][0]["label"] == "10月 No.75" and result["findings"] == []
+
+    def test_rows_asked_for_on_the_same_day_are_one_order_shipped_in_parts(self):
+        # 実例: ナガセ 10月 No.62（福山通運）と No.64（ヤマト運輸）。どちらも 10/16 の依頼
+        rows = [ship_row(62, "2026-10-16", "2026-10-20", tracking="福山通運\n67595104452"), ship_row(64, "2026-10-16", "2026-10-20", tracking="ヤマト運輸\n391482755344")]
+        _, result = run(*simple_case(), shipments=ship_tasks(rows))
+        assert [t["label"] for t in result["shipments"]["orders"][0]["tasks"]] == ["10月 No.62", "10月 No.64"]
+        assert found(result, "unattributed_shipment") == []
+
+    def test_the_same_goods_in_a_later_month_do_not_link_a_row_to_an_old_order(self):
+        # 実例（2026-11-05）: 9月分の確認で、10月 No.7（10/1 の注文の出荷。R0528-A を含む）を、同じ品番のある
+        # 9/18 の注文に結び、「翌月の出荷」と誤って指摘した。同じ商品の注文は毎週のように来る
+        sources = [order("③9.18.pdf", "NTS260918-A", "2026-09-18", [oline("R0528-A", 4, 1820), oline("R0406-green", 6, 1789)])]
+        invoices = [invoice("請求書.pdf", [line("2026-09-18", "R0406-green", 6, 1789)])]
+        rows = [
+            ship_row(75, "2026-09-18", "2026-09-22", "商品発送依頼", "", "全商品在庫ありません。"),
+            ship_row(7, "2026-10-02", "2026-10-06", "10/7着依頼です。", "675-9154-5711", HELD),
+        ]
+        facts = {"rows": [
+            fact(rows[0], nothing_shipped=True, quote="全商品在庫ありません。"),
+            fact(rows[1], unshipped=[{"code": "R0528-A", "description": "", "quote": "上記2品番以外発送済"}]),
+        ]}
+        _, result = run(invoices, sources, shipments=ship_tasks(rows, facts))
+        assert [t["label"] for t in result["shipments"]["orders"][0]["tasks"]] == ["9月 No.75"]
+        assert found(result, "cutoff") == [] and found(result, "unattributed_shipment") == []
+        assert "9月 No.75「全商品在庫ありません。」" in found(result, "not_shipped", CONFIRM)[0]["detail"]
+
+    def test_a_same_day_row_for_other_goods_is_not_a_part_of_the_order(self):
+        # 資料に無い注文の出荷かもしれない行を、同じ日というだけで別の注文の分割出荷にしない
+        rows = [ship_row(62, "2026-10-16", "2026-10-20", tracking="67595104452"), ship_row(63, "2026-10-16", "2026-10-20", "Z9999-A 10個", "67595104463")]
+        _, result = run(*simple_case(), shipments=ship_tasks(rows))
+        assert [t["label"] for t in result["shipments"]["orders"][0]["tasks"]] == ["10月 No.62"]
+        assert "10月 No.63" in found(result, "unattributed_shipment", CONFIRM)[0]["detail"]
+        # 他に行が無ければ、品番の書き方が違うだけとみて結ぶ（注文書が相手の品番のことがある）
+        _, result = run(*simple_case(), shipments=ship_tasks(rows[1:]))
+        assert [t["label"] for t in result["shipments"]["orders"][0]["tasks"]] == ["10月 No.63"]
+
+    def test_two_orders_of_one_day_can_share_one_shipment(self):
+        sources = [order("④.pdf", "ORD-A", "2026-10-05", [oline("Y0731-B", 1, 4016)]), order("⑤.pdf", "ORD-B", "2026-10-05", [oline("R0830-A", 1, 6170)])]
+        invoices = [invoice("請求書.pdf", [line("2026-10-05", "Y0731-B", 1, 4016), line("2026-10-05", "R0830-A", 1, 6170)])]
+        row = ship_row(18, "2026-10-05", "2026-10-07", tracking="67587511283")
+        check, result = run(invoices, sources, shipments=ship_tasks([row]))
+        assert [o["shared"] for o in result["shipments"]["orders"]] == [False, True]
+        assert check.order_lines[1]["state_reason"].endswith("（他の注文と同じ出荷）") and found(result, "shipping_evidence") == []
+
+    def test_what_the_model_read_must_be_written_in_the_row(self):
+        row = ship_row(7, "2026-10-02", "2026-10-06", "10/7着依頼です。", "675-9154-5711", "R0528-A は在庫補充され次第発送予定")
+        made_up = fact(
+            row, nothing_shipped=True, partial=True, quote="全商品在庫ありません", shipped_on="2026-12-01", arrival_date="2026-10-07",
+            purpose=PURPOSE_SAMPLE,
+            items=[{"code": "X9999-Z", "description": "", "quantity": 3}, {"code": "", "description": "在庫補充され次第", "quantity": 0}],
+            unshipped=[{"code": "r0528-a", "description": "", "quote": "在庫補充され次第発送予定"}, {"code": "R0560-A", "description": "", "quote": ""}],
+        )
+        task = ship_tasks([row], {"rows": [made_up]})[0]
+        assert [u["code"] for u in task["unshipped"]] == ["r0528-a"]  # 行に無い品番は受けない
+        assert [i["description"] for i in task["items"]] == ["在庫補充され次第"]  # 品番が無ければ品名が行にあること
+        assert (task["nothing_shipped"], task["partial"], task["quote"]) == (False, False, "")  # 引用が行に無い
+        assert (task["shipped_on"], task["arrival_date"], task["purpose"]) == ("", "2026-10-07", PURPOSE_NORMAL)
+        assert task["date"] == "2026-10-06" and task["tokens"] == {"R0528-A"} and task_ships(task)
+        assert ship_tasks([ship_row(10, "2026-10-02", "2026-10-05", task="在庫確保（在庫ロボット・エアロジ共に減算）")]) == []  # 商品発送だけ
+
+    def test_small_helpers(self):
+        assert code_tokens("C017-Aベージュ　15枚\nＲ０４６９－Ｒ－Ｍ 油汚れクロス", "y0726-white 6個、伝票 67595104452") == {"C017-A", "R0469-R-M", "Y0726-WHITE"}
+        assert codes_related("R0528-A", "r0528-a-a") and not codes_related("R0400-GRAY", "R0400-GRAYMARBLE") and not codes_related("", "")
+        assert weekday_gap("2026-10-23", "2026-10-26") == 1 and weekday_gap("2026-10-16", "2026-10-16") == 0  # 金曜→月曜
+        assert weekday_gap("2026-10-14", "2026-10-17") == 2 and weekday_gap("2026-10-08", "2026-10-05") == -3
+        assert weekday_gap("", "2026-10-05") is None
+        assert month_end("2026-10-09") == "2026-10-31" and month_end("2026-12-01") == "2026-12-31" and month_end("") == ""
+
+
 # --- 報告書と返信案 ---
 
 
@@ -565,6 +848,26 @@ class TestReport:
         report = render_report(result_of([group]))
         assert "ほか 20 行は資料と一致。" in report and "X999" in report and "C005" not in report
 
+    def test_the_shipment_table_is_shown_order_by_order(self):
+        invoices, sources, tasks = restock_case()
+        sample = ship_row(8, "2026-10-02", "2026-10-05", "サンプルの送り状の宛名を水島宛て", "675-8204-4261")
+        loose = ship_row(92, "2026-10-26", "2026-10-28", tracking="福山通運\n67598350890")
+        _, group = run(invoices, sources, shipments=tasks + ship_tasks([sample, loose]))
+        report = render_report({**result_of([group]), "shipment_log": {"used": True, "rows": 4, "note": ""}})
+        assert "**出荷管理表との照合**" in report
+        assert "| ORD-1001 | 10月 No.7 | 10/2 | 10/6 | 675-9154-5711 | 納品チーム「R0560-A R0528-A 上記2品番以外発送済 ※R0560-Aは在庫補充され次第発送予定※」／依頼者「10/7着依頼です。」 |" in report
+        assert "| ORD-1001 | 10月 No.38 | 10/9 | 10/13 | 福山通運 67592444684 | 依頼者「R0560-A サニタリーボックス キヅカイ 5枚 × 100」 |" in report
+        assert "どの注文とも結べなかった出荷の行: 10月 No.92（依頼 10/26・期日 10/28）。" in report
+        assert "請求の対象外とみた行: 10月 No.8（10/5 サンプル）。" in report
+        assert "【要確認】出荷管理表にあるのに、対応する注文書が資料に無い出荷: 1 件: 10月 No.92" in report
+        reply = render_reply(result_of([group]))
+        assert "・出荷した記録の無い行を請求している: 1 行・14,560円（R0528-A 8）は、出荷した記録がありません（出荷管理表 10月 No.7「上記2品番以外発送済」）" in reply
+        # 出荷の行が無い注文、表を使っていない結果
+        _, group = run(*simple_case(), shipments=ship_tasks([loose]))
+        assert "| ORD-1016 | 出荷の行なし | | | | |" in render_report(result_of([group]))
+        _, group = run(*simple_case())
+        assert "出荷管理表" not in render_report(result_of([group]))
+
     def test_the_legal_section_follows_the_result(self):
         _, group = run(*offset_case())
         notes = legal_notes(result_of([group]))
@@ -596,6 +899,10 @@ class FakeReader:
             return {"readable": False, "unread_reason": "中身が空（大きすぎて取得していない資料など）", "file": name}
         self.calls += 1
         return {**self._sources[name], "file": name}
+
+    def read_shiplog(self, name, rows):
+        self.asked.append(("shiplog", name, [r["id"] for r in rows]))
+        return {"rows": [fact(r) for r in rows]}
 
     def interpret(self, note, payload):
         self.asked.append(("interpret", note, payload))
@@ -675,6 +982,93 @@ class TestChecker:
         result = self.checker(tmp_path, reader).check("", groups, review=False)
         assert reader.asked == [] and summary_rows(result)[0]["verdict"] == VERDICT_OK
 
+    def shipment_rows(self):
+        return [
+            ship_row(6, "2026-10-01", "2026-10-05", "10/6AM必着です。", "391399216272", vendor="サクラマチ"),
+            ship_row(27, "2026-10-06", "2026-10-08", "【品番:S0384-H-M】15個", "391422171965", vendor="リマーク・サクラマチ"),
+            ship_row(29, "2026-10-08", "2026-10-09", "S0384-H-M\n注文数：5", "3914-2220-6991", vendor="サクラマチ"),
+            ship_row(84, "2026-10-21", "2026-10-30", "在庫確保、減算よろしくお願い致します。", task="在庫確保（在庫ロボット・エアロジ共に減算）", vendor="サクラマチ"),
+            ship_row(22, "2026-10-05", "2026-10-09", "C017-A 5個", "67587511283", vendor="リマーク"),
+            ship_row(9, "2026-08-03", "2026-08-05", "", "67500000000", vendor="サクラマチ"),  # 期間の外
+        ]
+
+    def test_the_shipment_table_is_cut_to_the_customer_and_read_once(self, tmp_path):
+        invoices, sources = clean_case()
+        reader = FakeReader({"請求書.pdf": invoices[0]}, {s["file"]: s for s in sources})
+        groups = [{"name": "サクラマチ", "invoices": [("請求書.pdf", b"%PDF")], "sources": [(s["file"], b"%PDF") for s in sources]}]
+        result = self.checker(tmp_path, reader).check("", groups, shiplog_rows=self.shipment_rows())
+        kind, name, ids = reader.asked[0]
+        assert (kind, name) == ("shiplog", "サクラマチ")
+        assert ids == ["2026-10#6", "2026-10#27", "2026-10#29"]  # その取引先の、期間内の、商品発送の行だけ
+        group = result["groups"][0]
+        assert [[t["label"] for t in o["tasks"]] for o in group["shipments"]["orders"]] == [["10月 No.6"], ["10月 No.27"], ["10月 No.29"]]
+        assert group["findings"] == [] and result["shipment_log"] == {"used": True, "rows": 6, "note": ""}
+        report = render_report(result)
+        assert "- 出荷管理表: 注文ごとに出荷の行（期日・伝票番号・納品チームコメント）と突き合わせ" in report
+        assert "| K12079 | 10月 No.27 | 10/6 | 10/8 | 391422171965 | 依頼者「【品番:S0384-H-M】15個」 |" in report
+
+    def test_the_customer_is_also_found_by_the_name_on_the_invoice_and_by_aliases(self, tmp_path):
+        invoices, sources = clean_case()
+        invoices[0]["recipient_name"] = "株式会社サクラマチ"
+        reader = FakeReader({"請求書.pdf": invoices[0]}, {s["file"]: s for s in sources})
+        groups = [{"name": "ユーコープ分", "invoices": [("請求書.pdf", b"%PDF")], "sources": [(s["file"], b"%PDF") for s in sources]}]
+        self.checker(tmp_path, reader).check("", groups, shiplog_rows=self.shipment_rows())
+        assert reader.asked[0][2] == ["2026-10#6", "2026-10#27", "2026-10#29"]
+        invoices[0]["recipient_name"] = "生活協同組合ユーコープ"
+        checker = self.checker(tmp_path, reader)
+        checker._config.data["invoice_check"]["shipment_log"]["aliases"] = {"ユーコープ分": ["サクラマチ"]}
+        reader.asked.clear()
+        checker.check("", groups, shiplog_rows=self.shipment_rows())
+        assert reader.asked[0][2] == ["2026-10#6", "2026-10#27", "2026-10#29"]
+
+    def test_invoices_not_based_on_orders_are_not_compared_with_shipments(self, tmp_path):
+        invoices, sources = offset_case(balance=11069)
+        reader = FakeReader({"請求書.pdf": invoices[0]}, {s["file"]: s for s in sources})
+        groups = [{"name": "サクラマチ", "invoices": [("請求書.pdf", b"%PDF")], "sources": [(s["file"], b"%PDF") for s in sources]}]
+        result = self.checker(tmp_path, reader).check("", groups, review=False, shiplog_rows=self.shipment_rows())
+        assert reader.asked == [] and result["groups"][0]["shipments"]["used"] is False
+        assert found(result["groups"][0], "no_ship_rows") == []
+
+    def test_a_copy_of_the_table_in_the_case_folder_is_used_before_fetching(self, tmp_path):
+        from raizuinu.invoicecheck import SHIPLOG_FILE, load_shiplog
+        from test_shiplog import book
+
+        config = make_config(tmp_path)
+        config.data["invoice_check"]["shipment_log"]["spreadsheet_id"] = "SHEET-ID"
+        fetched = []
+
+        def fetch(spreadsheet_id):
+            fetched.append(spreadsheet_id)
+            return [ship_row(1, "2026-10-01", "2026-10-02")]
+
+        rows, why = load_shiplog(config, tmp_path, fetch=fetch)
+        assert fetched == ["SHEET-ID"] and len(rows) == 1 and why == ""
+        (tmp_path / SHIPLOG_FILE).write_bytes(book())
+        rows, why = load_shiplog(config, tmp_path, fetch=fetch)
+        assert fetched == ["SHEET-ID"] and len(rows) == 8 and why == ""  # 写しがあれば取りに行かない
+        assert load_shiplog(config, tmp_path, skip=True, fetch=fetch) == (None, "")
+
+    def test_a_table_that_cannot_be_fetched_is_reported_and_the_check_goes_on(self, tmp_path):
+        from raizuinu.invoicecheck import load_shiplog
+
+        config = make_config(tmp_path)
+        assert load_shiplog(config, tmp_path) == (None, "")  # スプレッドシートが設定されていない
+        config.data["invoice_check"]["shipment_log"]["spreadsheet_id"] = "SHEET-ID"
+
+        def fetch(spreadsheet_id):
+            raise RuntimeError("出荷管理表を取得できません（HTTP 401。共有設定を確認してください）")
+
+        rows, why = load_shiplog(config, tmp_path, fetch=fetch)
+        assert rows is None and why.startswith("出荷管理表を読めなかったため、出荷の実績との突き合わせをしていません（出荷管理表を取得できません")
+        invoices, sources = clean_case()
+        reader = FakeReader({"請求書.pdf": invoices[0]}, {s["file"]: s for s in sources})
+        groups = [{"name": "サクラマチ", "invoices": [("請求書.pdf", b"%PDF")], "sources": [(s["file"], b"%PDF") for s in sources]}]
+        result = self.checker(tmp_path, reader).check("", groups, shiplog_rows=rows, shiplog_note=why)
+        assert [f["title"] for f in found(result["groups"][0], "shipping_evidence")] == ["出荷の記録が資料に無い注文"]
+        assert f"- 出荷管理表: {why}" in render_report(result)
+        config.data["invoice_check"]["shipment_log"]["enabled"] = False
+        assert load_shiplog(config, tmp_path, fetch=fetch) == (None, "")
+
     def test_a_case_folder_is_read_per_customer(self, tmp_path):
         case = tmp_path / "2026-10_卸"
         (case / "ナガセ" / "invoices").mkdir(parents=True)
@@ -685,6 +1079,7 @@ class TestChecker:
         (case / "ナガセ" / "invoices" / "請求書.pdf").write_bytes(b"%PDF-1")
         (case / "ナガセ" / "sources" / "注文書" / "①.pdf").write_bytes(b"%PDF-2")
         (case / "ナガセ" / "sources" / "契約書.pdf").write_bytes(b"%PDF-3")
+        (case / "出荷管理表.xlsx").write_bytes(b"PK")  # 出荷管理表の写しは取引先の資料に数えない
         note, groups = load_case(case)
         assert note == "ご確認ください" and [g["name"] for g in groups] == ["ナガセ"]
         assert groups[0]["invoices"] == [("請求書.pdf", b"%PDF-1")]
@@ -813,6 +1208,25 @@ class TestReader:
         text = client.content[0]["text"]
         assert text.startswith("依頼文:\n品切商品（請求なし）") and '"id": "S1"' in text
         assert "説明が見当たらない行は" in client.kwargs["system"]
+
+    def test_the_remarks_of_the_shipment_table_are_read_once_per_content(self, tmp_path):
+        rows = [ship_row(75, "2026-09-18", "2026-09-22", "商品発送依頼", "", "全商品在庫ありません。")]
+        answer = {"rows": [fact(rows[0], nothing_shipped=True, quote="全商品在庫ありません。")]}
+        client = fake_client(answer)
+        reader = InvoiceReader(make_config(tmp_path), client=client, cache_dir=tmp_path / "cache")
+        assert reader.read_shiplog("ナガセテクノサービス", rows) == answer
+        text = client.content[0]["text"]
+        assert text.startswith("取引先「ナガセテクノサービス」あての発送依頼の行:\n") and '"team_comment": "全商品在庫ありません。"' in text
+        assert '"id": "2026-09#75"' in text and "handler" not in text and "竹内" not in text  # 読むのに要る欄だけ渡す
+        assert "上記4品番以外発送済" in client.kwargs["system"]
+        assert client.kwargs["output_config"]["format"]["schema"]["properties"]["rows"]["items"]["properties"]["purpose"]["enum"] == [PURPOSE_NORMAL, PURPOSE_SAMPLE, PURPOSE_CLAIM]
+        reader.read_shiplog("ナガセテクノサービス", rows)
+        assert client.calls == 1 and reader.cache_hits == 1  # 行が変わらなければ読み直さない
+        reader.read_shiplog("ナガセテクノサービス", [{**rows[0], "tracking": "67572395391"}])
+        assert client.calls == 2
+        assert reader.read_shiplog("ナガセテクノサービス", []) == {} and client.calls == 2
+        failed = InvoiceReader(make_config(tmp_path), client=fake_client("読めませんでした"))
+        assert failed.read_shiplog("ナガセテクノサービス", rows) == {}
 
     def test_an_excel_order_is_read_as_text_with_real_dates(self, tmp_path):
         openpyxl = pytest.importorskip("openpyxl")

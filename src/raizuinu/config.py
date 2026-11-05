@@ -272,13 +272,28 @@ _DEFAULTS: dict[str, Any] = {
     # issuers は当社グループの発行者と登録番号（請求書の登録番号をこれと照合する）。
     # shipping_evidence は出荷の裏付けが無い行の扱い: risk=同じ注文に品切・入荷待ち・取消が
     # あるときだけ要確認（それ以外は留意）／always=常に要確認／off=見ない。
-    # checklist は確認事項の一覧（モデルの所見に渡す。管理者が項目を足せる）
+    # checklist は確認事項の一覧（モデルの所見に渡す。管理者が項目を足せる）。
+    # shipment_log は卸の出荷管理表（Googleスプレッドシート。月ごとのタブに発送依頼を1行1件）。
+    # 注文ごとに出荷の行を結び、未発送の請求・翌月の出荷・資料に無い注文の出荷を見る。
+    # spreadsheet_id が空なら使わない。case_file は依頼のフォルダに置いた写しの名前（あれば取得しない）。
+    # aliases は取引先名の読み替え（{"フォルダ名": ["表での書き方"]}。略称は自動で当たる）。
+    # days_before／days_after は、請求書と注文書の日付の前後どこまでの行を見るか。
+    # unattributed は、どの注文とも結べない出荷の扱い: confirm=要確認／note=留意／off=見ない
     "invoice_check": {
         "enabled": False,
         "model": None,  # None なら全体の model を使う
         "effort": "medium",
         "issuers": [],
         "shipping_evidence": "risk",
+        "shipment_log": {
+            "enabled": True,
+            "spreadsheet_id": "",
+            "case_file": "出荷管理表.xlsx",
+            "aliases": {},
+            "days_before": 7,
+            "days_after": 14,
+            "unattributed": "confirm",
+        },
         "max_file_mb": 20,
         "max_text_chars": 60000,
         "max_source_files": 40,

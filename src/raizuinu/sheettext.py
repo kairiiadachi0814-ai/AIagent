@@ -90,9 +90,12 @@ def _cell_text(cell: ET.Element, strings: list[str], date_styles: set[int]) -> s
     return _number_text(raw)
 
 
-def xlsx_to_text(data: bytes, max_chars: int = DEFAULT_MAX_CHARS, max_rows: int = DEFAULT_MAX_ROWS) -> str:
-    """ブック全体を「# シート: 名前」＋タブ区切りの行にする。空の行は飛ばす。"""
-    out: list[str] = []
+def read_sheets(data: bytes) -> list[tuple[str, list[dict[int, str]]]]:
+    """ブックを (シート名, 行) の並びにする。行は {列番号（A=1）: セルの文字}。空の行は入れない。
+
+    セルの中の改行はそのまま残す（コメント欄のように、改行に意味がある表のため）。
+    """
+    out: list[tuple[str, list[dict[int, str]]]] = []
     with zipfile.ZipFile(BytesIO(data)) as z:
         strings = _shared_strings(z)
         date_styles = _date_styles(z)
@@ -105,22 +108,30 @@ def xlsx_to_text(data: bytes, max_chars: int = DEFAULT_MAX_CHARS, max_rows: int 
                 path = "xl/" + path
             if not path or path not in z.namelist():
                 continue
-            out.append(f"# シート: {sheet.get('name', '')}")
-            root = ET.fromstring(z.read(path))
-            rows = 0
-            for row in root.iter(_NS + "row"):
+            rows: list[dict[int, str]] = []
+            for row in ET.fromstring(z.read(path)).iter(_NS + "row"):
                 cells: dict[int, str] = {}
                 for cell in row.findall(_NS + "c"):
                     letters, _ = _cell_ref_parts(cell.get("r", ""))
-                    text = re.sub(r"[ \t\r\n　]+", " ", _cell_text(cell, strings, date_styles)).strip()
+                    text = _cell_text(cell, strings, date_styles).strip()
                     if text:
                         cells[_col_index(letters) if letters else len(cells) + 1] = text
-                if not cells:
-                    continue
-                out.append("\t".join(cells.get(col, "") for col in range(1, max(cells) + 1)))
-                rows += 1
-                if rows >= max_rows:
-                    out.append("（以下省略）")
-                    break
+                if cells:
+                    rows.append(cells)
+            out.append((sheet.get("name", ""), rows))
+    return out
+
+
+def xlsx_to_text(data: bytes, max_chars: int = DEFAULT_MAX_CHARS, max_rows: int = DEFAULT_MAX_ROWS) -> str:
+    """ブック全体を「# シート: 名前」＋タブ区切りの行にする。空の行は飛ばす。"""
+    out: list[str] = []
+    for name, rows in read_sheets(data):
+        out.append(f"# シート: {name}")
+        for count, cells in enumerate(rows, start=1):
+            flat = {col: re.sub(r"[ \t\r\n　]+", " ", text).strip() for col, text in cells.items()}
+            out.append("\t".join(flat.get(col, "") for col in range(1, max(flat) + 1)))
+            if count >= max_rows:
+                out.append("（以下省略）")
+                break
     text = "\n".join(out)
     return text if len(text) <= max_chars else text[:max_chars] + "\n（以下省略）"

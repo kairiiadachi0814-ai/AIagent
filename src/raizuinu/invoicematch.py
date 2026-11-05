@@ -18,6 +18,10 @@
   相殺後の残高 11,069円を 10,069円と記載）
 - 明細の日付は、注文日・出荷日・納品日のどれかに一致するはず（2026-11-04: 新日本
   カレンダー。訂正前の納期の日付が残っていた）
+- 卸の出荷は、出荷管理表（発送依頼の一覧。shiplog）の行と注文を結んで確かめる（指示 2026-11-05）。
+  完了のチェックだけでは裏付けにしない（2026-09-18 ナガセ: 完了・伝票番号なし・「全商品在庫
+  ありません。」の注文を請求した）。品目が合うだけでは行と注文を結ばない（同じ商品の注文が
+  毎週来る）。どの注文とも結べない出荷は、資料に無い注文（請求漏れ）の可能性として聞く
 """
 
 from __future__ import annotations
@@ -25,7 +29,10 @@ from __future__ import annotations
 import math
 import re
 import unicodedata
+from datetime import date, timedelta
 from typing import Any
+
+from .shiplog import TASK_SHIP
 
 # --- 語彙（invoiceread のスキーマと共有） ---
 
@@ -59,6 +66,24 @@ KIND_ITEM, KIND_FEE, KIND_ADJUST = "商品", "付随費用", "調整"
 _FEE_RE = re.compile(r"(送料|運賃|配送料|名入代|名入れ代|版代|手数料)")
 _ADJUST_RE = re.compile(r"(相殺|値引|過請求|返金|返品|調整|割引|控除)")
 _DASHES = "‐‑‒–—―−－ｰー"
+
+# 出荷管理表の行（商品発送）の用途。サンプル・クレーム対応は請求の対象外なので、注文と結ばない
+PURPOSE_NORMAL, PURPOSE_SAMPLE, PURPOSE_CLAIM = "通常の出荷", "サンプル", "クレーム・不良対応"
+SHIP_PURPOSES = [PURPOSE_NORMAL, PURPOSE_SAMPLE, PURPOSE_CLAIM]
+_PURPOSE_WORDS = {
+    PURPOSE_SAMPLE: ("サンプル", "見本"),
+    PURPOSE_CLAIM: ("クレーム", "不良", "交換", "再送", "破損", "不足分"),
+}
+_CODE_TOKEN_RE = re.compile(r"[A-Z]{1,2}\d{3,5}(?:-[A-Z0-9]+)*")
+MIN_NAME_CHARS = 4  # 品名で同じ商品とみる最短の長さ
+MAX_SHIP_DATE_SHIFT = 14  # コメントから読んだ発送日・着日を受ける、期日からのずれ（日）
+MAX_TRACKING_CHARS, MAX_COMMENT_CHARS = 40, 80
+
+# 出荷管理表の行と注文を結ぶ見込みの点数（_link_score）
+_REQUEST_SCORES = (40, 30, 15, 5)  # 依頼日が注文日の当日・翌平日・2日後・3日後
+_WINDOW_SCORE, _SHIP_DATE_SCORE, _ARRIVAL_SCORE = 30, 10, 20
+_ITEM_SCORE, _QUANTITY_SCORE, _OTHER_ITEM_PENALTY = 100, 20, 20  # 減点は翌平日の点（30）より小さく
+_WINDOW_BEFORE, _WINDOW_AFTER, _WINDOW_BEFORE_DELIVERY = 3, 3, 5
 
 
 def to_int(value: Any) -> int:
@@ -293,6 +318,164 @@ def _apply_backorders(sources: list[dict], lines: list[dict]) -> None:
                     break
 
 
+# --- 出荷管理表（卸の出荷の実績。shiplog が行に直したもの） ---
+
+
+def _norm_text(text: Any) -> str:
+    """文中の品番を拾える形に（全角→半角、大文字、ハイフンの異体字をそろえる。空白は残す）。"""
+    out = unicodedata.normalize("NFKC", str(text or "")).upper()
+    for dash in _DASHES:
+        out = out.replace(dash, "-")
+    return out
+
+
+def code_tokens(*texts: Any) -> set[str]:
+    """文中に書かれた品番（R0560-A、S0384-H-M など）。"""
+    out: set[str] = set()
+    for text in texts:
+        out |= set(_CODE_TOKEN_RE.findall(_norm_text(text)))
+    return out
+
+
+def codes_related(a: Any, b: Any) -> bool:
+    """同じ品番か、枝番違い（R0528-A と R0528-A-A）。"""
+    a, b = norm_code(a), norm_code(b)
+    return bool(a) and bool(b) and (a == b or a.startswith(b + "-") or b.startswith(a + "-"))
+
+
+def _to_date(text: Any) -> date | None:
+    try:
+        return date.fromisoformat(str(text or ""))
+    except ValueError:
+        return None
+
+
+def days_between(start: Any, end: Any) -> int | None:
+    a, b = _to_date(start), _to_date(end)
+    return (b - a).days if a and b else None
+
+
+def weekday_gap(start: Any, end: Any) -> int | None:
+    """start の後、end までの平日の日数（同じ日は 0、金曜→月曜は 1）。end が前なら負の数。"""
+    a, b = _to_date(start), _to_date(end)
+    if not a or not b:
+        return None
+    if b < a:
+        return (b - a).days
+    return sum(1 for n in range(1, (b - a).days + 1) if (a + timedelta(days=n)).weekday() < 5)
+
+
+def _shift(day: Any, days: int) -> str:
+    found = _to_date(day)
+    return (found + timedelta(days=days)).isoformat() if found else ""
+
+
+def month_end(day: Any) -> str:
+    found = _to_date(day)
+    if not found:
+        return ""
+    first_of_next = date(found.year + (found.month == 12), found.month % 12 + 1, 1)
+    return (first_of_next - timedelta(days=1)).isoformat()
+
+
+def _short(text: Any, limit: int) -> str:
+    out = _one_line(text)
+    return out if len(out) <= limit else out[:limit] + "…"
+
+
+def ship_tasks(rows: list[dict], facts: dict | None = None) -> list[dict]:
+    """出荷管理表の「商品発送」の行に、コメント欄の読み取り（モデル）を足す。
+
+    読み取りは、行の文面で確かめられるものだけを受ける（品番・品名がその行に書かれている、
+    根拠の引用がその行にある、サンプル等の語がある）。読み取りが無くても、依頼日・期日・完了・
+    伝票番号だけで出荷の裏付けには使える。
+    """
+    by_id = {str(f.get("id") or ""): f for f in (facts or {}).get("rows") or []}
+    out: list[dict] = []
+    for row in rows:
+        if not str(row.get("task") or "").startswith(TASK_SHIP):
+            continue
+        text = "\n".join(str(row.get(k) or "") for k in ("comment", "team_comment", "tracking"))
+        flat, tokens = norm_code(text), code_tokens(text)
+        fact = by_id.get(str(row.get("id") or ""), {})
+
+        def written(entry: dict) -> bool:
+            code, name = norm_code(entry.get("code")), norm_code(entry.get("description"))
+            return code in tokens if code else (len(name) >= MIN_NAME_CHARS and name in flat)
+
+        def entry(raw: dict) -> dict:
+            return {"code": str(raw.get("code") or ""), "description": str(raw.get("description") or ""),
+                    "quantity": to_number(raw.get("quantity")), "quote": _one_line(raw.get("quote"))}
+
+        quote = _one_line(fact.get("quote"))
+        quoted = bool(quote) and norm_code(quote) in flat
+        base = row.get("due_date") or row.get("request_date")
+        shipped_on = str(fact.get("shipped_on") or "")
+        shift = days_between(base, shipped_on)
+        arrival = str(fact.get("arrival_date") or "")
+        ahead = days_between(base, arrival)
+        purpose = str(fact.get("purpose") or "")
+        if not any(word in text for word in _PURPOSE_WORDS.get(purpose, ())):
+            purpose = PURPOSE_NORMAL
+        if not fact:  # 読み取りが無いときは、語だけで見分ける
+            purpose = next((p for p, words in _PURPOSE_WORDS.items() if any(w in text for w in words)), PURPOSE_NORMAL)
+        task = {
+            **row, "tokens": tokens, "read": bool(fact),
+            "items": [entry(i) for i in fact.get("items") or [] if written(i)],
+            "unshipped": [entry(i) for i in fact.get("unshipped") or [] if written(i)],
+            "nothing_shipped": bool(fact.get("nothing_shipped")) and quoted,
+            "partial": bool(fact.get("partial")) and quoted,
+            "quote": quote if quoted else "",
+            "shipped_on": shipped_on if shift is not None and abs(shift) <= MAX_SHIP_DATE_SHIFT else "",
+            "arrival_date": arrival if ahead is not None and 0 <= ahead <= MAX_SHIP_DATE_SHIFT else "",
+            "purpose": purpose,
+        }
+        task["date"] = task["shipped_on"] or str(row.get("due_date") or "") or str(row.get("request_date") or "")
+        out.append(task)
+    return out
+
+
+def task_ships(task: dict) -> bool:
+    """その行が出荷の裏付けになるか。
+
+    完了でも出荷していないことがある（実例 2026-09-18 ナガセ: 完了・伝票番号なし・納品チーム
+    コメント「全商品在庫ありません。」）。伝票番号が無く納品チームのコメントがある行は、裏付けにしない。
+    """
+    if not task.get("done") or task.get("nothing_shipped"):
+        return False
+    return bool(str(task.get("tracking") or "").strip()) or not str(task.get("team_comment") or "").strip()
+
+
+def task_evidence(task: dict) -> str:
+    """出荷の裏付けとして報告に書く形。"""
+    tracking = _short(task.get("tracking"), MAX_TRACKING_CHARS) or "完了・伝票番号の記載なし"
+    return f"出荷管理表 {task.get('label')}（期日 {short_date(task.get('due_date'))}、{tracking}）"
+
+
+def task_doubt(task: dict) -> str:
+    """出荷の裏付けにならない行の、理由の言い方。"""
+    label = f"出荷管理表 {task.get('label')}（期日 {short_date(task.get('due_date'))}）"
+    comment = _short(task.get("team_comment"), MAX_COMMENT_CHARS)
+    if not task.get("done"):
+        return f"{label}は完了になっていません"
+    if task.get("nothing_shipped"):
+        return f"{label}に「{task.get('quote')}」とあります"
+    return f"{label}は伝票番号が無く、納品チームコメントに「{comment}」とあります"
+
+
+def task_view(task: dict) -> dict:
+    """報告書に出す、行の要点（コメントは短く切る。住所などを長々と写さない）。"""
+    return {
+        "label": str(task.get("label") or ""), "request_date": str(task.get("request_date") or ""),
+        "due_date": str(task.get("due_date") or ""), "date": str(task.get("date") or ""),
+        "done": bool(task.get("done")), "ships": task_ships(task), "purpose": str(task.get("purpose") or ""),
+        "tracking": _short(task.get("tracking"), MAX_TRACKING_CHARS),
+        "comment": _short(task.get("comment"), MAX_COMMENT_CHARS),
+        "team_comment": _short(task.get("team_comment"), MAX_COMMENT_CHARS),
+        "link": _one_line(task.get("link")),
+    }
+
+
 # --- 請求書ごとの検算と記載要件 ---
 
 
@@ -415,12 +598,21 @@ class GroupCheck:
     apply_interpretation() → finish()。
     """
 
-    def __init__(self, name: str, invoices: list[dict], sources: list[dict], settings: dict | None = None, unread: list[dict] | None = None) -> None:
+    def __init__(
+        self, name: str, invoices: list[dict], sources: list[dict], settings: dict | None = None,
+        unread: list[dict] | None = None, shipments: list[dict] | None = None,
+    ) -> None:
         self.name = name
         self.invoices = invoices
         self.sources = sources
         self.settings = dict(settings or {})
         self.unread = list(unread or [])
+        # 出荷管理表の、この取引先の「商品発送」の行（ship_tasks の結果）。None は表を使わない
+        self.shipments = shipments
+        self.ship_links: dict[str, list[dict]] = {}  # 注文 → 結び付いた行
+        self.ship_shared: set[str] = set()  # 他の注文の行を借りた注文（同梱とみた）
+        self.ship_doubts: dict[str, list[str]] = {}  # 注文 → 出荷を確かめられない理由
+        self.unattributed: list[dict] = []  # どの注文とも結べなかった行
         self.orders: list[dict] = []
         self.order_lines: list[dict] = []
         self.lines: list[dict] = []  # 請求書の行（全請求書ぶん）
@@ -627,11 +819,14 @@ class GroupCheck:
                 "subtotal": to_int(invoice.get("subtotal")), "tax_total": to_int(invoice.get("tax_total")),
                 "total": to_int(invoice.get("total")),
             })
+        self._apply_shipments()
         self._check_duplicates()
         self._check_mismatches()
         self._check_unmatched()
         self._check_not_billable()
         self._check_shipping_evidence()
+        self._check_cutoff()
+        self._check_unattributed()
         self._check_dates()
         self._check_unbilled()
         self._check_figures()
@@ -649,6 +844,309 @@ class GroupCheck:
             "findings": self.findings,
             "unread": self.unread,
             "date_basis": self._date_basis(),
+            "shipments": self._shipments_result(),
+        }
+
+    # --- 出荷管理表との突き合わせ ---
+
+    def _table_in_use(self) -> bool:
+        """出荷管理表に、この取引先の商品発送の行があるか（無ければ資料の記録だけで見る）。"""
+        return bool(self.shipments) and self.has_orders
+
+    def _line_keys(self, source: dict) -> tuple[set[str], list[str]]:
+        """注文の行の品番と品名。対になった請求書の行の書き方も含める（注文書は相手の品番のことがある）。"""
+        items = [source]
+        if source["id"] in self.used:
+            items.append(self._line(self.used[source["id"]]))
+        codes: set[str] = set()
+        names: list[str] = []
+        for item in items:
+            code = norm_code(item.get("code"))
+            if code:
+                codes.add(code)
+            codes |= code_tokens(item.get("description"), item.get("note"))
+            name = norm_code(item.get("description"))
+            if len(name) >= MIN_NAME_CHARS:
+                names.append(name)
+        return codes, names
+
+    @staticmethod
+    def _same_goods(entry: dict, codes: set[str], names: list[str]) -> bool:
+        """出荷管理表に書かれた商品（品番か品名）が、注文のその行のものか。"""
+        code, name = norm_code(entry.get("code")), norm_code(entry.get("description"))
+        if code and any(codes_related(code, c) for c in codes):
+            return True
+        return len(name) >= MIN_NAME_CHARS and any(name in n or n in name for n in names)
+
+    def _task_lists(self, task: dict, source: dict) -> tuple[bool, bool]:
+        """その行に、注文のこの行の商品が書かれているか。→ (書かれている, 数量も同じ)"""
+        codes, names = self._line_keys(source)
+        hit = any(codes_related(token, code) for token in task["tokens"] for code in codes)
+        same_quantity_too = False
+        for item in task["items"]:
+            if self._same_goods(item, codes, names):
+                hit = True
+                same_quantity_too = same_quantity_too or (item["quantity"] and abs(item["quantity"] - source["quantity"]) < 1e-6)
+        return hit, bool(same_quantity_too)
+
+    @staticmethod
+    def _ship_window(order: dict) -> tuple[str, str]:
+        """注文書の出荷日・納品日の指定から、出荷の期日が入るはずの範囲。指定が無ければ空。"""
+        ship, delivery = order.get("ship_date") or "", order.get("delivery_date") or ""
+        if ship and delivery:
+            return _shift(ship, -_WINDOW_BEFORE), delivery
+        if ship:
+            return _shift(ship, -_WINDOW_BEFORE), _shift(ship, _WINDOW_AFTER)
+        if delivery:
+            return _shift(delivery, -_WINDOW_BEFORE_DELIVERY), delivery
+        return "", ""
+
+    def _link_score(self, task: dict, order: dict) -> tuple[int, bool, bool]:
+        """出荷管理表の1行が、その注文の出荷である見込み。→ (点数, 期日が注文書の指定に合う, 別の商品の行)
+
+        日付の手がかり（依頼日が注文日の当日〜数日後／期日が注文書の出荷日・納品日の指定に合う）が
+        無ければ 0。**品目が合うだけでは結ばない**——同じ商品の注文が毎週のように来るため
+        （実例 2026-11-05: 9月分の確認で、10月の注文の出荷行を、同じ品番のある 9/18 の注文に結んだ）。
+        品目は、日付の合う行どうしの順位に使う（合えば加点、別の商品が書かれていれば減点）。
+        """
+        score = 0
+        gap = weekday_gap(order.get("order_date"), task.get("request_date"))
+        if gap is not None and 0 <= gap < len(_REQUEST_SCORES):
+            score += _REQUEST_SCORES[gap]
+        low, high = self._ship_window(order)
+        in_window = bool(low and task["date"] and low <= task["date"] <= high)
+        if in_window:
+            score += _WINDOW_SCORE + (_SHIP_DATE_SCORE if task["date"] == order.get("ship_date") else 0)
+        if task["arrival_date"] and task["arrival_date"] == order.get("delivery_date"):
+            score += _ARRIVAL_SCORE
+        if not score:
+            return 0, False, False
+        listed = [self._task_lists(task, s) for s in self.order_lines if s["order"] == order["key"]]
+        other_goods = bool(task["tokens"] or task["items"]) and not any(hit for hit, _ in listed)
+        if other_goods:
+            score -= _OTHER_ITEM_PENALTY
+        elif any(hit for hit, _ in listed):
+            score += _ITEM_SCORE + (_QUANTITY_SCORE if any(same for _, same in listed) else 0)
+        return max(score, 0), in_window, other_goods
+
+    def _ships_held_goods(self, task: dict, key: str, linked: list[dict]) -> bool:
+        """その行が、注文に結んだ行で未発送とされた商品を発送しているか（在庫補充の後の発送）。"""
+        for source in (s for s in self.order_lines if s["order"] == key):
+            codes, names = self._line_keys(source)
+            held = any(self._same_goods(u, codes, names) for t in linked for u in t["unshipped"])
+            if held and self._task_lists(task, source)[0]:
+                return True
+        return False
+
+    def _link_shipments(self) -> None:
+        """出荷管理表の行（通常の出荷）を、注文に結ぶ。"""
+        tasks = [t for t in self.shipments or [] if t["purpose"] == PURPOSE_NORMAL]
+        scores: dict[tuple[int, str], tuple[int, bool, bool]] = {}
+        for index, task in enumerate(tasks):
+            for order in self.orders:
+                found = self._link_score(task, order)
+                if found[0] > 0:
+                    scores[(index, order["key"])] = found
+        links: dict[str, list[dict]] = {o["key"]: [] for o in self.orders}
+        placed: set[int] = set()
+        # 1. 見込みの高い順に、注文と行を1対1で結ぶ
+        for (index, key), _ in sorted(scores.items(), key=lambda kv: (-kv[1][0], kv[0][0])):
+            if index not in placed and not links[key]:
+                links[key].append(tasks[index])
+                placed.add(index)
+        # 2. 残った行は、同じ注文を分けて出荷したと分かるものだけ足す: 先に結んだ行と同じ日の依頼／
+        #    期日が注文書の指定に合う（どちらも、別の商品の行でないこと）／結んだ行で未発送とされた
+        #    商品を発送している。依頼日が近いだけの行は足さない（資料に無い注文の出荷かもしれない）
+        for index, task in enumerate(tasks):
+            if index in placed:
+                continue
+            best: tuple[int, str] | None = None
+            for order in self.orders:
+                key = order["key"]
+                score, in_window, other_goods = scores.get((index, key), (0, False, False))
+                same_day = bool(score) and bool(links[key]) and links[key][0]["request_date"] == task["request_date"]
+                split = (same_day or in_window) and not other_goods
+                if (split or self._ships_held_goods(task, key, links[key])) and (best is None or score > best[0]):
+                    best = (score, key)
+            if best is not None:
+                links[best[1]].append(task)
+                placed.add(index)
+        # 3. 行の付かなかった注文は、他の注文と一緒に出荷した見込みの行を借りる
+        for order in self.orders:
+            if links[order["key"]]:
+                continue
+            found = [
+                (scores[(i, order["key"])][0], -i) for i in range(len(tasks))
+                if (i, order["key"]) in scores and not scores[(i, order["key"])][2]
+            ]
+            if found:
+                links[order["key"]].append(tasks[-max(found)[1]])
+                self.ship_shared.add(order["key"])
+        self.ship_links = links
+        self.unattributed = [t for i, t in enumerate(tasks) if i not in placed]
+
+    def _shipped_later(self, after: dict, source: dict, linked: list[dict]) -> dict | None:
+        """その注文に結んだ後の行で、その商品を出荷しているもの（在庫補充の後の発送）。"""
+        later = linked[linked.index(after) + 1:] if after in linked else []
+        return next((t for t in later if task_ships(t) and self._task_lists(t, source)[0]), None)
+
+    def _apply_shipments(self) -> None:
+        """出荷管理表の記載を、注文の行の出荷状況に反映する。
+
+        資料（出荷分の控え・消し線・入荷待ち管理表）で決まっている行は変えず、出荷不明の行だけを決める:
+        未発送と書かれた商品 → 未出荷（後日の行で出荷していれば出荷済）／裏付けになる行がある → 出荷済／
+        行はあるが裏付けにならない（未完了・何も発送していない・伝票番号なしでコメントあり）→ 出荷不明のまま。
+        """
+        if self.shipments is None or not self.has_orders:
+            return
+        if not self.shipments:
+            self.findings.append(finding(
+                NOTE, "no_ship_rows", "出荷管理表にこの取引先の行が無い",
+                "出荷管理表の対象の期間に、この取引先の「商品発送」の行がありません。取引先名の書き方が違うか、"
+                "表を通さない出荷の可能性があります。出荷の確認は、資料の記録だけで行いました", "",
+                brief="出荷管理表にこの取引先の行が無く、出荷の確認は資料の記録だけで行いました",
+            ))
+            return
+        self._link_shipments()
+        conflicts: list[str] = []
+        for order in self.orders:
+            linked = self.ship_links.get(order["key"]) or []
+            ships = [t for t in linked if task_ships(t)]
+            doubts = [t for t in linked if not task_ships(t)]
+            for source in (s for s in self.order_lines if s["order"] == order["key"]):
+                codes, names = self._line_keys(source)
+                held = next((t for t in linked if any(self._same_goods(u, codes, names) for u in t["unshipped"])), None)
+                later = self._shipped_later(held, source, linked) if held is not None else None
+                if held is not None and later is None:
+                    quote = next(u["quote"] for u in held["unshipped"] if self._same_goods(u, codes, names))
+                    said = f"出荷管理表 {held['label']}" + (f"「{_short(quote, MAX_COMMENT_CHARS)}」" if quote else "で未発送")
+                    if source["state"] == OPEN:
+                        source["state"], source["ship_date"], source["state_reason"] = NOT_SHIPPED, "", said
+                    elif source["state"] == NOT_SHIPPED:
+                        source["state_reason"] += f"。{said}"
+                    elif source["state"] == SHIPPED:
+                        conflicts.append(f"{order['order_number'] or order['files'][0]} {source['code'] or source['description']}（資料: {source['state_reason']}、{said}）")
+                    continue
+                if source["state"] != OPEN:
+                    continue
+                if later is not None:
+                    source["state"], source["state_reason"] = SHIPPED, f"{task_evidence(later)}。{held['label']} では未発送"
+                    source["table_ship_dates"], source["table_task"] = [later["date"]], later
+                elif ships:
+                    source["state"] = SHIPPED
+                    source["state_reason"] = "、".join(task_evidence(t) for t in ships[:2]) + ("（他の注文と同じ出荷）" if order["key"] in self.ship_shared else "")
+                    source["table_ship_dates"] = sorted(t["date"] for t in ships if t["date"])
+                    source["table_task"] = min(ships, key=lambda t: t["date"] or "9999")
+                elif any(t["nothing_shipped"] for t in doubts):
+                    task = next(t for t in doubts if t["nothing_shipped"])
+                    source["state"], source["ship_date"] = NOT_SHIPPED, ""
+                    source["state_reason"] = f"出荷管理表 {task['label']}「{task['quote']}」"
+            if doubts and not ships:
+                self.ship_doubts[order["key"]] = [task_doubt(t) for t in doubts]
+        if conflicts:
+            self.findings.append(finding(
+                CONFIRM, "ship_conflict", "資料では出荷済み、出荷管理表では未発送の記載",
+                "、".join(conflicts[:6]) + "。どちらが正しいかを営業担当に確認してください", "",
+            ))
+        unread = [t for links in self.ship_links.values() for t in links if not t["read"] and str(t.get("team_comment") or "").strip()]
+        if unread:
+            listing = "、".join(f"{t['label']}「{_short(t.get('team_comment'), MAX_COMMENT_CHARS)}」" for t in unread[:6])
+            self.findings.append(finding(
+                CONFIRM, "ship_comment", "出荷管理表のコメント欄を読み取れなかった",
+                f"納品チームコメントのある行: {listing}。未発送の商品が書かれていないか、人の目で確認してください", "",
+            ))
+
+    def _period(self, invoice: dict | None = None) -> tuple[str, str]:
+        """請求の対象の期間（明細の日付の月の初日〜末日）。日付が無ければ空。"""
+        lines = [l for l in self.lines if invoice is None or l["invoice"] == str(invoice.get("file") or "")]
+        dates = sorted(str(l.get("date")) for l in lines if _to_date(l.get("date")))
+        if not dates:
+            return "", ""
+        return dates[0][:8] + "01", month_end(dates[-1])
+
+    def _check_cutoff(self) -> None:
+        """請求した注文の出荷が、出荷管理表では請求の月より後になっていないか。"""
+        for invoice in self.invoices:
+            name = str(invoice.get("file") or "")
+            _, end = self._period(invoice)
+            if not end:
+                continue
+            late: dict[str, list[dict]] = {}
+            evidence: dict[str, dict] = {}
+            for line in (l for l in self.lines if l["invoice"] == name):
+                for source in self._billed_sources(line):
+                    dates = source.get("table_ship_dates") or []
+                    if source["state"] == SHIPPED and dates and min(dates) > end:
+                        late.setdefault(source["order"], []).append(line)
+                        evidence.setdefault(source["order"], source["table_task"])
+                        break
+            parts = []
+            for key, lines in late.items():
+                order = next(o for o in self.orders if o["key"] == key)
+                task = evidence[key]
+                asked = f"。依頼者コメント「{_short(task.get('comment'), MAX_COMMENT_CHARS)}」" if task.get("partial") else ""
+                parts.append(
+                    f"注文 {order['order_number'] or order['files'][0]}（{len(lines)} 行・{yen(sum(l['amount'] for l in lines))}）は、"
+                    f"{task_evidence(task)}の出荷です{asked}"
+                )
+            if parts:
+                month = int(end[5:7])
+                self.findings.append(finding(
+                    CONFIRM, "cutoff", "翌月の出荷を当月分で請求している可能性",
+                    "。".join(parts) + f"。{month}月中に出荷していなければ、{month}月分の請求から外してください（出荷した月の売上になります）",
+                    name, sum(l["amount"] for lines in late.values() for l in lines),
+                    [l["id"] for lines in late.values() for l in lines],
+                ))
+
+    def _loose_shipments(self) -> list[dict]:
+        """どの注文とも結べなかった行のうち、依頼日も期日も請求の月に入っているもの。"""
+        start, end = self._period()
+        if not start:
+            return []
+        return [
+            t for t in self.unattributed
+            if start <= str(t.get("request_date") or "") <= end and start <= t["date"] <= end
+        ]
+
+    def _check_unattributed(self) -> None:
+        """出荷管理表にあるのに、資料のどの注文とも結べない出荷（資料に無い注文＝請求漏れの可能性）。
+
+        依頼日も期日も請求の月に入っている行だけを見る（月をまたぐ行は前後の月の請求のことがある）。
+        """
+        mode = str((self.settings.get("shipment_log") or {}).get("unattributed") or "confirm")
+        found = self._loose_shipments()
+        if mode == "off" or not found:
+            return
+        listing = "、".join(
+            f"{t['label']}（依頼 {short_date(t.get('request_date'))}・期日 {short_date(t.get('due_date'))}、"
+            f"{_short(t.get('tracking'), MAX_TRACKING_CHARS) or ('完了' if t.get('done') else '未完了')}）"
+            for t in found[:8]
+        )
+        self.findings.append(finding(
+            NOTE if mode == "note" else CONFIRM, "unattributed_shipment", "出荷管理表にあるのに、対応する注文書が資料に無い出荷",
+            f"{len(found)} 件: {listing}。資料のどの注文の出荷か特定できません。入荷待ち分の後日の出荷か、"
+            "資料に無い注文（請求漏れ）の可能性があります。営業担当に確認してください", "",
+            brief=f"出荷管理表に、対応する注文書が資料に無い出荷が {len(found)} 件あります（{'、'.join(t['label'] for t in found[:8])}）",
+        ))
+
+    def _shipments_result(self) -> dict:
+        """報告書に出す、出荷管理表との照合の結果。"""
+        if self.shipments is None:
+            return {"used": False, "rows": 0}
+        tasks = self.shipments
+        placed = {id(t) for links in self.ship_links.values() for t in links}
+        return {
+            "used": self._table_in_use(),
+            "rows": len(tasks),
+            "orders": [
+                {
+                    "order": o["order_number"] or o["files"][0], "shared": o["key"] in self.ship_shared,
+                    "tasks": [task_view(t) for t in self.ship_links.get(o["key"]) or []],
+                }
+                for o in self.orders
+            ],
+            "unattributed": [task_view(t) for t in self._loose_shipments()],
+            "others": [task_view(t) for t in tasks if t["purpose"] != PURPOSE_NORMAL and id(t) not in placed],
         }
 
     def _check_duplicates(self) -> None:
@@ -720,7 +1218,7 @@ class GroupCheck:
             if state == NOT_SHIPPED:
                 self.findings.append(finding(
                     CONFIRM, "not_shipped", "出荷した記録の無い行を請求している",
-                    f"{len(lines)} 行・{yen(total)}（{listing}）は、{reasons}です。当月中に出荷したかを営業担当に確認し、未出荷なら外してください",
+                    f"{len(lines)} 行・{yen(total)}（{listing}）は、出荷した記録がありません（{reasons}）。当月中に出荷したかを営業担当に確認し、未出荷なら外してください",
                     name, total, [l["id"] for l in lines],
                 ))
             else:
@@ -750,11 +1248,23 @@ class GroupCheck:
                     by_invoice.setdefault(line["invoice"], {}).setdefault(source["order"], []).append(line)
                     break
         for name, by_order in by_invoice.items():
-            risky, plain = [], []
+            risky, plain, unproven = [], [], []
             for key, lines in by_order.items():
                 order = next(o for o in self.orders if o["key"] == key)
                 label = f"{order['order_number'] or order['files'][0]}（{len(lines)} 行・{yen(sum(l['amount'] for l in lines))}）"
-                (risky if mode == "always" or self._order_has_trouble(key) else plain).append(label)
+                if self._table_in_use():
+                    why = "、".join(self.ship_doubts.get(key) or []) or "出荷管理表に、この注文の出荷の行が見当たりません"
+                    unproven.append(f"注文 {label}: {why}")
+                else:
+                    (risky if mode == "always" or self._order_has_trouble(key) else plain).append(label)
+            if unproven:
+                # 出荷管理表があれば、どの注文も出荷を確かめられる。確かめられない注文は発行前に聞く
+                self.findings.append(finding(
+                    CONFIRM, "shipping_evidence", "出荷管理表で出荷を確かめられない注文（発行前に出荷確認）",
+                    "。".join(unproven) + "。出荷済みかを営業担当に確認し、未出荷なら外してください",
+                    name, sum(l["amount"] for lines in by_order.values() for l in lines),
+                    [l["id"] for lines in by_order.values() for l in lines],
+                ))
             if risky:
                 why = "同じ注文に品切・入荷待ち・取消の行があり、残りの行も在庫の影響を受けている可能性があります。" if mode != "always" else ""
                 self.findings.append(finding(
@@ -783,6 +1293,8 @@ class GroupCheck:
             return "注文日"
         if date == source.get("requested_ship_date") and source.get("requested_ship_date"):
             return "出荷日"
+        if date in (source.get("table_ship_dates") or []):
+            return "出荷日"  # 出荷管理表の期日（または実際の発送日）
         return "根拠なし" if any(source.get(k) for k in ("order_date", "ship_date", "delivery_date")) else ""
 
     def _check_dates(self) -> None:
@@ -795,6 +1307,8 @@ class GroupCheck:
                 for label, key in (("注文日", "order_date"), ("出荷日", "ship_date"), ("出荷日", "requested_ship_date"), ("納品日", "delivery_date"))
                 if source.get(key) and not (key == "requested_ship_date" and source.get("ship_date"))
             )
+            if source.get("table_ship_dates"):
+                known += "、出荷管理表の期日 " + "・".join(short_date(d) for d in source["table_ship_dates"])
             self.findings.append(finding(
                 CONFIRM, "line_date_basis", "明細の日付の根拠が資料に無い",
                 f"{short_date(line.get('date'))}付の「{line.get('code') or line.get('description')}」は、資料（{source['file']}）では {known} です。出荷日か納品日に直してください",

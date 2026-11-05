@@ -16,8 +16,13 @@
     <フォルダ>/request.txt            依頼文（担当者の説明・営業の指示の引用）。無くてもよい
     <フォルダ>/<取引先>/invoices/…    確認する請求書（PDF）
     <フォルダ>/<取引先>/sources/…     作成元資料（下の階層も読む）
+    <フォルダ>/出荷管理表.xlsx        卸の出荷管理表の写し。無ければ実行のたびに取得する
 結果は <フォルダ>/_result/ に報告書（report.md）・返信案（reply.txt）・照合結果（result.json）。
 Chatworkへの投稿、Box・Googleドライブからの取得、自動検知は段階2以降。
+
+卸の請求書は、出荷管理表（Googleスプレッドシート。`invoice_check.shipment_log`）とも突き合わせる
+（指示 2026-11-05）。注文ごとに出荷の行（期日・完了・伝票番号・納品チームコメント）を結び、
+未発送の商品の請求、翌月の出荷の請求、資料に無い注文の出荷（請求漏れ）を見る。
 """
 
 from __future__ import annotations
@@ -29,12 +34,37 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .invoicematch import DOC_INVOICE, GroupCheck, VERDICT_OK
+from . import shiplog
+from .invoicematch import DOC_INVOICE, DOC_ORDER, GroupCheck, VERDICT_OK, ship_tasks
 from .invoiceread import FEE_MISMATCH, FEE_OK, InvoiceReader
 from .invoicereport import render_reply, render_report, summary_rows
 
 JST = timezone(timedelta(hours=9))
 RESULT_DIR = "_result"
+SHIPLOG_FILE = "出荷管理表.xlsx"
+SHIPLOG_DAYS_BEFORE, SHIPLOG_DAYS_AFTER = 7, 14
+
+
+def load_shiplog(config: Any, case_dir: Path, skip: bool = False, fetch: Callable[[str], list[dict]] | None = None) -> tuple[list[dict] | None, str]:
+    """出荷管理表の行を用意する。→ (行。使わないときは None, 使えなかった理由)
+
+    フォルダに写し（出荷管理表.xlsx）があればそれを読む（同じ資料で確かめ直せるように）。
+    無ければスプレッドシートから取得する。取得できなくても確認は続け、理由を報告に出す。
+    """
+    settings = dict((config.data.get("invoice_check") or {}).get("shipment_log") or {})
+    if skip or not settings.get("enabled", True):
+        return None, ""
+    copy = case_dir / str(settings.get("case_file") or SHIPLOG_FILE)
+    try:
+        if copy.is_file():
+            return shiplog.parse_workbook(copy.read_bytes()), ""
+        spreadsheet_id = str(settings.get("spreadsheet_id") or "")
+        if not spreadsheet_id:
+            return None, ""
+        return (fetch or shiplog.fetch_rows)(spreadsheet_id), ""
+    except Exception as exc:
+        print("[warn] 出荷管理表を読めません: " + traceback.format_exc(), flush=True)
+        return None, f"出荷管理表を読めなかったため、出荷の実績との突き合わせをしていません（{exc}）"
 
 
 def load_case(case_dir: Path) -> tuple[str, list[dict]]:
@@ -75,8 +105,12 @@ class InvoiceChecker:
     def settings(self) -> dict:
         return dict(self._config.data.get("invoice_check") or {})
 
-    def check(self, request_note: str, groups: list[dict], case: str = "", review: bool = True) -> dict:
-        results = [self._check_group(request_note, group, review) for group in groups]
+    def check(
+        self, request_note: str, groups: list[dict], case: str = "", review: bool = True,
+        shiplog_rows: list[dict] | None = None, shiplog_note: str = "",
+    ) -> dict:
+        """shiplog_rows は出荷管理表の行（shiplog.parse_workbook の結果）。None なら突き合わせない。"""
+        results = [self._check_group(request_note, group, review, shiplog_rows) for group in groups]
         usage = dict(self._reader.usage)
         cost_jpy = None
         if self._cost is not None:
@@ -89,6 +123,7 @@ class InvoiceChecker:
             "case": case,
             "request_note": request_note,
             "groups": results,
+            "shipment_log": {"used": shiplog_rows is not None, "rows": len(shiplog_rows or []), "note": shiplog_note},
             "calls": self._reader.calls,
             "cache_hits": self._reader.cache_hits,
             "usage": usage,
@@ -99,7 +134,28 @@ class InvoiceChecker:
 
     # --- 内部 ---
 
-    def _check_group(self, note: str, group: dict, review: bool) -> dict:
+    def _shipments_for(self, name: str, invoices: list[dict], sources: list[dict], rows: list[dict] | None) -> list[dict] | None:
+        """出荷管理表から、この取引先の「商品発送」の行を取り出して読む。表を使わないときは None。
+
+        期間は、請求書の明細と注文書の日付の前後（依頼は注文の当日以降、出荷は月をまたぐことがある）。
+        """
+        if rows is None:
+            return None
+        if not any(s.get("doc_type") == DOC_ORDER and s.get("lines") for s in sources):
+            return []  # 注文書に基づかない請求（売上報告書など）は、出荷と突き合わせない
+        settings = dict(self.settings.get("shipment_log") or {})
+        names = [name] + [str(i.get("recipient_name") or "") for i in invoices] + list((settings.get("aliases") or {}).get(name) or [])
+        dates = [str(l.get("date") or "") for i in invoices for l in i.get("lines") or []]
+        dates += [str(s.get(k) or "") for s in sources if s.get("doc_type") == DOC_ORDER for k in ("order_date", "ship_date", "delivery_date")]
+        dates = sorted(d for d in dates if shiplog.shift(d, 0))
+        if not dates:
+            return []
+        start = shiplog.shift(dates[0], -int(settings.get("days_before", SHIPLOG_DAYS_BEFORE)))
+        end = shiplog.shift(dates[-1], int(settings.get("days_after", SHIPLOG_DAYS_AFTER)))
+        found = [r for r in shiplog.rows_for(rows, names, start, end) if str(r.get("task") or "").startswith(shiplog.TASK_SHIP)]
+        return ship_tasks(found, self._reader.read_shiplog(name, found) if found else {})
+
+    def _check_group(self, note: str, group: dict, review: bool, shiplog_rows: list[dict] | None = None) -> dict:
         settings = self.settings
         invoice_names = {name for name, _ in group.get("invoices") or []}
         invoices = [self._reader.read_invoice(name, data) for name, data in group.get("invoices") or []]
@@ -121,7 +177,8 @@ class InvoiceChecker:
             else:
                 sources.append(found)
 
-        check = GroupCheck(str(group.get("name") or ""), invoices, sources, settings, unread)
+        name = str(group.get("name") or "")
+        check = GroupCheck(name, invoices, sources, settings, unread, self._shipments_for(name, invoices, sources, shiplog_rows))
         check.prepare()
         if check.needs_interpretation():
             payload = check.interpretation_payload()
@@ -229,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default="", help="結果の出力先（既定: <case>/_result）")
     parser.add_argument("--no-cache", action="store_true", help="読み取り結果の控えを使わず、読み直す")
     parser.add_argument("--no-review", action="store_true", help="モデルの所見を省く（突合と検算だけ）")
+    parser.add_argument("--no-shiplog", action="store_true", help="出荷管理表との突き合わせを省く")
     args = parser.parse_args(argv)
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -258,7 +316,10 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     cache_dir = None if args.no_cache else state_dir / "invoice_check" / "cache"
     reader = InvoiceReader(config, cost=cost, cache_dir=cache_dir)
-    result = InvoiceChecker(config, reader=reader, cost=cost).check(note, groups, case=case_dir.name, review=not args.no_review)
+    rows, why = load_shiplog(config, case_dir, skip=args.no_shiplog)
+    result = InvoiceChecker(config, reader=reader, cost=cost).check(
+        note, groups, case=case_dir.name, review=not args.no_review, shiplog_rows=rows, shiplog_note=why,
+    )
 
     out_dir = Path(args.out) if args.out else case_dir / RESULT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
