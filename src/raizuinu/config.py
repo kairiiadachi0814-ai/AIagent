@@ -268,6 +268,22 @@ _DEFAULTS: dict[str, Any] = {
         "collections": [],
         "transcribe": {"enabled": True, "max_per_run": 3, "max_source_chars": 120000},
     },
+    # 発行請求書の確認（FR-15）。段階1は手動実行だけ（python -m raizuinu.invoicecheck --case …）。
+    # issuers は当社グループの発行者と登録番号（請求書の登録番号をこれと照合する）。
+    # shipping_evidence は出荷の裏付けが無い行の扱い: risk=同じ注文に品切・入荷待ち・取消が
+    # あるときだけ要確認（それ以外は留意）／always=常に要確認／off=見ない。
+    # checklist は確認事項の一覧（モデルの所見に渡す。管理者が項目を足せる）
+    "invoice_check": {
+        "enabled": False,
+        "model": None,  # None なら全体の model を使う
+        "effort": "medium",
+        "issuers": [],
+        "shipping_evidence": "risk",
+        "max_file_mb": 20,
+        "max_text_chars": 60000,
+        "max_source_files": 40,
+        "checklist": [],
+    },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {
         "enabled": False,
