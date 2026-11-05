@@ -23,7 +23,8 @@ import re
 
 from .invoicematch import BACKORDER_STATUSES, DOC_INVOICE, DOC_ORDER, DOC_TYPES, LINE_STATUSES, SEVERITIES, to_int
 
-PROMPT_VERSION = "2"
+# 読み取り結果の控えは、指示文の版ごとに持つ（指示を直した種類だけ読み直す）
+PROMPT_VERSIONS = {"invoice": "2", "source": "2", "interpret": "2", "review": "3"}
 
 # 表題がこれなら注文書。実例（2026-11-05）: 表題「注文書（直送依頼書）」の文書を「契約書・取引条件」と
 # 読み、行を書き出さなかった（請求書の行が「資料に対応なし」になった）。読み違いは読み直す
@@ -267,8 +268,13 @@ findings に書いてよいのは、上の2〜4で、資料または依頼文の
 守ること:
 - evidence に、根拠の資料名と該当の記載を必ず書く
 - 金額を自分で計算し直して別の数字を作らない。資料と請求書に書かれた数字だけを使う
-- severity: 資料の記載と請求書が明確に食い違う → 要修正。契約書に無い単価など、資料では
-  確かめられない点 → 要確認。問題ではないが管理者が知っておくとよい食い違い → 留意
+- 営業担当の指示は短く、どちらにも読めることがある（「送料弊社負担の間違いです。修正お願いします」は
+  「正しくは弊社負担。別途請求としていたのが間違い」とも読める）。指示を読むときは、契約書・取引条件の
+  記載と、旧版の請求書（reference_invoices。指示はこれに対して出されている）に照らして意味を決める。
+  いまの請求書が契約書・取引条件と合っていれば、指示は反映済みとみて書かない
+- 文中で行を指すときは、渡された行の番号（I3 など）ではなく、日付と品名で書く
+- severity: 資料の記載と請求書が食い違う → 要確認。問題ではないが管理者が知っておくとよい点 → 留意。
+  要修正は使わない（修正が要るかは管理者が決める）
 - 該当が無ければ findings は空にする（空が普通）
 """
 
@@ -391,7 +397,7 @@ class InvoiceReader:
         if self._cache_dir is None:
             return None
         model = str(self.settings.get("model") or self._config.model)
-        digest = hashlib.sha1(f"{PROMPT_VERSION}|{model}|{kind}|{key}".encode("utf-8")).hexdigest()
+        digest = hashlib.sha1(f"{PROMPT_VERSIONS.get(kind, '')}|{model}|{kind}|{key}".encode("utf-8")).hexdigest()
         return self._cache_dir / f"{kind}-{digest}.json"
 
     def _ask(self, kind: str, system: str, schema: dict, content: list[dict], cache_key: str) -> dict | None:

@@ -663,8 +663,8 @@ class GroupCheck:
                 order = next(o for o in self.orders if o["key"] == key)
                 label = order["order_number"] or order["files"][0]
                 files = "・".join(order["files"]) if order["copies"] > 1 else order["files"][0]
-                dates = "・".join(sorted({short_date(l.get("date")) for l in group if l.get("date")}))
-                firsts = "・".join(sorted({short_date(self._line(self.used[self.duplicates[l["id"]]]).get("date")) for l in group}))
+                dates = _dates(l.get("date") for l in group)
+                firsts = _dates(self._line(self.used[self.duplicates[l["id"]]]).get("date") for l in group)
                 parts.append(
                     f"注文 {label}（資料: {files}）の行が {firsts}付で請求済みなのに、{dates}付でも {len(group)} 行・{yen(sum(l['amount'] for l in group))} 計上されています"
                 )
@@ -905,15 +905,18 @@ class GroupCheck:
 
         根拠（evidence）の無い所見は受けない。付随費用は、コードでもモデルでも根拠が
         確かめられなかった行を「要確認」にする。
+        **モデルの所見は「要確認」まで**（「要修正」はコードで裏付けが取れた指摘だけ）。
+        実例（2026-11-05）: 営業担当の「①送料弊社負担の間違いです。修正お願いしたいです」を
+        逆の意味に読み、契約どおり直っている請求書に「要修正」を出した。
         """
         files = {str(i.get("file") or "") for i in self.invoices}
         checks = {str(c.get("invoice_line_id") or ""): c for c in review.get("fee_checks") or []}
         for line in self.fee_lines():
             check = checks.get(line["id"])
-            verdict, basis = (str(check.get("verdict") or ""), str(check.get("basis") or "").strip()) if check else ("", "")
+            verdict, basis = (str(check.get("verdict") or ""), _one_line(check.get("basis"))) if check else ("", "")
             label = f"「{line.get('description')}」{yen(line['amount'])}"
             if verdict == fee_mismatch and basis:
-                self.findings.append({**finding(FIX, "fee", "付随費用が資料の条件と違う", f"{label}: {basis}", line["invoice"], line["amount"], [line["id"]]), "by": "所見"})
+                self.findings.append({**finding(CONFIRM, "fee", "付随費用が資料の条件と違う可能性", f"{label}: {basis}", line["invoice"], line["amount"], [line["id"]]), "by": "所見"})
             elif verdict == fee_ok and basis:
                 self.fee_basis[line["id"]] = basis
             elif not self.fee_basis.get(line["id"]):
@@ -923,10 +926,12 @@ class GroupCheck:
                     line["invoice"], line["amount"], [line["id"]],
                 ))
         for item in review.get("findings") or []:
-            severity, evidence = str(item.get("severity") or ""), str(item.get("evidence") or "").strip()
-            title, detail = str(item.get("title") or "").strip(), str(item.get("detail") or "").strip()
+            severity, evidence = str(item.get("severity") or ""), _one_line(item.get("evidence"))
+            title, detail = _one_line(item.get("title")), _one_line(item.get("detail"))
             if severity not in SEVERITIES or not evidence or not title:
                 continue
+            if severity == FIX:
+                severity = CONFIRM
             invoice = str(item.get("invoice") or "")
             self.findings.append({
                 "severity": severity, "code": "review", "title": title,
@@ -979,6 +984,16 @@ class GroupCheck:
             "code": source["code"], "description": source["description"], "quantity": source["quantity"],
             "unit_price": source["unit_price"], "amount": source["amount"], "state": source["state"], "reason": reason,
         }
+
+
+def _one_line(text: Any) -> str:
+    """モデルの文を1行にする（報告書の箇条書きが崩れないように）。"""
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _dates(values: Any) -> str:
+    """日付を古い順に「10/9・10/13」の形で並べる。"""
+    return "・".join(short_date(d) for d in sorted({str(v) for v in values if v}))
 
 
 def _nearest_figure(amount: int, figures: list[dict]) -> dict | None:

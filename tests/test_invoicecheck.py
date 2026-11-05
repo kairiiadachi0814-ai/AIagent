@@ -399,21 +399,32 @@ class TestGroupedLinesFeesAndDates:
         fee = found(result, "fee")
         assert len(fee) == 1 and fee[0]["severity"] == CONFIRM and "名入代" in fee[0]["detail"]
 
-    def test_a_fee_that_contradicts_the_terms_must_be_fixed(self):
+    def test_a_fee_the_model_says_contradicts_the_terms_is_asked_about(self):
         review = {"fee_checks": [{"invoice_line_id": "I2", "verdict": FEE_MISMATCH, "basis": "契約書M.pdf では300枚の名入代は1,500円ではなく2,000円"}], "findings": []}
         _, result = run(*calendar_case(), mapping=calendar_mapping(), review=review)
-        assert [(f["severity"], f["by"]) for f in found(result, "fee")] == [(FIX, "所見")]
+        assert [(f["severity"], f["by"], f["title"]) for f in found(result, "fee")] == [(CONFIRM, "所見", "付随費用が資料の条件と違う可能性")]
 
     def test_model_findings_need_evidence(self):
         review = {"fee_checks": [], "findings": [
-            {"severity": CONFIRM, "invoice": "請求書-01.pdf", "title": "単価114円は契約書に無い", "detail": "見積による単価", "evidence": "契約書M.pdf の単価表"},
+            {"severity": CONFIRM, "invoice": "請求書-01.pdf", "title": "単価114円は契約書に無い", "detail": "見積による\n単価", "evidence": "契約書M.pdf の\n単価表"},
             {"severity": FIX, "invoice": "", "title": "根拠の無い所見", "detail": "…", "evidence": ""},
             {"severity": "重大", "invoice": "", "title": "知らない重さ", "detail": "…", "evidence": "x"},
         ]}
         _, result = run(*calendar_case(), mapping=calendar_mapping(), review=review)
         kept = found(result, "review")
         assert [f["title"] for f in kept] == ["単価114円は契約書に無い"]
-        assert kept[0]["by"] == "所見" and "（根拠: 契約書M.pdf の単価表）" in kept[0]["detail"]
+        assert kept[0]["by"] == "所見" and kept[0]["detail"] == "見積による 単価（根拠: 契約書M.pdf の 単価表）"  # 1行にそろえる
+
+    def test_the_model_can_ask_but_never_orders_a_fix(self):
+        # 実例（2026-11-05）: 営業担当の「①送料弊社負担の間違いです。修正お願いしたいです」を逆の意味に読み、
+        # 契約どおり直っている請求書に「要修正」を出した。要修正はコードで裏付けの取れた指摘だけ
+        review = {"fee_checks": [], "findings": [
+            {"severity": FIX, "invoice": "請求書-01.pdf", "title": "送料負担の誤りが未修正", "detail": "指示①が反映されていない", "evidence": "依頼文「①送料弊社負担の間違いです」"},
+        ]}
+        _, result = run(*calendar_case(date_small="2026-10-23"), mapping=calendar_mapping(), review={**review, "fee_checks": [
+            {"invoice_line_id": "I2", "verdict": FEE_OK, "basis": "契約書M.pdf「名入代 300枚 1,500円」"}]})
+        assert [f["severity"] for f in found(result, "review")] == [CONFIRM]
+        assert result["invoices"][0]["verdict"] == CONFIRM and not [f for f in result["findings"] if f["severity"] == FIX]
 
 
 class TestNearMatches:
