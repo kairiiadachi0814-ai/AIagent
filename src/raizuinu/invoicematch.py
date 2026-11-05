@@ -143,11 +143,14 @@ def line_kind(line: dict) -> str:
     return KIND_ITEM
 
 
-def finding(severity: str, code: str, title: str, detail: str, invoice: str = "", amount: int = 0, lines: list[str] | None = None) -> dict:
-    """指摘1件。invoice は対象の請求書ファイル（取引先全体の指摘なら空）。"""
+def finding(
+    severity: str, code: str, title: str, detail: str, invoice: str = "", amount: int = 0,
+    lines: list[str] | None = None, brief: str = "",
+) -> dict:
+    """指摘1件。invoice は対象の請求書ファイル（取引先全体の指摘なら空）。brief は返信案に載せる短い言い方。"""
     return {
         "severity": severity, "code": code, "title": title, "detail": detail,
-        "invoice": invoice, "amount": int(amount), "lines": list(lines or []), "by": "照合",
+        "invoice": invoice, "amount": int(amount), "lines": list(lines or []), "by": "照合", "brief": brief,
     }
 
 
@@ -763,7 +766,7 @@ class GroupCheck:
                 self.findings.append(finding(
                     NOTE, "shipping_evidence", "出荷の記録が資料に無い注文",
                     f"注文 {'、'.join(plain)} は注文書だけで、送り状などの出荷記録がありません。予定どおり出荷済みなら問題ありません",
-                    name,
+                    name, brief=f"出荷の記録が資料に無い注文が {len(plain)} 件あります。予定どおり出荷済みなら問題ありません",
                 ))
 
     def _basis_of(self, line: dict) -> str:
@@ -957,7 +960,7 @@ class GroupCheck:
             state = sources[0]["state"]
             result = "一致" if state in (OPEN, SHIPPED) else f"一致（{state}）"
             if line_id in self.mapped_by_model:
-                result += "・行をまとめて請求"
+                result += "・行をまとめて請求" if len(sources) > 1 else "・品名で対応付け"
             where = self._where(sources)
         elif line["kind"] != KIND_ITEM or not self.has_orders:
             result, where = ("根拠あり" if self.fee_basis.get(line_id) else "注文書以外"), self.fee_basis.get(line_id, "")
@@ -965,7 +968,7 @@ class GroupCheck:
             result, where = "資料に対応なし", ""
         return {
             "id": line_id, "invoice": line["invoice"], "date": str(line.get("date") or ""),
-            "code": str(line.get("code") or ""), "description": str(line.get("description") or ""),
+            "code": str(line.get("code") or ""), "description": str(line.get("description") or line.get("note") or ""),
             "quantity": line["quantity"], "unit_price": line["unit_price"], "amount": line["amount"],
             "kind": line["kind"], "result": result, "source": where, "basis": self._basis_of(line),
         }

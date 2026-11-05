@@ -203,7 +203,7 @@ def render_reply(result: dict, addressee: str = "坂田さん", reply_tag: str =
     for group in groups:
         for item in group.get("findings") or []:
             if item.get("severity") == NOTE:
-                notes.append(f"・{group.get('name')}: {item.get('title')}。{item.get('detail')}")
+                notes.append(f"・{group.get('name')}: " + (item.get("brief") or f"{item.get('title')}。{item.get('detail')}"))
     if notes:
         out.append("")
         out.append("■参考（修正不要）")
