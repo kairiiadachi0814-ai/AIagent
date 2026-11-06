@@ -247,6 +247,9 @@ scp -i ~/.ssh/raizuinu_vps 'ubuntu@tk2-262-40529.vs.sakura.ne.jp:/var/lib/raizui
 
 発行請求書の確認で使う資料を、VPSからBoxの読み取り用アプリとして読む。**読み取りだけ**で、Boxへは書き込まない。
 
+- アカウント: アプリは **Boxの開発者アカウント（Box Developer account）** で作る。通常の無料アカウントで作ると
+  Enterprise ID が 0 になり、トークンを取れない（実例 2026-11-06。開発者コンソールの上部に
+  「Box Developerアカウントにログインまたはサインアップしてください」と出ていたら、そのアカウントでは動かない）
 - アプリ: Boxの開発者コンソールで作った「AIassistant-reader」（サーバー認証・Client Credentials Grant）。
   アプリアクセスレベルは「アプリアクセスのみ」。スコープは読み取り＋書き込み
   （**書き込みはBoxがダウンロードに求めるため**。管理操作・開発者操作は全部オフ）

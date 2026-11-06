@@ -27,12 +27,14 @@ from raizuinu.config import Config  # noqa: E402
 MAX_LISTED = 20  # 一覧に名前を出す件数
 MAX_FOLDERS_SEARCHED = 12  # ダウンロードを試すファイルを探して開くフォルダの数
 MAX_TEST_BYTES = 5 * 1024 * 1024  # 試しに取るファイルの大きさの上限
+NO_ENTERPRISE = "0"  # Enterprise（組織）を持たないアカウントで「Enterprise IDをコピー」すると入る値
 
 TOKEN_HINTS = {
     "invalid_client": "BOX_CLIENT_ID か BOX_CLIENT_SECRET が違っています。開発者コンソールの値を貼り直してください。",
     "invalid_grant": "BOX_ENTERPRISE_ID が違うか、アプリがまだ承認されていません。"
                      "開発者コンソール右上のアイコン →「Enterprise IDをコピー」の値をご確認ください。",
-    "unauthorized_client": "アプリの認証方法が「クライアント資格情報許可（Client Credentials Grant）」になっているかをご確認ください。",
+    "unauthorized_client": "アプリがまだ承認されていないか、アプリの認証方法が Client Credentials Grant ではありません。"
+                           "Boxの開発者アカウントで作ったアプリかもご確認ください。",
 }
 
 
@@ -66,6 +68,13 @@ def main() -> int:
     if missing:
         print("環境変数が足りません: " + "／".join(missing))
         print("/etc/raizuinu/env に追記してください（値はここには出しません）")
+        return 1
+
+    if config.box_enterprise_id == NO_ENTERPRISE:
+        # 実例 2026-11-06: 通常の無料アカウントで作ったアプリは Enterprise ID が 0 で、トークンを取れなかった
+        print("BOX_ENTERPRISE_ID が 0 です。アプリを作ったBoxのアカウントに Enterprise（組織）がありません。")
+        print("→ 通常の無料アカウントではなく、Boxの開発者アカウント（Box Developer account）でアプリを作り直し、"
+              "0 ではない Enterprise ID を書いてください。")
         return 1
 
     try:
