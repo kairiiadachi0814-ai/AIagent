@@ -238,6 +238,11 @@
       "context_minutes": 120
     }
   },
+  "box": {
+    "_note": "Boxの資料の読み取り（発行請求書の確認の段階2）。読み取り用アプリのサービスアカウントを root_folder_id（①月次税務資料提出フォルダ（ライズG））へビューアーで招待済み（2026-11-06）。ID・シークレットは /etc/raizuinu/env の BOX_CLIENT_ID／BOX_CLIENT_SECRET／BOX_ENTERPRISE_ID。接続確認: python tools/check_box.py（書き込みはしない）",
+    "enabled": false,
+    "root_folder_id": "226145855021"
+  },
   "invoice_check": {
     "_note": "発行請求書の確認（FR-15）。段階1は手動実行のみ: python -m raizuinu.invoicecheck --case <フォルダ>。最終承認は管理者（承認はしない）",
     "enabled": false,

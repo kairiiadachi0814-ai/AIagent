@@ -243,6 +243,27 @@ scp -i ~/.ssh/raizuinu_vps 'ubuntu@tk2-262-40529.vs.sakura.ne.jp:/var/lib/raizui
 - すぐ試す: `sudo -u raizuinu env PYTHONPATH=/opt/raizuinu/app/src RAIZUINU_STATE_DIR=/var/lib/raizuinu ... python -m raizuinu.linksync --now`（`--dry-run` で投稿せず違いだけ表示）
 - 状態は `/var/lib/raizuinu/handbook_sync.json`（提案中の控え・転記済み・見送りの記録）
 
+## Boxの資料を読む設定（2026-11-06追加・FR-15 段階2の準備）
+
+発行請求書の確認で使う資料を、VPSからBoxの読み取り用アプリとして読む。**読み取りだけ**で、Boxへは書き込まない。
+
+- アプリ: Boxの開発者コンソールで作った「AIassistant-reader」（サーバー認証・Client Credentials Grant）。
+  アプリアクセスレベルは「アプリアクセスのみ」。スコープは読み取り＋書き込み
+  （**書き込みはBoxがダウンロードに求めるため**。管理操作・開発者操作は全部オフ）
+- 招待: アプリのサービスアカウント（`AutomationUser_…@boxdevedition.com`）を
+  「①月次税務資料提出フォルダ（ライズG）」（`config/config.json` の `box.root_folder_id`）へ**ビューアー**で招待する。
+  Boxはアプリのスコープとフォルダでの役割の両方が許す操作だけを通すので、**役割をビューアーより上げない**こと
+- 秘密情報: `/etc/raizuinu/env` に `BOX_CLIENT_ID`／`BOX_CLIENT_SECRET`／`BOX_ENTERPRISE_ID` を1行ずつ。
+  チャットには貼らない。クライアントシークレットを作り直したら、この値も書き換える
+- 接続確認（書き込みはしない。認証・招待フォルダでの権限・一覧・ダウンロードを順に確かめる）:
+
+```bash
+ssh -i ~/.ssh/raizuinu_vps ubuntu@tk2-262-40529.vs.sakura.ne.jp "sudo bash -c 'set -a; . /etc/raizuinu/env; set +a; cd /tmp && sudo -E -u raizuinu env PYTHONPATH=/opt/raizuinu/app/src /opt/raizuinu/venv/bin/python /opt/raizuinu/app/tools/check_box.py'"
+```
+
+- 「【注意】このフォルダで書き込みができる役割になっています」と出たら、Boxの共有設定で役割をビューアーへ下げる
+- アプリをやめるときは、フォルダの共有からサービスアカウントを外し、開発者コンソールでアプリを削除する
+
 ## コストの実測・目安
 
 claude-opus-5での実測（2026-08-13、変更前）:

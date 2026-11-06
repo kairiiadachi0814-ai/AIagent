@@ -299,6 +299,16 @@ _DEFAULTS: dict[str, Any] = {
         "max_source_files": 40,
         "checklist": [],
     },
+    # Box の資料の読み取り（発行請求書の確認の段階2）。Box のアプリ（サーバー認証）として入り、
+    # サービスアカウントがビューアーで招待されたフォルダ（root_folder_id）の下だけを読む。
+    # 書き込みの機能は持たない。接続確認は python tools/check_box.py
+    "box": {
+        "enabled": False,
+        "api_url": "https://api.box.com",
+        "root_folder_id": "",
+        "timeout_seconds": 30,
+        "max_file_mb": 20,
+    },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {
         "enabled": False,
@@ -402,6 +412,24 @@ class Config:
         以後は状態ファイル側が正となる（環境変数は最初の1回だけ効く）。
         """
         return os.environ.get("TASKRISING_BOT_REFRESH_TOKEN")
+
+    # Box（読み取り用アプリ）。アプリの ID・シークレットと、アプリを作ったアカウントの Enterprise ID
+    @property
+    def box_client_id(self) -> str | None:
+        return _env("BOX_CLIENT_ID")
+
+    @property
+    def box_client_secret(self) -> str | None:
+        return _env("BOX_CLIENT_SECRET")
+
+    @property
+    def box_enterprise_id(self) -> str | None:
+        return _env("BOX_ENTERPRISE_ID")
+
+
+def _env(name: str) -> str | None:
+    """環境変数の値。手で貼った値の前後の空白と引用符は外す。"""
+    return (os.environ.get(name) or "").strip().strip("\"'").strip() or None
 
 
 def _deep_merge(base: dict, override: dict) -> None:
