@@ -1134,6 +1134,88 @@ class TestBatchedNotices:
         assert w.run_once() == 1
         assert "\n② 光パックス石川から発注書が届きました。" in bodies(w)[-1]
 
+    def past_the_threshold(self, tmp_path, **config):
+        """通し番号が (99)(100) まで来ている状態（まとめ通知 9000）。次は 101。"""
+        w = self.held_over_weekend(tmp_path, **config)
+        state = w._load_state()
+        for thread, n in zip(state["open"], (99, 100)):
+            thread["number"] = n
+        state["numbering"]["next"] = 101
+        w._save_state(state)
+        return w
+
+    def test_numbering_restarts_within_the_day_once_past_the_threshold(self, tmp_path):
+        # 指示 2026-11-09: 対応待ちが毎日残ると番号が増え続ける（105まで伸びた）。100を超える番号を振る前に
+        # 対応待ちが無くなっていれば、同じ日のうちでも①から振り直す。最初の通知にその旨を一言添える
+        w = self.past_the_threshold(tmp_path)
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]全て対応完了"))
+        w.run_once()
+        assert w._load_state()["open"] == []
+        w._chatwork.messages += held("4970_001.pdf", "2026/09/07 10:00:00")
+        w.clock.now = at(2026, 9, 7, 10, 5)
+        assert w.run_once() == 1
+        body = bodies(w)[-1]
+        assert "\n① 光パックス石川から発注書が届きました。" in body
+        assert "※対応待ちが無くなったので、番号は①から振り直しています。" in body
+        assert body.index("①から振り直して") < body.index(ASK_DONE)
+        # 続く通知は②。一言は最初の1通だけ
+        w._chatwork.messages += held("4980_001.pdf", "2026/09/07 10:30:00")
+        w.clock.now = at(2026, 9, 7, 10, 35)
+        assert w.run_once() == 1
+        assert "\n② 光パックス石川から発注書が届きました。" in bodies(w)[-1]
+        assert "振り直して" not in bodies(w)[-1]
+        assert [t["number"] for t in w._load_state()["open"]] == [1, 2]
+        assert "restarted" not in w._load_state()["numbering"]
+        # 新しい番号で閉じられる
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9002]① 対応完了"))
+        w.run_once()
+        assert [t["number"] for t in w._load_state()["open"]] == [2]
+
+    def test_no_restart_while_something_is_still_waiting(self, tmp_path):
+        w = self.past_the_threshold(tmp_path)
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000](99) 対応完了"))
+        w.run_once()
+        w._chatwork.messages += held("4970_001.pdf", "2026/09/07 10:00:00")
+        w.clock.now = at(2026, 9, 7, 10, 5)
+        assert w.run_once() == 1
+        assert "\n(101) 光パックス石川から発注書が届きました。" in bodies(w)[-1]
+        assert "振り直して" not in bodies(w)[-1]
+        assert [t["number"] for t in w._load_state()["open"]] == [100, 101]
+
+    def test_a_batch_after_the_restart_says_so_once(self, tmp_path):
+        w = self.past_the_threshold(tmp_path)
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]全て対応完了"))
+        w.run_once()
+        w._chatwork.messages += held("4970_001.pdf", "2026/09/07 10:00:00") + held("4980_001.pdf", "2026/09/07 10:01:00")
+        w.clock.now = at(2026, 9, 7, 10, 5)
+        assert w.run_once() == 2
+        body = bodies(w)[-1]
+        assert body.startswith(
+            f"[To:{SHINODA}] [To:{ADACHI}]\n届いているFAXが2件あります。まとめてお知らせします。\n"
+            "※対応待ちが無くなったので、番号は①から振り直しています。"
+        )
+        assert "\n① " in body and "\n② " in body and body.count("振り直して") == 1
+        assert [t["number"] for t in w._load_state()["open"]] == [1, 2]
+
+    @pytest.mark.parametrize("config, next_number, expected", [
+        ({}, 60, 60),  # 既定の閾値（100）に届いていなければ、同じ日は続き番号のまま
+        ({"numbering": {"restart_after": 10}}, 60, 60),  # 閾値は1日の上限（50）の2倍を下回らない（同じ日に同じ番号を出さない）
+        ({"numbering": {"restart_after": 10}}, 101, 1),
+        ({"numbering": {"restart_after": 120}}, 106, 106),  # 高い閾値はそのまま
+        ({"numbering": {"restart_after": 0}}, 106, 106),  # 0 なら日付が変わるときだけ戻す
+    ])
+    def test_the_threshold_is_at_least_twice_the_daily_limit(self, tmp_path, config, next_number, expected):
+        w = self.held_over_weekend(tmp_path, **config)
+        state = w._load_state()
+        state["numbering"]["next"] = next_number
+        w._save_state(state)
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]全て対応完了"))
+        w.run_once()
+        w._chatwork.messages += held("4970_001.pdf", "2026/09/07 10:00:00")
+        w.clock.now = at(2026, 9, 7, 10, 5)
+        assert w.run_once() == 1
+        assert [t["number"] for t in w._load_state()["open"]] == [expected]
+
     def test_a_duplicate_number_means_the_newest_unless_replied_to(self, tmp_path):
         # 番号は対応待ちが残る間は続きなので普段は重ならない。万一重なっていたら新しい方（返信先があればそちら）
         w = self.held_over_weekend(tmp_path)
@@ -1406,6 +1488,24 @@ class TestReopening:
         w.run_once()
         assert w.reopened_last_run == []
         assert len(w._chatwork.sent) == 1
+
+    def test_an_open_number_is_not_brought_back_from_an_older_fax_with_the_same_number(self, tmp_path):
+        # 番号は①から振り直すので、履歴には別のFAXの古い①が残り得る。新しい①が対応待ちにあるなら
+        # 「①戻して」で古い①を戻さない（話題は対応待ちの①。会話側が「残っています」と返す）
+        w = self.held_over_weekend_open(tmp_path)  # ①② が対応待ち
+        state = w._load_state()
+        old = {**state["open"][0], "posted_id": "8000", "batch_id": "8000", "pdf_id": "7999", "filename": "4900_001.pdf",
+               "closed_at": "2026-08-20T10:00:00+09:00", "closed_by": SHINODA, "closer_id": "8100", "via": "number", "thanks_id": "8101"}
+        state["closed_log"] = [old, {**old, "number": 3, "pdf_id": "7998", "filename": "4910_001.pdf"}]
+        w._save_state(state)
+        w._chatwork.messages.append(human(9600, f"[To:{AGENT}] ①はまだ対応完了できていないです。戻してほしい。", FUDABA))
+        w.run_once()
+        assert w.reopened_last_run == []
+        assert [t["filename"] for t in w._load_state()["open"]] == ["4950_001.pdf", "4960_001.pdf"]
+        # 対応待ちに無い番号（③）は従来どおり履歴から戻す
+        w._chatwork.messages.append(human(9700, f"[To:{AGENT}] ③はまだ対応完了できていないです。戻してほしい。", FUDABA))
+        w.run_once()
+        assert [t["filename"] for t in w.reopened_last_run] == ["4910_001.pdf"]
 
     def test_a_long_note_without_a_target_is_not_an_undo(self, tmp_path):
         w = self.three_closed_by_all(tmp_path)

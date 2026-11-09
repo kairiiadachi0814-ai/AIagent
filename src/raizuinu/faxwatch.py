@@ -958,8 +958,13 @@ class FaxWatcher:
             if named:
                 picks = named
             elif numbers:
+                # 番号は①から振り直すので、履歴には別のFAXの古い同番号が残っていることがある。
+                # その番号がいま対応待ちにあれば、話題はそちら（古い方は戻さず、会話側が「残っています」と返す）
+                open_numbers = {int(t.get("number") or 0) for t in state.get("open") or []}
                 picks = []
                 for n in numbers:
+                    if n in open_numbers:
+                        continue
                     hits = [e for e in fresh if int(e.get("number") or 0) == n]
                     if hits:
                         picks.append(max(hits, key=lambda e: str(e.get("closed_at", ""))))
@@ -1167,12 +1172,29 @@ class FaxWatcher:
         self._save_state(state)
         return len(posted)
 
-    @staticmethod
-    def _take_number(state: dict, now: datetime) -> int:
+    RESTART_NOTE = "※対応待ちが無くなったので、番号は①から振り直しています。"
+
+    def _restart_threshold(self) -> int:
+        """同じ日のうちに①へ戻してよくなる番号（これを超える番号を振る前に対応待ちが無ければ戻す）。
+        0 なら日付が変わるときだけ戻す。
+
+        同じ日に同じ番号が2つ出ないよう、1日の処理上限（max_per_day）の2倍を下回らない
+        （戻す前にその日に振った番号は 閾値+1−上限 以上、戻した後に振れる番号は 上限 以下なので重ならない）。
+        """
+        settings = self._config.fax_watch
+        after = int((settings.get("numbering") or {}).get("restart_after", 100) or 0)
+        if after <= 0:
+            return 0
+        return max(after, 2 * int(settings.get("max_per_day", 50)))
+
+    def _take_number(self, state: dict, now: datetime) -> int:
         """通知の通し番号を1つ取る。
 
         日付が変わったとき、対応待ちが残っていなければ①に戻し、残っていれば続きから振る
         （前日の①と当日の①が朝の一覧に並ぶと、どちらの話か決まらないため）。
+        同じ日のうちでも、番号が閾値（既定100）を超えるところで対応待ちが無くなっていれば①に戻す
+        （指示 2026-11-09。対応待ちが毎日残ると番号が増え続け、105まで伸びていた）。そのときは
+        numbering.restarted を立て、通知に一言添える（`_pop_restart_note` で消す）。
         """
         today = now.strftime("%Y%m%d")
         numbering = state.get("numbering") or {}
@@ -1180,8 +1202,18 @@ class FaxWatcher:
             carry = bool(state.get("open"))
             numbering = {"date": today, "next": int(numbering.get("next", 1)) if carry else 1}
         n = int(numbering.get("next", 1))
-        state["numbering"] = {"date": today, "next": n + 1}
+        restarted = bool(numbering.get("restarted"))
+        threshold = self._restart_threshold()
+        if threshold and n > threshold and not state.get("open"):
+            n, restarted = 1, True
+        state["numbering"] = {"date": today, "next": n + 1, **({"restarted": True} if restarted else {})}
         return n
+
+    def _pop_restart_note(self, state: dict) -> str:
+        """同じ日のうちに①へ戻した直後の通知に添える一言（一度だけ）。"""
+        if (state.get("numbering") or {}).pop("restarted", False):
+            return self.RESTART_NOTE
+        return ""
 
     def _post_single(self, room_id: int, p: dict, state: dict, now: datetime) -> dict:
         """1件だけの通知（従来の形）。発注書には番号を付ける（夕方の一覧などで番号で指せるように）。"""
@@ -1190,7 +1222,8 @@ class FaxWatcher:
         item = p["item"]
         number = self._take_number(state, now) if (p["is_order"] and p["ask_done"]) else 0
         prefix = f"{circled(number)} " if number else ""
-        text = self._render(p, prefix, trailer=True, ask_done=p["ask_done"] and p["is_order"])
+        note = self._pop_restart_note(state) if number else ""
+        text = self._render(p, prefix, trailer=True, ask_done=p["ask_done"] and p["is_order"], extra=note)
         reply_tag = f"[rp aid={int(item.get('account_id', 0))} to={room_id}-{item['message_id']}]"
         heads = " ".join(h for h in (self._heads(now) if p["wants_heads"] else "", self._urgent_heads([p])) if h)
         parts = [reply_tag] + ([heads] if heads else []) + [sanitize_for_chatwork(text)]
@@ -1203,6 +1236,7 @@ class FaxWatcher:
 
         max_chars = int((self._config.fax_watch.get("batch") or {}).get("max_chars", 6000))
         numbered = [(p, self._take_number(state, now)) for p in prepared]
+        restart_note = self._pop_restart_note(state)
         # 1通にまとめると1件ずつの通知（PDFの投稿への返信）が無いので、各件にPDFのリンクを添える
         blocks = [
             (
@@ -1228,6 +1262,8 @@ class FaxWatcher:
         for index, chunk in enumerate(chunks):
             if index == 0:
                 header = f"届いているFAXが{total}件あります。まとめてお知らせします。"
+                if restart_note:
+                    header += "\n" + restart_note
             else:
                 header = f"（続き {index + 1}/{len(chunks)}）"
             lines = [header, ""]
@@ -1364,10 +1400,12 @@ class FaxWatcher:
             return f"※急ぎの指定があるため（「{p['urgent_word']}」）、{told}".rstrip("、")
         return f"※急ぎと読める記載があるため、{told}".rstrip("、")
 
-    def _render(self, p: dict, prefix: str, trailer: bool, ask_done: bool) -> str:
-        """通知1件分の本文。prefix は番号（「① 」）、trailer は末尾の注意書きと返し方。"""
+    def _render(self, p: dict, prefix: str, trailer: bool, ask_done: bool, extra: str = "") -> str:
+        """通知1件分の本文。prefix は番号（「① 」）、trailer は末尾の注意書きと返し方。
+        extra は本文の直後に置く補足（番号を①から振り直した旨など）。"""
         if not p["readable"]:
-            return self._compose_unreadable(p["found"], p["notice"], p["filename"], prefix=prefix)
+            text = self._compose_unreadable(p["found"], p["notice"], p["filename"], prefix=prefix)
+            return text + ("\n" + extra if extra else "")
         lines = [
             self._compose(
                 p["found"], p["sender"], p["basis"], p["fax_number"], p["notice"], p["filename"],
@@ -1380,6 +1418,8 @@ class FaxWatcher:
             lines.append(f"※{str(quiet['reason']).strip()}のため、呼び出し（To）と対応完了の確認は省いています。")
         if p.get("urgent"):
             lines.append(self._urgent_note(p))
+        if extra:
+            lines.append(extra)
         if trailer:
             lines.append("※PDFを読んで整理しています。数量・金額は原本でご確認ください。")
             if ask_done:

@@ -132,6 +132,8 @@
     },
     "_batch_note": "batch:一度に複数件（朝の控え分など）を知らせるときは1通にまとめて番号（①②…）を振る。返事は番号で（「①③ 対応完了」）、全件なら「全て対応完了」。長ければ max_chars ごとに分ける",
     "batch": { "enabled": true, "max_chars": 6000 },
+    "_numbering_note": "numbering: 通知の通し番号。日付が変わるとき対応待ちが無ければ①へ戻す。restart_after を超える番号を振る前に対応待ちが無ければ、同じ日のうちでも①へ戻す（指示 2026-11-09。0 なら日付が変わるときだけ）。同じ日に同じ番号が出ないよう、実際の閾値は max_per_day の2倍を下回らない",
+    "numbering": { "restart_after": 100 },
     "on_mention": { "enabled": true, "delay_seconds": 5, "retry_seconds": 10 },
     "directory_csv_url": "https://docs.google.com/spreadsheets/d/1cOIYTuhBV3Je9PZtl8gz4DIbNKES0hrtBn-5nOQgO9M/export?format=csv",
     "max_pdf_mb": 15,
