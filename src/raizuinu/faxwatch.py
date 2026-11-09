@@ -181,6 +181,12 @@ def circled(n: int) -> str:
     return f"({n})"
 
 
+def number_label(n: int) -> str:
+    """モデルに渡す番号の表記。丸数字には普通の数字を添え（㊹（44））、51以上は (51) のまま。"""
+    mark = circled(n)
+    return mark if mark.startswith("(") else f"{mark}（{n}）"
+
+
 def _circled_value(ch: str) -> int:
     code = ord(ch)
     for lo, hi, base in _CIRCLED_RANGES:
@@ -189,18 +195,27 @@ def _circled_value(ch: str) -> int:
     return 0
 
 
-_NUM_FORMS_RE = re.compile(r"(?:No\.?\s*|[#＃])(\d{1,2})|(\d{1,2})\s*番|[(（](\d{1,2})[)）]", re.IGNORECASE)
-# 日付・時刻・件数・金額・ファイル名の一部（9/12、10時、2件、3つとも、5,280円、4950_001）は番号と読まない
-_BARE_NUM_RE = re.compile(r"(?<![\d/:.\-_A-Za-z])(\d{1,2})(?!,\d{3}(?!\d))(?![\d/:.\-_月日円件時分個枚人つ通%])")
+# 番号は3桁まで読む。通し番号は対応待ちが残っている限り続くので 100 を超える
+# （実例 2026-11-09 10:10: 篠田さんの「(100) 対応完了」を2桁までしか読まず、番号を聞き返した。
+# 聞き返しの例文「(89) 対応完了」自体も読めない形だった）
+_NUM_FORMS_RE = re.compile(
+    r"(?:No\.?\s*|[#＃])(\d{1,3})(?!\d)|(?<!\d)(\d{1,3})\s*番|[(（](\d{1,3})[)）]", re.IGNORECASE
+)
+# 日付・時刻・件数・金額・ファイル名の一部（9/12、10時、2件、3つとも、5,280円、4950_001）は番号と読まない。
+# 桁区切りの後ろの3桁（5,280 の 280）も番号ではない
+_BARE_NUM_RE = re.compile(
+    r"(?<![\d/:.\-_A-Za-z])(?<!\d,)(\d{1,3})(?!,\d{3}(?!\d))(?![\d/:.\-_月日円件時分個枚人つ通%])"
+)
 # 番号の並び（57.58.64.65、57,58、57/58/64）と範囲（①〜⑤、57〜60、57から60まで）。
 # 実例 2026-11-04 12:41: 「57.58.64.65対応完了」をピリオド区切りのため1つも読めず、番号を聞き返した。
 # 「①〜⑤」は①と⑤だけを閉じていた（黙って3件取りこぼす形）
 _NUM_HEAD = r"(?<![\d_\-A-Za-z])"
 _NUM_TAIL = r"(?![\d/:.\-_月日円件時分個枚人つ通%受着届納])"
 _RANGE_SEP = r"(?:〜|～|~|-|–|—|ー|から)"
-_NUM_RANGE_RE = re.compile(rf"{_NUM_HEAD}(\d{{1,2}})\s*{_RANGE_SEP}\s*(\d{{1,2}})(?:\s*(?:まで|迄))?{_NUM_TAIL}")
-_NUM_RUN_RE = re.compile(rf"{_NUM_HEAD}(\d{{1,2}}(?:\s*[.,/、・]\s*\d{{1,2}})+){_NUM_TAIL}")
+_NUM_RANGE_RE = re.compile(rf"{_NUM_HEAD}(\d{{1,3}})\s*{_RANGE_SEP}\s*(\d{{1,3}})(?:\s*(?:まで|迄))?{_NUM_TAIL}")
+_NUM_RUN_RE = re.compile(rf"{_NUM_HEAD}(\d{{1,3}}(?:\s*[.,/、・]\s*\d{{1,3}})+){_NUM_TAIL}")
 _RUN_SPLIT_RE = re.compile(r"[.,/、・\s]+")
+_THOUSANDS_RE = re.compile(r"\d{1,3}(?:,\d{3})+")  # 5,280／12,000／1,234,567
 MAX_RANGE_SPAN = 30  # 「1〜80」のような打ち間違いで対応待ち全部を閉じない
 
 
@@ -216,6 +231,17 @@ def _looks_like_date(separator_text: str, parts: list[int], known: set[int] | No
     return not (known and all(p in known for p in parts))
 
 
+def _looks_like_amount(separator_text: str, parts: list[int], known: set[int] | None) -> bool:
+    """「5,280」「12,000」のような桁区切りの金額か（「,」区切りで、2つ目からがちょうど3桁）。
+
+    番号が3桁になると「100,101」も同じ形になるので、挙げた番号が全部対応待ち（known）に
+    あれば番号の並びと読む。
+    """
+    if not _THOUSANDS_RE.fullmatch(re.sub(r"\s+", "", separator_text)):
+        return False
+    return not (known and all(p in known for p in parts))
+
+
 _ALL_RE = re.compile(r"(全て|すべて|全部|全件|一式|まとめて|両方|どちらも|いずれも|件とも|つとも|とも(対応|完了|済|確認))")
 _EXCEPT_RE = re.compile(r"(以外|除い|除き|のぞい|のぞき)")
 
@@ -223,9 +249,10 @@ _EXCEPT_RE = re.compile(r"(以外|除い|除き|のぞい|のぞき)")
 def report_numbers(body: str, known: Iterable[int] | None = None) -> list[int]:
     """返事に書かれた通知の番号。重複なし。
 
-    読める形: ①③、1と3、No.2、(4)、57.58.64.65、57,58、57/58/64、①〜⑤、57〜60、57から60まで。
-    日付（9/12）・時刻（10時）・件数（2件）・金額（5,280円）・ファイル名の一部は番号と読まない。
-    known はいま対応待ちの番号。「1/2」のように日付とも読める形は、両方が known にあれば番号と読む。
+    読める形: ①③、1と3、No.2、(4)、(100)、57.58.64.65、57,58、57/58/64、①〜⑤、57〜60、57から60まで。
+    番号は3桁まで。日付（9/12）・時刻（10時）・件数（2件）・金額（5,280円）・ファイル名の一部は番号と読まない。
+    known はいま対応待ちの番号。「1/2」（日付）「100,101」（桁区切りの金額）のようにほかの読み方も
+    できる形は、挙げた番号が全部 known にあれば番号と読む。
     """
     known_set = {int(n) for n in known if n} if known is not None else None
     # 丸数字は数字に置き換えて（前後に空白）、並びや範囲の形もそのまま読めるようにする
@@ -242,7 +269,7 @@ def report_numbers(body: str, known: Iterable[int] | None = None) -> list[int]:
 
     def take_run(match: re.Match) -> str:
         parts = [int(p) for p in _RUN_SPLIT_RE.split(match.group(1)) if p]
-        if _looks_like_date(match.group(1), parts, known_set):
+        if _looks_like_date(match.group(1), parts, known_set) or _looks_like_amount(match.group(1), parts, known_set):
             return match.group(0)
         found.extend(parts)
         return " "
@@ -2134,7 +2161,8 @@ class FaxStatus:
 - 対応待ちには番号（①②…）が付いている。「①と③が済みました」のように番号で
   報告されたら、その番号のPDF名を done_filenames に入れる。番号は「44」「44番」「No.44」
   のように普通の数字で書かれることも多く、㊹と同じ番号である（一覧の（44）と照合する。
-  「44番は見当たらない」と返さない）。「57.58.64.65」のように区切って並べたり、
+  「44番は見当たらない」と返さない）。51番からは丸数字が無いので一覧も報告も「(100)」「100」の形。
+  「57.58.64.65」のように区切って並べたり、
   「①〜⑤」「57〜60」と範囲で書かれることもある（範囲は間の番号も全部）。番号も「全て」も無い
   「対応完了」で対象が複数あるときは閉じず、どの番号か聞き返す
   （「全部でしたら『全て対応完了』とお返事ください」と添える）
@@ -2216,7 +2244,7 @@ class FaxStatus:
             # 番号は ㊹（44） の形で渡す。人は「44対応完了」と普通の数字でも書く
             # （実例 2026-11-02 09:48: 「44番は対応待ちの一覧に見当たらない」と返した）
             open_list = "\n".join(
-                f"- {circled(int(t['number'])) + '（' + str(int(t['number'])) + '）' if t.get('number') else '（番号なし）'} / "
+                f"- {number_label(int(t['number'])) if t.get('number') else '（番号なし）'} / "
                 f"{t.get('filename', '')} / {t.get('sender') or '差出人不明'} / {t.get('kind', '')}"
                 for t in self.open_threads()
             ) or "（なし）"

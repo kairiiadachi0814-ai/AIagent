@@ -1266,6 +1266,15 @@ class TestBatchedNotices:
         ("1~12迄完了", list(range(1, 13))), ("1-12完了", list(range(1, 13))), ("①~⑫迄完了", list(range(1, 13))),
         ("1/2/3,4~8済み", [4, 5, 6, 7, 8, 1, 2, 3]), ("1〜3、5〜7完了", [1, 2, 3, 5, 6, 7]),
         ("1/2済み", []),  # 対応待ちの番号が分からなければ「/」区切り2つで月日に収まるものは日付と読む（1月2日）
+        # 実例（2026-11-09 10:10）: 通し番号が100を超え、「(100) 対応完了」を読めずに番号を聞き返した
+        ("(100) 対応完了", [100]), ("100対応完了", [100]), ("100番 対応完了", [100]), ("No.100 対応完了", [100]),
+        (f"[rp aid={AGENT} to={FAX_ROOM}-9002]経理財務アシスタントさん\n(100) 対応完了", [100]),
+        ("(100)(102) 対応完了", [100, 102]), ("100.101 対応完了", [100, 101]), ("100・102 対応完了", [100, 102]),
+        ("100〜102 対応完了", [100, 101, 102]), ("98から101まで対応完了", [98, 99, 100, 101]),
+        ("㊿と(51)と100 対応完了", [51, 50, 100]),  # 「(51)」の形を先に読むので順は前後する
+        # 桁区切りの金額・4桁以上・ファイル名の一部は3桁になっても番号と読まない
+        ("5,280 対応完了", []), ("12,000円で対応完了", []), ("1,234,567 対応完了", []), ("1088_001.pdf 対応完了", []),
+        ("No.1234 対応完了", []), ("1234番 対応完了", []), ("2026年 対応完了", []), ("100% 対応完了", []),
     ])
     def test_reading_numbers_from_a_reply(self, body, expected):
         from raizuinu.faxwatch import report_numbers
@@ -1279,6 +1288,10 @@ class TestBatchedNotices:
         ("9/12納品分 対応完了", [9, 12], []),  # 「納品分」が続けば日付
         ("9/12 対応完了", [9, 12], [9, 12]),
         ("1/2/3 済み", [], [1, 2, 3]),  # 3つ以上は対応待ちに関係なく番号
+        # 3桁の番号を「,」で並べると桁区切りの金額と同じ形。全部が対応待ちにあれば番号
+        ("100,101 対応完了", [100, 101, 102], [100, 101]),
+        ("100,101 対応完了", [100], []),  # 片方しか無ければ金額のまま（聞き返す）
+        ("5,280 対応完了", [5, 100], []),
     ])
     def test_a_slash_pair_is_numbers_when_both_are_open(self, body, known, expected):
         from raizuinu.faxwatch import report_numbers
@@ -1286,11 +1299,12 @@ class TestBatchedNotices:
         assert report_numbers(body, known) == expected
 
     def test_wording_for_all_and_the_circled_numbers(self):
-        from raizuinu.faxwatch import circled, mentions_all
+        from raizuinu.faxwatch import circled, mentions_all, number_label
 
         assert mentions_all("全て対応完了") and mentions_all("2件とも対応完了です") and mentions_all("全部済みました")
         assert not mentions_all("①対応完了") and not mentions_all("対応完了です")
-        assert [circled(n) for n in (1, 20, 21, 35, 36, 50, 51)] == ["①", "⑳", "㉑", "㉟", "㊱", "㊿", "(51)"]
+        assert [circled(n) for n in (1, 20, 21, 35, 36, 50, 51, 100)] == ["①", "⑳", "㉑", "㉟", "㊱", "㊿", "(51)", "(100)"]
+        assert [number_label(n) for n in (44, 51, 100)] == ["㊹（44）", "(51)", "(100)"]
 
 
 class TestReopening:
@@ -1520,6 +1534,30 @@ class TestRepliesToOwnListings:
         assert [t["number"] for t in w.closed_last_run] == [4]
         assert [t["number"] for t in w._load_state()["open"]] == [1, 2]
         assert bodies(w)[-1].startswith(f"[rp aid={FUDABA} to={FAX_ROOM}-9600]\n")
+
+    def test_three_digit_numbers_replied_to_the_thanks_close_that_number(self, tmp_path):
+        # 実例（2026-11-09 10:10）: 通し番号が100を超え、篠田さんの「(100) 対応完了」を読めずに番号を聞き返した
+        w = TestBatchedNotices().held_over_weekend(tmp_path)  # ①②（まとめ 9000）
+        state = w._load_state()
+        for thread, n in zip(state["open"], (98, 99)):
+            thread["number"] = n
+        state["numbering"]["next"] = 100
+        w._save_state(state)
+        w._chatwork.messages += held("4970_001.pdf", "2026/09/07 10:00:00")
+        w.clock.now = at(2026, 9, 7, 10, 5)
+        w.run_once()  # (100) の通知 9001
+        assert "\n(100) 光パックス石川から発注書が届きました。" in bodies(w)[-1]
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9001]経理財務アシスタントさん\n(100) 対応完了"))
+        w.run_once()
+        assert [t["number"] for t in w.closed_last_run] == [100] and w.asked_last_run == []
+        assert [t["number"] for t in w._load_state()["open"]] == [98, 99]
+        thanks = bodies(w)[-1]
+        assert "対応待ちのFAXは、あと2件です。" in thanks and "・(98) 9/5" in thanks and "・(99) 9/6" in thanks
+        # お礼（9002）への返信で残りを並べて報告
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9002](98)(99) 対応完了"))
+        w.run_once()
+        assert [t["number"] for t in w.closed_last_run] == [98, 99]
+        assert w._load_state()["open"] == [] and "これでありません" in bodies(w)[-1]
 
     def test_a_mention_with_the_display_name_is_still_a_short_report(self, tmp_path):
         # 宛名「経理財務アシスタントさん」（12字）は一言の長さに数えない
