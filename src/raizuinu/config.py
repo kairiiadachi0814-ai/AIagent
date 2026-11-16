@@ -309,6 +309,12 @@ _DEFAULTS: dict[str, Any] = {
         "timeout_seconds": 30,
         "max_file_mb": 20,
     },
+    # AnthropicのAPIキーの見張り。巡回に相乗りして check_minutes おきにキーを確かめ（料金のかからない
+    # モデル一覧のAPI）、認証エラーなら管理者ルームへ一度だけ知らせる。戻ったときも一度だけ
+    "key_alert": {
+        "enabled": True,
+        "check_minutes": 15,
+    },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {
         "enabled": False,

@@ -348,6 +348,14 @@ def main() -> None:
     # 3つの処理が同じルームを見に行くことがあるため、取得は1回にまとめる。
     # 包みの寿命はこの実行だけ（次の巡回では取り直す）
     chatwork = OneShotCache(ChatworkClient(config.chatwork_api_token or ""))
+    # APIキーが使えなくなっていたら、管理者ルームへ一度だけ知らせる（実例 2026-11-16:
+    # キーの期限切れで全機能が止まったが、どこにも知らせていなかった）
+    try:
+        from .keyalert import KeyAlert
+
+        KeyAlert(config, chatwork).run_once()
+    except Exception:
+        print("[error] APIキーの確認に失敗: " + traceback.format_exc(), flush=True)
     # レターパックの取次ぎも同じタイマーに相乗りする（タイマーを増やさない）。
     # 片方が落ちてももう片方は動かす
     try:

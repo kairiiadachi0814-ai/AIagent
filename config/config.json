@@ -240,6 +240,11 @@
       "context_minutes": 120
     }
   },
+  "key_alert": {
+    "_note": "AnthropicのAPIキーの見張り。5分ごとの巡回に相乗りして check_minutes おきにキーを確かめ（料金のかからないモデル一覧のAPI）、認証エラー（401／403）なら管理者ルームへ一度だけ知らせる。通るようになったときも一度だけ。止まっている間は毎回確かめる（実例 2026-11-16: 有効期限つきのキーが切れ、どこにも知らせずに全機能が止まった）",
+    "enabled": true,
+    "check_minutes": 15
+  },
   "box": {
     "_note": "Boxの資料の読み取り（発行請求書の確認の段階2）。読み取り用アプリのサービスアカウントを root_folder_id（①月次税務資料提出フォルダ（ライズG））へビューアーで招待済み（2026-11-06）。ID・シークレットは /etc/raizuinu/env の BOX_CLIENT_ID／BOX_CLIENT_SECRET／BOX_ENTERPRISE_ID。接続確認: python tools/check_box.py（書き込みはしない）",
     "enabled": false,
