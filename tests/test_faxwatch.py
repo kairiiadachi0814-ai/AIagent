@@ -1088,7 +1088,8 @@ class TestBatchedNotices:
         body = bodies(w)[0]
         assert body.startswith(f"[To:{SHINODA}] [To:{ADACHI}]\n")  # 発注書があるので呼び出す
         assert "\n① 光パックス石川から発注書が届きました。" in body
-        assert "\n② FAXが届きました（広告）。" in body  # 広告にも番号は振る（指せるように）
+        # 広告には番号を振らない（実例 2026-11-10: 返事の要らない文書の番号が、済んでいない①に見えた）
+        assert "\n・FAXが届きました（広告）。" in body and "②" not in body
         assert "対応完了の返事が要るのは ① です。" in body
         assert [t["number"] for t in w._load_state()["open"]] == [1]  # 見届けるのは発注書だけ
 
@@ -1096,8 +1097,8 @@ class TestBatchedNotices:
         w = self.held_over_weekend(tmp_path, payload=AD)
         body = bodies(w)[0]
         assert "[To:" not in body and "対応完了の返事が要るのは" not in body
-        assert "\n① FAXが届きました（広告）。" in body and "\n② FAXが届きました（広告）。" in body
-        assert w._load_state()["open"] == []
+        assert body.count("\n・FAXが届きました（広告）。") == 2 and "①" not in body  # 番号は振らない
+        assert w._load_state()["open"] == [] and "numbering" not in w._load_state()
 
     def test_daytime_singles_continue_the_numbering(self, tmp_path):
         w = self.held_over_weekend(tmp_path)
@@ -1488,6 +1489,94 @@ class TestReopening:
         w.run_once()
         assert w.reopened_last_run == []
         assert len(w._chatwork.sent) == 1
+
+    def yesterdays_one_closed_then_a_morning_batch(self, tmp_path):
+        """実例（2026-11-09〜10）の形。前日: ①（9000）を通知して閉じる（お礼 9001）。
+        当日 8:30: 返事の要らない確認書と発注書をまとめて通知（9002）。"""
+        w = watcher(tmp_path, [], [ORDER, CONFIRMATION, ORDER], now=at(2026, 9, 7, 10, 0))  # 月
+        w._config.data["fax_watch"]["quiet_rules"] = QUIET_RULES
+        prime(w)
+        w._chatwork.messages += held("4950_001.pdf", "2026/09/07 14:26:00")
+        w.clock.now = at(2026, 9, 7, 14, 27)
+        assert w.run_once() == 1
+        w._chatwork.messages.append(human(9500, f"[rp aid={AGENT} to={FAX_ROOM}-9000]対応完了"))
+        w.clock.now = at(2026, 9, 7, 15, 9)
+        w.run_once()
+        assert w._load_state()["open"] == []
+        w._chatwork.messages += held("4960_001.pdf", "2026/09/07 20:23:36") + held("4970_001.pdf", "2026/09/07 21:11:18")
+        w.clock.now = at(2026, 9, 7, 21, 15)
+        assert w.run_once() == 0  # 時間外は控えるだけ
+        w.clock.now = at(2026, 9, 8, 8, 30)
+        assert w.run_once() == 2
+        return w
+
+    def test_only_faxes_that_need_a_reply_are_numbered_in_a_batch(self, tmp_path):
+        # 実例（2026-11-10 8:30）: 確認書に①、発注書に②を振った。「② 対応完了」への「これでありません」が
+        # ①まで閉じたように見えた。番号は対応完了の返事が要るFAXにだけ振る
+        w = self.yesterdays_one_closed_then_a_morning_batch(tmp_path)
+        body = bodies(w)[2]
+        assert f"\n・{G7}からFAXが届きました（発注書 情報確認表）。" in body
+        assert "\n① 光パックス石川から発注書が届きました。" in body and "②" not in body
+        assert "対応完了の返事が要るのは ① です。" in body
+        assert [(t["number"], t["filename"]) for t in w._load_state()["open"]] == [(1, "4970_001.pdf")]
+        assert w._load_state()["numbering"]["next"] == 2
+
+    def test_bringing_back_a_number_means_todays_fax_not_yesterdays(self, tmp_path):
+        # 実例（2026-11-10 10:28）: 「①は未対応です。対応待ちに戻してほしい。」で、前日に閉じた①
+        # （別のFAX）を戻し、その直後に「昨日お知らせした…まだ返信をいただいていません」と催促した
+        w = self.yesterdays_one_closed_then_a_morning_batch(tmp_path)
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9002]経理財務アシスタントさん\n① 対応完了", FUDABA))
+        w.clock.now = at(2026, 9, 8, 10, 27)
+        w.run_once()
+        assert w._load_state()["open"] == [] and "これでありません" in bodies(w)[3]
+        w._chatwork.messages.append(
+            human(9700, f"[rp aid={AGENT} to={FAX_ROOM}-9003][To:{AGENT}]経理財務アシスタントさん\n①は未対応です。対応待ちに戻してほしい。", FUDABA)
+        )
+        w.clock.now = at(2026, 9, 8, 10, 28)
+        w.run_once()
+        assert [t["filename"] for t in w.reopened_last_run] == ["4970_001.pdf"]  # 当日の①。前日の 4950 ではない
+        assert len(w._chatwork.sent) == 5 and "①を対応待ちに戻しました" in bodies(w)[4]  # 催促は重ねない
+        thread = w._load_state()["open"][0]
+        assert thread["stage"] == 0 and thread["reopened_at"].startswith("2026-09-08T10:28")
+        w.clock.now = at(2026, 9, 8, 12, 5)
+        w.run_once()
+        assert len(w._chatwork.sent) == 5  # 戻した日は聞かない
+        w.clock.now = at(2026, 9, 9, 9, 0)  # 翌営業日の朝から聞く
+        w.run_once()
+        assert len(w._chatwork.sent) == 6 and "まだ対応完了の返信をいただいていません" in bodies(w)[5]
+
+    def test_a_reopened_fax_that_was_already_chased_starts_over(self, tmp_path):
+        # 催促済み（stage 1）で閉じた控えを戻しても、「たびたび失礼します」をすぐには出さない
+        w = self.held_over_weekend_open(tmp_path)  # ①②（月 8:30）
+        w.clock.now = at(2026, 9, 8, 9, 0)
+        w.run_once()  # 翌朝の催促 9001（stage 1）
+        w._chatwork.messages.append(human(9600, f"[rp aid={AGENT} to={FAX_ROOM}-9001]全て対応完了"))
+        w.clock.now = at(2026, 9, 8, 13, 0)
+        w.run_once()
+        assert w._load_state()["open"] == []
+        w._chatwork.messages.append(human(9700, f"[To:{AGENT}] ①はまだ対応完了できていないです。戻してほしい。", FUDABA))
+        w.clock.now = at(2026, 9, 8, 13, 5)
+        w.run_once()
+        sent = len(w._chatwork.sent)
+        thread = w._load_state()["open"][0]
+        assert (thread["number"], thread["stage"]) == (1, 0) and "checked_at" not in thread
+        w.clock.now = at(2026, 9, 8, 13, 10)
+        w.run_once()
+        assert len(w._chatwork.sent) == sent
+
+    def test_a_number_of_the_current_run_is_not_taken_from_an_earlier_run(self, tmp_path):
+        # いまの並びで振った番号（①②）に当たる控えが履歴に無いとき、前の並びの同じ番号を戻さない。
+        # いまの並びでまだ振っていない番号（③）は、従来どおり履歴から戻す
+        w = self.three_closed_by_all(tmp_path)  # ①②③（9/7 8:30 通知）を閉じた
+        state = w._load_state()
+        state["numbering"] = {"date": "20260907", "next": 3, "since": "2026-09-07T09:00:00+09:00"}
+        w._save_state(state)
+        w._chatwork.messages.append(human(9600, f"[To:{AGENT}] ①は未対応です。対応待ちに戻してほしい。", FUDABA))
+        w.run_once()
+        assert w.reopened_last_run == [] and w._load_state()["open"] == []
+        w._chatwork.messages.append(human(9700, f"[To:{AGENT}] ③は未対応です。対応待ちに戻してほしい。", FUDABA))
+        w.run_once()
+        assert [t["filename"] for t in w.reopened_last_run] == ["4970_001.pdf"]
 
     def test_an_open_number_is_not_brought_back_from_an_older_fax_with_the_same_number(self, tmp_path):
         # 番号は①から振り直すので、履歴には別のFAXの古い①が残り得る。新しい①が対応待ちにあるなら

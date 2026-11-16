@@ -181,6 +181,9 @@ def circled(n: int) -> str:
     return f"({n})"
 
 
+UNNUMBERED_MARK = "・"  # まとめ通知で、対応完了の返事が要らないFAX（番号を振らない）の頭に付ける
+
+
 def number_label(n: int) -> str:
     """モデルに渡す番号の表記。丸数字には普通の数字を添え（㊹（44））、51以上は (51) のまま。"""
     mark = circled(n)
@@ -961,11 +964,19 @@ class FaxWatcher:
                 # 番号は①から振り直すので、履歴には別のFAXの古い同番号が残っていることがある。
                 # その番号がいま対応待ちにあれば、話題はそちら（古い方は戻さず、会話側が「残っています」と返す）
                 open_numbers = {int(t.get("number") or 0) for t in state.get("open") or []}
+                # いまの並びで振った番号なら、その並びの通知だけを戻す。実例 2026-11-10 10:28:
+                # 当日の「①は未対応、戻して」で、前日 15:09 に閉じた①（別のFAX）を戻した。
+                # いまの並びでまだ振っていない番号（振り直す前の (103) など）は、従来どおり履歴から戻す
+                numbering = state.get("numbering") or {}
+                since = _parse_iso(numbering.get("since"))
+                issued = int(numbering.get("next", 1)) - 1
                 picks = []
                 for n in numbers:
                     if n in open_numbers:
                         continue
                     hits = [e for e in fresh if int(e.get("number") or 0) == n]
+                    if since and n <= issued:
+                        hits = [e for e in hits if (_parse_iso(e.get("posted_at")) or since - timedelta(1)) >= since]
                     if hits:
                         picks.append(max(hits, key=lambda e: str(e.get("closed_at", ""))))
             elif mentions_all(body) or is_undo_request(body):
@@ -980,8 +991,15 @@ class FaxWatcher:
                 continue
             restored = []
             for entry in picks:
-                thread = {k: v for k, v in entry.items() if k not in ("closed_at", "closed_by", "closer_id", "via", "thanks_id")}
+                thread = {
+                    k: v for k, v in entry.items()
+                    if k not in ("closed_at", "closed_by", "closer_id", "via", "thanks_id", "checked_at", "rechecked_at")
+                }
                 thread["since_id"] = mid  # 戻す依頼より前の「対応完了」は当てない
+                # 催促は戻した時点から数え直す（翌営業日の朝から）。実例 2026-11-10 10:28:
+                # 戻した直後に「昨日お知らせした…まだ返信をいただいていません」と催促した
+                thread["stage"] = 0
+                thread["reopened_at"] = self._now().isoformat()
                 state.setdefault("open", []).append(thread)
                 open_files.add(str(thread.get("filename") or ""))
                 restored.append(thread)
@@ -1200,13 +1218,25 @@ class FaxWatcher:
         numbering = state.get("numbering") or {}
         if numbering.get("date") != today:
             carry = bool(state.get("open"))
-            numbering = {"date": today, "next": int(numbering.get("next", 1)) if carry else 1}
+            numbering = {
+                "date": today,
+                "next": int(numbering.get("next", 1)) if carry else 1,
+                "since": numbering.get("since") if carry else None,
+            }
         n = int(numbering.get("next", 1))
         restarted = bool(numbering.get("restarted"))
         threshold = self._restart_threshold()
         if threshold and n > threshold and not state.get("open"):
             n, restarted = 1, True
-        state["numbering"] = {"date": today, "next": n + 1, **({"restarted": True} if restarted else {})}
+        # since: いまの番号の並びが①から始まった時刻。番号は振り直すので、同じ番号でも
+        # これより前の通知は別のFAX（「①戻して」で前の並びの①を戻さないために見る）
+        since = now.isoformat() if n == 1 else numbering.get("since")
+        state["numbering"] = {
+            "date": today,
+            "next": n + 1,
+            **({"since": since} if since else {}),
+            **({"restarted": True} if restarted else {}),
+        }
         return n
 
     def _pop_restart_note(self, state: dict) -> str:
@@ -1235,14 +1265,19 @@ class FaxWatcher:
         from .answer import sanitize_for_chatwork
 
         max_chars = int((self._config.fax_watch.get("batch") or {}).get("max_chars", 6000))
-        numbered = [(p, self._take_number(state, now)) for p in prepared]
+        # 番号は、対応完了の返事が要るFAXにだけ振る（1件ずつの通知と同じ）。実例 2026-11-10 8:30:
+        # 返事の要らない確認書に①、発注書に②を振ったため、「② 対応完了」への「これでありません」が
+        # ①まで閉じたように見え、「①は未対応、戻して」で前日の①（別のFAX）を戻した
+        numbered = [
+            (p, self._take_number(state, now) if (p["is_order"] and p["ask_done"]) else 0) for p in prepared
+        ]
         restart_note = self._pop_restart_note(state)
         # 1通にまとめると1件ずつの通知（PDFの投稿への返信）が無いので、各件にPDFのリンクを添える
         blocks = [
             (
                 p,
                 n,
-                self._render(p, f"{circled(n)} ", trailer=False, ask_done=False)
+                self._render(p, f"{circled(n)} " if n else UNNUMBERED_MARK, trailer=False, ask_done=False)
                 + f"\nPDF: {message_url(room_id, p['item']['message_id'])}",
             )
             for p, n in numbered
@@ -1817,7 +1852,9 @@ class FaxWatcher:
                 )
                 continue
             if stage == 0:
-                due = at_clock(next_business_day(posted_at.date()), check_clock)
+                # 対応待ちへ戻した控えは、戻した日の翌営業日から聞く（戻した直後に催促しない）
+                base = max(posted_at, _parse_iso(thread.get("reopened_at")) or posted_at)
+                due = at_clock(next_business_day(base.date()), check_clock)
                 if now >= due:
                     due_first.append(thread)
             elif stage == 1:
@@ -2209,9 +2246,12 @@ class FaxStatus:
 - 「①以外は完了」のような除外の形はプログラム側が扱う。done_all・done_filenames は
   立てず、reply は「済んだ番号を挙げる形でお願いします」と一言添える
 - 「まだ対応できていない」「対応待ちに戻して」「さっきの完了は間違い」もプログラム側が
-  閉じた履歴から戻す。ここへ来たのは戻す先が無かったとき（その番号はまだ対応待ちに
-  残っている、など）なので、done は立てず「○は対応待ちに残っています」のように短く返す。
-  「このルームでは対応できない」とは言わない
+  閉じた履歴から戻す。ここへ来たのは戻す先が無かったときなので、done は立てない。
+  その番号が下の一覧にあれば「○は対応待ちに残っています」と短く返す。一覧に無ければ、
+  残っているとは言わず「○番に当たるFAXが、対応待ちにも戻せる履歴にも見当たりません。
+  PDFのファイル名で教えてください」と返す（番号は振り直すので、前の日の同じ番号とは
+  別のFAX。番号の付いていない通知＝確認書・棚卸表・広告などは、もともと対応完了の
+  確認の対象にしていない、と一言添えてよい）。「このルームでは対応できない」とは言わない
 
 いま対応待ちのFAX（番号（数字） / PDF名 / 差出人 / 種類）:
 {open_list}
