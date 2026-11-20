@@ -425,6 +425,10 @@ class PaymentNoticeRunner:
         # 5分ごとの巡回と、承認の返信を合図にした即時処理（webhook側）の両方から呼ばれる。
         # 同時に走ると二重に作り直し・交付するため、状態ファイルの隣のロックで直列にする
         with self._locked():
+            try:
+                posted += self._reading_tests()
+            except Exception:
+                print("[error] 証憑の読み取りテストに失敗: " + traceback.format_exc(), flush=True)
             for route in self.routes():
                 try:
                     posted += self._run_route(route)
@@ -452,6 +456,12 @@ class PaymentNoticeRunner:
                     if str(target_id) in set(notice.get("request_ids") or []) | set(notice.get("old_request_ids") or []):
                         return True
         return False
+
+    def owns_room(self, room_id: int) -> bool:
+        """委託先の専用ルームか（webhook 側が、メンションを合図にその場で受付を回すために使う）。"""
+        if not self._settings().get("enabled"):
+            return False
+        return any(int(c.get("room_id", 0) or 0) == int(room_id) for c in self.contracts())
 
     def _locked(self):
         """状態ファイルのロック（Linuxの flock。無い環境では何もしない）。"""
@@ -737,6 +747,111 @@ class PaymentNoticeRunner:
             f"{route.banner}{contract.get('payee', '')}様から届いた証憑を読み取れませんでした。内容のご確認をお願いします。",
             message_url(room_id, message.get("message_id")),
         ]))
+
+    # --- 読み取りテスト（本番の受付とは別） ---
+
+    def _reading_tests(self) -> int:
+        """委託先のルームで、テスト役（`test_submitter_account_ids`）が上げた証憑を読んで結果を返す。
+
+        実物の領収書で読み取りを確かめるためのもの（指示 2026-11-20: 宮﨑さんではなく足立さんが写真を上げて試す）。
+        **読むだけで、控えには残さない**（支払通知書には載らない）。本番（live）かどうかに関係なく動く。
+        テストが済んだら設定からテスト役を外す（外せば、その人の添付には関わらない）。
+        """
+        self._owned_room = 0
+        before = self._posts
+        path = self._root / "paynotice-test.json"
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            state = {}
+        changed = False
+        for contract in self.contracts():
+            testers = {int(a) for a in contract.get("test_submitter_account_ids") or [] if a}
+            room_id = int(contract.get("room_id", 0) or 0)
+            if not testers or not room_id:
+                continue
+            try:
+                messages = self._chatwork.get_recent_messages(room_id, limit=100)
+            except Exception:
+                print("[warn] 委託先のルームの取得に失敗: " + traceback.format_exc(), flush=True)
+                continue
+            cstate = state.setdefault(str(contract["id"]), {"last_seen": 0, "retries": {}})
+            for message in sorted(messages, key=lambda m: int(m.get("message_id", 0))):
+                mid = int(message.get("message_id", 0))
+                if mid <= int(cstate.get("last_seen") or 0):
+                    continue
+                if _account_of(message) in testers and attachments_of(str(message.get("body") or "")):
+                    try:
+                        self._test_read(contract, message)
+                    except ModelUnavailable:
+                        retries = cstate.setdefault("retries", {})
+                        retries[str(mid)] = int(retries.get(str(mid), 0)) + 1
+                        changed = True
+                        if retries[str(mid)] < int(self._settings().get("max_read_attempts", 3)):
+                            break  # 次の巡回でやり直す
+                        self._reply(room_id, message, "【読み取りテスト】ファイルを読み取れませんでした（読み取りの処理が失敗しました）。")
+                    except Exception as exc:
+                        print(f"[error] 読み取りテスト {mid} に失敗: " + traceback.format_exc(), flush=True)
+                        self._reply(room_id, message, f"【読み取りテスト】ファイルを読み取れませんでした（{exc}）。")
+                cstate.get("retries", {}).pop(str(mid), None)
+                cstate["last_seen"] = mid
+                changed = True
+        if changed:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            except OSError:
+                print("[warn] 読み取りテストの状態を保存できませんでした", flush=True)
+        return self._posts - before
+
+    def _test_read(self, contract: dict, message: dict) -> None:
+        room_id = int(contract["room_id"])
+        submitted = datetime.fromtimestamp(int(message.get("send_time", 0)), JST)
+        term_start = _parse_date((contract.get("term") or {}).get("start"))
+        lines = ["【読み取りテスト】次のように読み取りました。テストのため控えには残さず、支払通知書にも載せません。"]
+        count = 0
+        seen: list[dict] = []
+        for file_id, name in attachments_of(str(message.get("body") or "")):
+            suffix = Path(name).suffix.lower()
+            if suffix not in IMAGE_TYPES and suffix != ".pdf":
+                lines.append(f"■ {name}\n　画像（JPEG・PNG・GIF・WebP）とPDF以外は読み取れません。")
+                continue
+            info = self._chatwork.get_file_info(room_id, file_id)
+            status, data = self._download(str(info.get("download_url", "")))
+            if status != 200 or not data:
+                raise RuntimeError(f"{name} を取得できませんでした（HTTP {status}）")
+            found = self.read_receipt(data, name)
+            receipts = found.get("receipts") or []
+            lines.append(f"■ {name}" + (f"（{len(receipts)}件）" if len(receipts) > 1 else ""))
+            if not receipts:
+                note = str(found.get("note") or "").strip()
+                lines.append("　領収書として読み取れませんでした。" + (f"（{note}）" if note else ""))
+                continue
+            for raw in receipts:
+                receipt = {
+                    "date": str(raw.get("date") or "").strip(),
+                    "payee": str(raw.get("payee") or "").strip(),
+                    "amount": raw.get("amount") if isinstance(raw.get("amount"), int) else 0,
+                    "purpose": str(raw.get("purpose") or "").strip(),
+                    "status": OK,
+                }
+                issues = check_receipt(receipt, submitted.date(), term_start, seen)
+                seen.append(receipt)
+                count += 1
+                day = _parse_date(receipt["date"])
+                lines.append(
+                    f"　日付: {jp_date(day) if day else '読み取れず'}／支払先: {receipt['payee'] or '読み取れず'}／"
+                    f"金額: {yen(receipt['amount']) if receipt['amount'] else '読み取れず'}"
+                )
+                lines.append(f"　用途: {receipt['purpose'] or '読み取れず'}／種類: {raw.get('kind') or '-'}／"
+                             f"税率の記載: {raw.get('tax_note') or '-'}／登録番号: {raw.get('registration') or '記載なし'}")
+                lines.append(f"　支払通知書の内容欄: {receipt_label(receipt)}")
+                for issue in issues:
+                    lines.append(f"　【要確認】{issue}")
+        lines.append("読み違いがあれば、どの項目が違うかを教えてください。")
+        self._reply(room_id, message, "\n".join(lines))
+        self._audit({"type": "paynotice_test_read", "contract": contract["id"],
+                     "message_id": str(message.get("message_id")), "receipts": count})
 
     # --- 2. 作成 ---
 

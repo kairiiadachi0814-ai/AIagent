@@ -263,6 +263,8 @@
         "to_name": "宮﨑",
         "room_id": 453639844,
         "account_id": 8923331,
+        "_test_submitter_note": "読み取りテストの間だけ置く。ここに書いたアカウントがこのルームに上げた画像・PDFは、読んだ結果を返信するだけで、控えにも支払通知書にも載せない（本番の受付は account_id の本人が上げた分だけ）。テストが済んだら空にする",
+        "test_submitter_account_ids": [6945415],
         "spreadsheet_id": "1Bwx-IjQD-HzBwat-pHHn347dxs-W4c0RTZFvTVkY0mc",
         "template_sheet": "2026年10月(源泉なし)",
         "sheet_title": "{year}年{month}月(源泉なし)",

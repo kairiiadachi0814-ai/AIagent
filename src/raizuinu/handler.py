@@ -230,6 +230,13 @@ class RaizuinuHandler:
                     return WebhookResult(200, "処理済みメッセージ")
                 self._process_fax_status(event)
                 return WebhookResult(200, "FAXの対応状況を返答")
+            # 業務委託先の専用ルーム: 質問には答えない（許可ルームではない）。アシスタント宛の投稿を合図に、
+            # 証憑の受付をその場で回すだけ（5分の巡回を待たせない。返事は支払通知書の処理が出す）
+            if self._pay_notice is not None and self._pay_notice.owns_room(event.room_id):
+                if not self._mark_processed(event.message_id):
+                    return WebhookResult(200, "処理済みメッセージ")
+                self._run_pay_notice_soon()
+                return WebhookResult(200, "証憑の受付を実行")
             return WebhookResult(200, f"許可外ルーム: {event.room_id}")
 
         # 再送による二重応答の防止
@@ -297,6 +304,20 @@ class RaizuinuHandler:
                     "error": error_detail.splitlines()[-1] if error_detail else "",
                 }
             )
+
+    def _run_pay_notice_soon(self) -> None:
+        """支払通知書の処理を裏で回す（画像の読み取りに時間がかかるので、webhook の応答を待たせない）。"""
+
+        def run() -> None:
+            try:
+                self._pay_notice.run_once()
+            except Exception:
+                print("[warn] 支払通知書の即時処理に失敗: " + traceback.format_exc(), flush=True)
+
+        if self._config.webhook_async:
+            threading.Thread(target=run, daemon=True).start()
+        else:
+            run()
 
     def _process(self, event: MentionEvent) -> None:
         cfg = self._config

@@ -360,7 +360,7 @@ def test_a_picture_that_is_not_a_receipt_is_said_so(env):
 
 
 def test_files_from_other_members_are_not_taken_as_evidence(env):
-    env.cw.attach(PAYEE_ROOM, IWANAGA, ["業務委託契約書.pdf"])
+    env.cw.attach(PAYEE_ROOM, IWANAGA, ["業務委託契約書.pdf"])   # テスト役でも委託先でもない
     env.runner.run_once()
     assert env.cw.sent == [] and env.model.calls == []
 
@@ -392,6 +392,57 @@ def test_a_read_failure_is_retried_then_handed_to_people(env):
         env.runner.run_once()
     assert "読み取れませんでした。経理担当が確認します。" in env.cw.posts(PAYEE_ROOM)[1]
     assert "届いた証憑を読み取れませんでした" in env.cw.posts(APPROVAL_ROOM)[0]
+
+
+# --- 読み取りテスト（本番前に、実物の領収書で確かめる） ---
+
+
+def test_a_testers_receipt_is_read_and_reported_but_not_kept(env):
+    # 指示（2026-11-20）: 宮﨑さんではなく足立さんが、宮﨑さんのルームに領収書の写真を上げて読み取りを試す
+    env.config.data["payment_notice"]["live"] = False   # 本番前でも動く
+    env.model.receipts["real.jpg"] = {"receipts": [{**receipt(payee="近畿日本鉄道株式会社", purpose="交通費（近鉄奈良〜大阪難波）", amount=680),
+                                                    "registration": "T1120001052417"}], "note": ""}
+    mid = env.cw.attach(PAYEE_ROOM, ADACHI, ["real.jpg"])
+    assert env.runner.run_once() == 1
+    reply = env.cw.posts(PAYEE_ROOM)[0]
+    assert reply.startswith(f"[rp aid={ADACHI} to={PAYEE_ROOM}-{mid}]\n【読み取りテスト】次のように読み取りました。"
+                            "テストのため控えには残さず、支払通知書にも載せません。")
+    assert "■ real.jpg" in reply
+    assert "日付: 11月12日（木）／支払先: 近畿日本鉄道株式会社／金額: 680円" in reply
+    assert "用途: 交通費（近鉄奈良〜大阪難波）／種類: 領収書／税率の記載: 10%／登録番号: T1120001052417" in reply
+    assert "支払通知書の内容欄: 立替：交通費（近鉄奈良〜大阪難波） 近畿日本鉄道" in reply
+    assert not (env.tmp / "state" / "paynotice.json").exists()   # 本番の控えには何も残らない
+    env.runner.run_once()
+    assert len(env.cw.posts(PAYEE_ROOM)) == 1                   # 同じ投稿を二度読まない
+
+
+def test_a_test_reading_shows_what_could_not_be_read(env):
+    env.model.receipts["two.jpg"] = {"receipts": [receipt(amount=0), receipt(day="2026-09-01", amount=500)], "note": ""}
+    env.cw.attach(PAYEE_ROOM, ADACHI, ["two.jpg", "blur.jpg", "memo.docx"])
+    env.runner.run_once()
+    reply = env.cw.posts(PAYEE_ROOM)[0]
+    assert "■ two.jpg（2件）" in reply and "金額: 読み取れず" in reply
+    assert "【要確認】金額を読み取れませんでした" in reply and "【要確認】日付（2026-09-01）が契約の開始日より前です" in reply
+    assert "■ blur.jpg\n　領収書として読み取れませんでした。（証憑ではありません）" in reply
+    assert "■ memo.docx\n　画像（JPEG・PNG・GIF・WebP）とPDF以外は読み取れません。" in reply
+    assert state_of(env)["receipts"] == [] if (env.tmp / "state" / "paynotice.json").exists() else True
+
+
+def test_a_testers_receipt_never_reaches_the_notice(env):
+    env.cw.attach(PAYEE_ROOM, ADACHI, ["IMG_0001.jpg"])
+    env.model.receipts["IMG_0001.jpg"] = {"receipts": [receipt()], "note": ""}
+    env.runner.run_once()
+    env.clock.now = at(12, 1, 9, 0)
+    env.runner.run_once()
+    notice = state_of(env)["notices"]["2026-11"]
+    assert notice["total"] == 100000 and len(notice["lines"]) == 1   # 定例の業務委託費だけ
+
+
+def test_without_a_tester_the_admins_files_are_left_alone(env):
+    env.config.data["payment_notice"]["contracts"][0]["test_submitter_account_ids"] = []
+    env.cw.attach(PAYEE_ROOM, ADACHI, ["IMG_0001.jpg"])
+    env.runner.run_once()
+    assert env.cw.sent == [] and env.model.calls == []
 
 
 # --- 2. 作成 ---

@@ -108,6 +108,9 @@ class TestPaymentNoticeReplies:
         def owns_reply(self, room_id, target_id):
             return room_id == 12345 and target_id in self.owned
 
+        def owns_room(self, room_id):
+            return room_id == 453639844
+
         def run_once(self):
             self.runs += 1
             return 1
@@ -133,6 +136,18 @@ class TestPaymentNoticeReplies:
         body = payload(body="[To:999]経理財務アシスタントさん\n銀行明細の取得方法は？", message_id="200002")
         handler.handle_webhook(body, sign(body))
         assert len(chatwork.sent) == 2 and handler._pay_notice.runs == 0
+
+    def test_a_mention_in_the_payee_room_starts_the_intake_and_answers_nothing(self, tmp_path, monkeypatch):
+        # 委託先のルームは許可ルームではない。質問には答えず、証憑の受付を回すだけ
+        handler, chatwork, generator, audit = self.make(tmp_path, monkeypatch)
+        body = payload(room_id=453639844, body="[To:999]経理財務アシスタントさん\n領収書です[download:9]a.jpg[/download]")
+        result = handler.handle_webhook(body, sign(body))
+        assert result.status == 200 and "証憑の受付" in result.detail
+        assert handler._pay_notice.runs == 1 and chatwork.sent == [] and generator.calls == []
+        handler.handle_webhook(body, sign(body))   # 再送では二度回さない
+        assert handler._pay_notice.runs == 1
+        other = payload(room_id=99999, message_id="200009")
+        assert "許可外ルーム" in handler.handle_webhook(other, sign(other)).detail
 
     def test_a_failure_in_the_notice_flow_does_not_fall_back_to_an_answer(self, tmp_path, monkeypatch):
         handler, chatwork, generator, audit = self.make(tmp_path, monkeypatch)
