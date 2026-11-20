@@ -815,7 +815,9 @@ class PaymentNoticeRunner:
             file_id = self._chatwork.upload_file(route.approval_room, notice["filename"], pdf,
                                                  message=f"{route.banner}支払通知書（確認用・第{notice['version']}版）です。")
             self._posts += 1
-            ids += self._find_upload(route.approval_room, file_id)
+            # 添付の投稿IDは、APIがファイルIDしか返さないので後から拾う（`_link_uploads`。
+            # 投稿の直後は一覧にまだ出ないことがある。2026-11-20 のリハーサルで拾えなかった）
+            notice["request_file_ids"] = [str(file_id)]
         except Exception:
             print("[warn] 支払通知書の添付に失敗: " + traceback.format_exc(), flush=True)
             self._send(route.approval_room, "PDFを添付できませんでした。スプレッドシートの"
@@ -896,6 +898,7 @@ class PaymentNoticeRunner:
             print("[warn] 承認ルームの取得に失敗: " + traceback.format_exc(), flush=True)
             return
         newest = max((int(m.get("message_id", 0)) for m in messages), default=0)
+        self._link_uploads(waiting(), messages)
         last_seen = state.get("approval_last_seen")
         if not waiting():
             state["approval_last_seen"] = max(newest, int(last_seen or 0))
@@ -1265,14 +1268,16 @@ class PaymentNoticeRunner:
     def _alert(self, route: Route, text: str) -> None:
         self._send(route.approval_room, self._heads(route) + "\n" + route.banner + text)
 
-    def _find_upload(self, room_id: int, file_id: Any) -> list[str]:
-        """添付した投稿のID（その投稿への返信も、承認として読めるように）。"""
-        try:
-            messages = self._chatwork.get_recent_messages(room_id, limit=20)
-        except Exception:
-            return []
-        marker = f"[download:{file_id}]"
-        return [str(m.get("message_id")) for m in messages if marker in str(m.get("body") or "")]
+    @staticmethod
+    def _link_uploads(waiting: list[tuple[dict, dict, dict]], messages: list[dict]) -> None:
+        """PDFを添付した投稿を承認依頼に結び付ける（その投稿への返信も、承認として読めるように）。"""
+        for _, _, notice in waiting:
+            for file_id in notice.get("request_file_ids") or []:
+                marker = f"[download:{file_id}]"
+                for message in messages:
+                    mid = str(message.get("message_id"))
+                    if marker in str(message.get("body") or "") and mid not in notice.setdefault("request_ids", []):
+                        notice["request_ids"].append(mid)
 
     def _audit(self, record: dict) -> None:
         try:

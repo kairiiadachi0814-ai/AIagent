@@ -526,11 +526,13 @@ def test_nothing_is_delivered_without_an_approval(env):
 
 
 def test_a_reply_to_the_attached_pdf_counts_too(env):
+    # 添付の投稿IDは作った時点では分からない（APIはファイルIDしか返さない）。次に一覧を見たときに結び付ける
     december(env)
-    pdf_post = state_of(env)["notices"]["2026-11"]["request_ids"][1]
+    pdf_post = next(m["message_id"] for m in env.cw.rooms[APPROVAL_ROOM] if "[download:" in m["body"])
     env.cw.reply(APPROVAL_ROOM, IWANAGA, pdf_post, "承認")
     env.runner.run_once()
-    assert state_of(env)["notices"]["2026-11"]["status"] == ISSUED
+    notice = state_of(env)["notices"]["2026-11"]
+    assert notice["status"] == ISSUED and pdf_post in notice["request_ids"]
 
 
 def test_a_correction_rebuilds_the_notice_and_asks_again(env):
