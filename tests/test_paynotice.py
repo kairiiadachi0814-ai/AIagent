@@ -548,11 +548,67 @@ def test_a_correction_rebuilds_the_notice_and_asks_again(env):
     assert env.sheets.deleted == ["2026年11月(源泉なし)"] and env.sheets.tabs["2026年11月(源泉なし)"]["cells"]["N20"] == 50000
     posts = env.cw.posts(APPROVAL_ROOM)
     assert "支払通知書（第2版）" in posts[-2] and "① 11/30 ヤマトライジング業務委託費 50,000円" in posts[-2]
-    assert "載せていない証憑:" in posts[-2] and "（外す指示あり）" in posts[-2]
+    assert "載せていない証憑（番号はそのままです）:" in posts[-2] and "（外す指示あり）" in posts[-2]
     assert "直しました（業務委託費を50,000円に、②を外す）。第2版を投稿しています。" in posts[-1]
     assert len(env.cw.uploads) == 2 and all(u[0] == APPROVAL_ROOM for u in env.cw.uploads)
     # 行の一覧をモデルへ渡している
     assert "2（②）: 証憑「立替：交通費（近畿日本鉄道）」" in env.model.calls[-1][1]
+
+
+def two_receipts(env):
+    """近鉄（11/12）と駐車料金（11/15）の2件で、12/1 の朝に第1版を作らせる。→ 承認依頼の投稿ID"""
+    submit(env)
+    submit(env, names=("IMG_0002.jpg",), day="2026-11-15", payee="タイムズ24", amount=1200, purpose="駐車料金")
+    env.runner.run_once()
+    env.clock.now = at(12, 1, 9, 0)
+    env.runner.run_once()
+    return state_of(env)["notices"]["2026-11"]["request_ids"][0]
+
+
+def test_numbers_stay_with_their_lines_across_versions(env):
+    # 実例（2026-11-20 のリハーサル）: 第1版「①業務委託費 ②近鉄 ③駐車料金」から②を外すと、第2版で
+    # 駐車料金が②、外した近鉄が③に振り直された。番号は一度振ったら変えない
+    request = two_receipts(env)
+    first = env.cw.posts(APPROVAL_ROOM)[0]
+    assert "② 11/12 立替：交通費（近畿日本鉄道） 1,240円" in first and "③ 11/15 立替：駐車料金（タイムズ24） 1,200円" in first
+    env.cw.reply(APPROVAL_ROOM, ADACHI, request, "②を外して")
+    env.model.replies.append({"intent": "revise", "question": "", "ops": [op("exclude_receipt", number=2)]})
+    env.clock.now = at(12, 1, 10, 0)
+    env.runner.run_once()
+    second = env.cw.posts(APPROVAL_ROOM)[-2]
+    assert "支払通知書（第2版）" in second
+    assert "① 11/30 ヤマトライジング業務委託費 100,000円" in second
+    assert "③ 11/15 立替：駐車料金（タイムズ24） 1,200円" in second          # ③のまま
+    assert "載せていない証憑（番号はそのままです）:\n② IMG_0001.jpg 11/12 近畿日本鉄道 1,240円（外す指示あり）" in second
+    assert "② 11/15" not in second and "③ IMG_0001" not in second
+    # 次の指示も、最初に見た番号のまま通じる
+    env.cw.reply(APPROVAL_ROOM, ADACHI, last_bot_reply(env), "③の金額を1,300円に。②はやはり載せて")
+    env.model.replies.append({"intent": "revise", "question": "", "ops": [
+        op("set_receipt_amount", number=3, amount=1300), op("include_receipt", number=2)]})
+    env.runner.run_once()
+    third = env.cw.posts(APPROVAL_ROOM)[-2]
+    assert "② 11/12 立替：交通費（近畿日本鉄道） 1,240円" in third and "③ 11/15 立替：駐車料金（タイムズ24） 1,300円" in third
+    assert state_of(env)["notices"]["2026-11"]["total"] == 102540
+    # モデルへ渡す一覧も同じ番号
+    assert "2（②）: 証憑「立替：交通費（近畿日本鉄道）」" in env.model.calls[-1][1]
+    assert "3（③）: 証憑「立替：駐車料金（タイムズ24）」" in env.model.calls[-1][1]
+
+
+def test_an_added_line_gets_the_next_number_and_keeps_it(env):
+    request = two_receipts(env)
+    env.cw.reply(APPROVAL_ROOM, ADACHI, request, "10月分の交通費精算3,000円を足して、②は外して")
+    env.model.replies.append({"intent": "revise", "question": "", "ops": [
+        op("add_line", amount=3000, day="2026-11-30", label="交通費精算（10月分）", exempt=True),
+        op("exclude_receipt", number=2)]})
+    env.clock.now = at(12, 1, 10, 0)
+    env.runner.run_once()
+    second = env.cw.posts(APPROVAL_ROOM)[-2]
+    assert "④ 11/30 交通費精算（10月分） 3,000円 ※課税対象外" in second and "③ 11/15 立替：駐車料金" in second
+    env.cw.reply(APPROVAL_ROOM, ADACHI, last_bot_reply(env), "④を消して")
+    env.model.replies.append({"intent": "revise", "question": "", "ops": [op("remove_line", number=4)]})
+    env.runner.run_once()
+    notice = state_of(env)["notices"]["2026-11"]
+    assert notice["version"] == 3 and notice["total"] == 101200 and "④" not in env.cw.posts(APPROVAL_ROOM)[-2]
 
 
 def last_bot_reply(env, room=APPROVAL_ROOM):
@@ -674,7 +730,7 @@ def test_an_unreadable_receipt_is_listed_once_a_person_gives_the_amount(env):
     env.runner.run_once()
     notice = state_of(env)["notices"]["2026-11"]
     request = env.cw.posts(APPROVAL_ROOM)[0]
-    assert notice["total"] == 100000 and "載せていない証憑:" in request
+    assert notice["total"] == 100000 and "載せていない証憑（番号はそのままです）:" in request
     assert "② IMG_0001.jpg 近畿日本鉄道（金額を読み取れませんでした、日付を読み取れませんでした）" in request
     env.cw.reply(APPROVAL_ROOM, IWANAGA, notice["request_ids"][0], "②は11/12の交通費で1,240円です")
     env.model.replies.append({"intent": "revise", "question": "", "ops": [

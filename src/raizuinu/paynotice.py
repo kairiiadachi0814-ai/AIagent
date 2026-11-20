@@ -205,6 +205,15 @@ def build_lines(contract: dict, period: str, receipts: list[dict], overrides: di
     return lines
 
 
+def line_key(line: dict) -> str:
+    """行を見分ける鍵（番号を版をまたいで保つため）。定例の行／証憑／手で足した行。"""
+    if line.get("kind") == "fee":
+        return "fee"
+    if line.get("receipt_id"):
+        return f"r:{line['receipt_id']}"
+    return f"a:{line.get('uid') or line.get('label')}"
+
+
 def total_of(lines: list[dict]) -> int:
     return sum(int(line["quantity"]) * int(line["price"]) for line in lines)
 
@@ -783,6 +792,8 @@ class PaymentNoticeRunner:
             "request_ids": [],
             "old_request_ids": list((previous or {}).get("old_request_ids") or []) + list((previous or {}).get("request_ids") or []),
             "reminded": dict((previous or {}).get("reminded") or {}),
+            # 行の番号は一度振ったら変えない（外した行も、その番号のまま「載せていない証憑」に残す）
+            "numbers": self._numbers_of(previous),
         }
         # 作れなかったときは控えを前の版のままにする（中途半端な版を承認待ちにしない）
         pdf = self._render(route, contract, cstate, notice)
@@ -891,34 +902,48 @@ class PaymentNoticeRunner:
             f"合計: {yen(notice['total'])}",
         ]
         room_id = int(contract.get("room_id", 0) or 0)
-        display = []
+        # 番号は一度振ったら、その行が外されても版が替わっても変えない。
+        # 実例（2026-11-20 のリハーサル）: 第1版の「②近鉄・③駐車料金」から②を外すと、第2版で駐車料金が②、
+        # 外した近鉄が③に振り直され、どの行の話か追いにくくなった
+        numbers = notice.setdefault("numbers", {})
+
+        def number_of(key: str) -> int:
+            if key not in numbers:
+                numbers[key] = max(numbers.values(), default=0) + 1
+            return int(numbers[key])
+
+        display, shown, kept_out = [], [], []
         for line in notice["lines"]:
-            display.append({"kind": line["kind"], "receipt_id": line.get("receipt_id"), "label": line["label"]})
-            number = circled(len(display))
+            number = number_of(line_key(line))
+            display.append({"number": number, "kind": line["kind"], "receipt_id": line.get("receipt_id"),
+                            "uid": line.get("uid"), "label": line["label"]})
             amount = yen(int(line["quantity"]) * int(line["price"]))
             mark = " ※課税対象外" if line.get("exempt") else ""
-            text = f"{number} {_short(line['date'])} {line['label']} {amount}{mark}"
+            text = f"{circled(number)} {_short(line['date'])} {line['label']} {amount}{mark}"
             receipt = self._receipt(cstate, line.get("receipt_id"))
             if receipt:
                 text += self._receipt_link(room_id, receipt)
                 for issue in receipt.get("issues") or []:
                     text += f"\n　【要確認】{issue}"
-            lines.append(text)
+            shown.append((number, text))
         listed = {line.get("receipt_id") for line in notice["lines"]}
-        held = [r for r in cstate["receipts"] if r.get("period") == period and r["id"] not in listed]
-        if held:
-            lines.append("載せていない証憑:")
-            for receipt in held:
-                display.append({"kind": "receipt", "receipt_id": receipt["id"], "label": receipt.get("filename", "")})
-                why = "外す指示あり" if receipt["status"] == EXCLUDED else "、".join(receipt.get("issues") or [])
-                detail = " ".join(x for x in (
-                    receipt.get("filename", ""),
-                    _short(receipt.get("date")) if _parse_date(receipt.get("date")) else "",
-                    receipt.get("payee"),
-                    yen(receipt["amount"]) if receipt.get("amount") else "",
-                ) if x)
-                lines.append(f"{circled(len(display))} {detail}（{why}）" + self._receipt_link(room_id, receipt))
-        notice["display"] = display
+        for receipt in [r for r in cstate["receipts"] if r.get("period") == period and r["id"] not in listed]:
+            number = number_of(f"r:{receipt['id']}")
+            display.append({"number": number, "kind": "receipt", "receipt_id": receipt["id"], "uid": None,
+                            "label": receipt.get("label") or receipt_label(receipt)})
+            why = "外す指示あり" if receipt["status"] == EXCLUDED else "、".join(receipt.get("issues") or [])
+            detail = " ".join(x for x in (
+                receipt.get("filename", ""),
+                _short(receipt.get("date")) if _parse_date(receipt.get("date")) else "",
+                receipt.get("payee"),
+                yen(receipt["amount"]) if receipt.get("amount") else "",
+            ) if x)
+            kept_out.append((number, f"{circled(number)} {detail}（{why}）" + self._receipt_link(room_id, receipt)))
+        lines += [text for _, text in sorted(shown)]
+        if kept_out:
+            lines.append("載せていない証憑（番号はそのままです）:")
+            lines += [text for _, text in sorted(kept_out)]
+        notice["display"] = sorted(display, key=lambda entry: entry["number"])
         term_end = _parse_date((contract.get("term") or {}).get("end"))
         start, closing = period_bounds(period)
         if term_end and start <= term_end < closing:
@@ -930,6 +955,18 @@ class PaymentNoticeRunner:
         lines.append("直すときは、この投稿への返信で「②を外して」「業務委託費を50,000円に」のようにお知らせください。"
                      "作り直して、もう一度お見せします。")
         return lines
+
+    @staticmethod
+    def _numbers_of(previous: dict | None) -> dict:
+        """前の版で振った番号（行の鍵 → 番号）。番号の控えが無い古い版は、見せた並びから起こす。"""
+        if not previous:
+            return {}
+        if previous.get("numbers"):
+            return dict(previous["numbers"])
+        numbers = {}
+        for index, entry in enumerate(previous.get("display") or [], 1):
+            numbers[line_key(entry)] = int(entry.get("number") or index)
+        return numbers
 
     @staticmethod
     def _receipt(cstate: dict, receipt_id: Any) -> dict | None:
@@ -1045,9 +1082,10 @@ class PaymentNoticeRunner:
         done = []
 
         def target(number: int, kind: str) -> dict:
-            if not 1 <= number <= len(display) or display[number - 1]["kind"] != kind:
+            entry = next((e for i, e in enumerate(display, 1) if int(e.get("number") or i) == number), None)
+            if entry is None or entry["kind"] != kind:
                 raise NoticeError(f"{circled(number) if number else '番号'}に当たる行が見当たりません")
-            return display[number - 1]
+            return entry
 
         def amount_of(op: dict) -> int:
             amount = op.get("amount")
@@ -1078,13 +1116,16 @@ class PaymentNoticeRunner:
                 label = str(op.get("label") or "").strip()
                 if not label:
                     raise NoticeError("足す行の内容を読み取れませんでした")
+                overrides["added_seq"] = int(overrides.get("added_seq", 0)) + 1
                 overrides.setdefault("added", []).append(
-                    {"date": date_of(op), "label": label, "price": amount_of(op), "exempt": bool(op.get("exempt"))})
+                    {"uid": f"a{overrides['added_seq']}", "date": date_of(op), "label": label,
+                     "price": amount_of(op), "exempt": bool(op.get("exempt"))})
                 done.append(f"「{label}」{yen(op['amount'])}の行を追加")
             elif name == "remove_line":
                 entry = target(number, "added")
                 added = overrides.get("added") or []
-                match = next((a for a in added if a["label"] == entry["label"]), None)
+                match = next((a for a in added if (a.get("uid") and a.get("uid") == entry.get("uid"))
+                              or (not entry.get("uid") and a["label"] == entry["label"])), None)
                 if match is None:
                     raise NoticeError(f"{circled(number)}は手で足した行ではありません")
                 added.remove(match)
@@ -1264,8 +1305,9 @@ class PaymentNoticeRunner:
     def _read_reply(self, text: str, notice: dict) -> dict:
         rows = []
         for index, entry in enumerate(notice.get("display") or [], 1):
+            number = int(entry.get("number") or index)
             kind = {"fee": "定例の業務委託費", "receipt": "証憑", "added": "手で足した行"}[entry["kind"]]
-            rows.append(f"{index}（{circled(index)}）: {kind}「{entry['label']}」")
+            rows.append(f"{number}（{circled(number)}）: {kind}「{entry['label']}」")
         ask = "[支払通知書の行]\n" + "\n".join(rows) + f"\n\n[承認者の返信]\n{text}"
         return self._ask_model(REVISE_SYSTEM, REVISE_SCHEMA, ask)
 
