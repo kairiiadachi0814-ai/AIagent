@@ -250,6 +250,16 @@
       { "account_id": 8681926, "name": "坂田" },
       { "account_id": 11481620, "name": "岩永" }
     ],
+    "payment_request": {
+      "_note": "交付と同時に出す振込の依頼（指示 2026-11-20）。承認を得て委託先へ支払通知書を交付したら、このルームで recipients あてに振込の手配を頼み、支払通知書のPDFと、承認された証憑（領収書の画像）を添付する。振込そのものはしない。振込先は投稿の文には書かず、PDFの備考欄を見てもらう。このルームは allowed_room_ids に入れない",
+      "room_id": 64547366,
+      "room_name": "支払依頼・入金確認チャット",
+      "recipients": [
+        { "account_id": 8681926, "name": "坂田" },
+        { "account_id": 9129422, "name": "伊藤" },
+        { "account_id": 11481620, "name": "岩永" }
+      ]
+    },
     "create_time": "09:00",
     "remind_time": "09:00",
     "issue_within_business_days": 5,

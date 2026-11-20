@@ -43,6 +43,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .chatwork import MAX_UPLOAD_BYTES
 from .faxwatch import JST, WEEKDAYS, _account_of, _parse_iso, at_clock, circled, message_url, parse_clock, \
     reply_targets, strip_own_mention, strip_tags
 
@@ -390,6 +391,8 @@ class Route:
     delivery: dict | None = None  # リハーサルでは全契約の交付先をここへ差し替える
     intake: bool = True
     extra_alert_room: int = 0
+    payment_room: int = 0                    # 交付と同時に、振込の依頼を出すルーム（0 なら出さない）
+    payment_recipients: list | None = None   # 振込の依頼の宛先（account_id・name）
 
     def approver_ids(self) -> list[int]:
         return [int(a["account_id"]) for a in self.approvers if a.get("account_id")]
@@ -531,6 +534,8 @@ class PaymentNoticeRunner:
     def route(self, name: str) -> Route:
         settings = self._settings()
         admin_room = int(self._config.admin_room_id or 0)
+        payment = settings.get("payment_request") or {}
+        payment_room = int(payment.get("room_id", 0) or 0)
         if name == LIVE:
             return Route(
                 name=LIVE,
@@ -538,6 +543,8 @@ class PaymentNoticeRunner:
                 approvers=list(settings.get("approvers") or []),
                 state_file="paynotice.json",
                 extra_alert_room=admin_room,
+                payment_room=payment_room,
+                payment_recipients=list(payment.get("recipients") or []),
             )
         admins = [int(a) for a in (self._config.admin_account_ids or [])]
         return Route(
@@ -549,6 +556,9 @@ class PaymentNoticeRunner:
             banner="【リハーサル】",
             delivery={"room_id": admin_room, "account_id": admins[0] if admins else 0, "name": ""},
             intake=False,
+            # リハーサルでは、振込の依頼も管理者ルームへ出す（本番のルームには出さない）
+            payment_room=admin_room if payment_room else 0,
+            payment_recipients=[{"account_id": a, "name": ""} for a in admins],
         )
 
     def contracts(self) -> list[dict]:
@@ -577,10 +587,12 @@ class PaymentNoticeRunner:
         submitted = datetime(closing.year, closing.month, closing.day, 12, 0, tzinfo=JST)
         cstate["receipts"] = [r for r in cstate["receipts"] if r.get("period") != period]
         cstate["notices"].pop(period, None)
+        store = self._evidence_dir(route, contract)
         for index, path in enumerate(receipt_files, 1):
-            found = self.read_receipt(path.read_bytes(), path.name)
+            content = path.read_bytes()
+            found = self.read_receipt(content, path.name)
             self._add_receipts(contract, cstate, found, file_id=f"file{index}", message_id="", filename=path.name,
-                               submitted=submitted, period=period)
+                               submitted=submitted, period=period, data=content, store=store)
         if from_room:
             room_id = int(contract["room_id"])
             people = {int(a) for a in [contract.get("account_id"), *(contract.get("submitter_account_ids") or []),
@@ -600,7 +612,7 @@ class PaymentNoticeRunner:
                     found = self.read_receipt(data, name)
                     self._add_receipts(contract, cstate, found, file_id=str(file_id),
                                        message_id=str(message.get("message_id")), filename=name,
-                                       submitted=sent, period=period)
+                                       submitted=sent, period=period, data=data, store=store)
         self._owned, self._owned_room = state.setdefault("owned", []), route.approval_room
         notice = self._create(route, contract, cstate, period, self._now())
         self._save(route, state)
@@ -724,7 +736,8 @@ class PaymentNoticeRunner:
                 continue
             accepted += self._add_receipts(contract, cstate, found, file_id=str(file_id),
                                            message_id=str(message.get("message_id")), filename=name,
-                                           submitted=submitted, period=period)
+                                           submitted=submitted, period=period, data=data,
+                                           store=self._evidence_dir(route, contract))
         self._acknowledge(route, contract, message, period, accepted, problems, submitted.date())
         self._audit({"type": "paynotice_receipt", "route": route.name, "contract": contract["id"],
                      "message_id": str(message.get("message_id")), "period": period,
@@ -732,9 +745,20 @@ class PaymentNoticeRunner:
                      "review": len([r for r in accepted if r["status"] == REVIEW])})
 
     def _add_receipts(self, contract: dict, cstate: dict, found: dict, file_id: str, message_id: str,
-                      filename: str, submitted: datetime, period: str) -> list[dict]:
+                      filename: str, submitted: datetime, period: str, data: bytes | None = None,
+                      store: Path | None = None) -> list[dict]:
         term_start = _parse_date((contract.get("term") or {}).get("start"))
         added = []
+        # 読んだファイルそのものを控える（承認後、振込の依頼に「承認済みの証憑」として添えるため）
+        stored = ""
+        if data and store is not None and found.get("receipts"):
+            try:
+                store.mkdir(parents=True, exist_ok=True)
+                path = store / f"{file_id}{Path(filename).suffix.lower()}"
+                path.write_bytes(data)
+                stored = str(path)
+            except OSError:
+                print("[warn] 証憑のファイルを控えられませんでした: " + traceback.format_exc(), flush=True)
         for index, raw in enumerate(found.get("receipts") or [], 1):
             receipt = {
                 "id": f"{file_id}-{index}",
@@ -749,6 +773,7 @@ class PaymentNoticeRunner:
                 "purpose": str(raw.get("purpose") or "").strip(),
                 "kind": str(raw.get("kind") or ""),
                 "tax_note": str(raw.get("tax_note") or ""),
+                "stored": stored,
             }
             # 登録番号は、形（T＋13桁）が合うものだけ控える（合わない番号は読み違いの疑い）
             number, valid = clean_registration(raw.get("registration"))
@@ -1050,6 +1075,9 @@ class PaymentNoticeRunner:
         year, month = (int(part) for part in period.split("-"))
         pattern = str(contract.get("file_name") or "{issue_month}.{issue_day}-支払通知書{year}年{month}月分.pdf")
         return pattern.format(year=year, month=month, issue_month=issue_date.month, issue_day=issue_date.day)
+
+    def _evidence_dir(self, route: Route, contract: dict) -> Path:
+        return self._root / "paynotice" / route.name / str(contract["id"]) / "evidence"
 
     def _pdf_path(self, route: Route, contract: dict, period: str, version: int) -> Path:
         return self._root / "paynotice" / route.name / str(contract["id"]) / f"{period}-v{version}.pdf"
@@ -1361,12 +1389,16 @@ class PaymentNoticeRunner:
         notice["approval_message_id"] = str(message.get("message_id"))
         self._audit({"type": "paynotice_approved", "route": route.name, "contract": contract["id"],
                      "period": notice["period"], "version": notice["version"], "by": notice["approved_by"]})
-        self._deliver(route, contract, notice, now, reply_to=message)
+        self._deliver(route, contract, cstate, notice, now, reply_to=message)
 
     # --- 4. 交付 ---
 
-    def _deliver(self, route: Route, contract: dict, notice: dict, now: datetime, reply_to: dict | None = None) -> bool:
-        """承認された版のPDFを、そのまま交付する。承認が無ければ何もしない。"""
+    def _deliver(self, route: Route, contract: dict, cstate: dict, notice: dict, now: datetime,
+                 reply_to: dict | None = None) -> bool:
+        """承認された版のPDFを、そのまま交付する。承認が無ければ何もしない。
+
+        交付できたら、同時に振込の依頼を出す（`payment_request`。指示 2026-11-20）。
+        """
         if not notice.get("approved_by") or notice.get("status") == ISSUED:
             return False
         target = route.delivery or {"room_id": contract.get("room_id"), "account_id": contract.get("account_id"),
@@ -1392,8 +1424,16 @@ class PaymentNoticeRunner:
         notice.pop("delivery_failed_at", None)
         payment = date.fromisoformat(notice["payment_date"])
         text = (f"{route.banner}{contract.get('payee', '')}様のルームへ、{period_label(notice['period'])}分の支払通知書"
-                f"（第{notice['version']}版・合計{yen(notice['total'])}）を交付しました。\n"
-                f"支払予定日は{jp_date(payment)}です。振込の手配をお願いします。")
+                f"（第{notice['version']}版・合計{yen(notice['total'])}）を交付しました。\n")
+        if route.payment_room:
+            notice["payment_request"] = {"status": "pending", "sent": []}
+            name = self._payment_room_name(route)
+            if self._request_payment(route, contract, cstate, notice, now):
+                text += f"あわせて{name}へ、振込の依頼を出しました（支払予定日は{jp_date(payment)}）。"
+            else:
+                text += f"{name}への振込の依頼は、投稿に失敗しました。次の巡回でもう一度試します。"
+        else:
+            text += f"支払予定日は{jp_date(payment)}です。振込の手配をお願いします。"
         if reply_to is not None:
             self._reply(route.approval_room, reply_to, "承認ありがとうございます。" + text)
         else:
@@ -1421,9 +1461,139 @@ class PaymentNoticeRunner:
 
     def _retry_delivery(self, route: Route, state: dict, now: datetime) -> None:
         for contract in self.contracts():
-            for notice in self._cstate(state, contract)["notices"].values():
+            cstate = self._cstate(state, contract)
+            for notice in cstate["notices"].values():
                 if notice.get("status") == AWAITING and notice.get("approved_by"):
-                    self._deliver(route, contract, notice, now)
+                    self._deliver(route, contract, cstate, notice, now)
+                elif notice.get("status") == ISSUED and (notice.get("payment_request") or {}).get("status") == "pending":
+                    # 交付は済んだが、振込の依頼を出しきれなかった分のやり直し
+                    if self._request_payment(route, contract, cstate, notice, now):
+                        self._send(route.approval_room,
+                                   f"{route.banner}{contract.get('payee', '')}様 {period_label(notice['period'])}分の振込の依頼を、"
+                                   f"{self._payment_room_name(route)}へ出しました。")
+
+    # --- 5. 振込の依頼 ---
+
+    def _payment_room_name(self, route: Route) -> str:
+        if route.name != LIVE:
+            return "このルーム（リハーサルのため）"
+        name = str((self._settings().get("payment_request") or {}).get("room_name") or "").strip()
+        return f"「{name}」" if name else "支払依頼のルーム"
+
+    def _request_payment(self, route: Route, contract: dict, cstate: dict, notice: dict, now: datetime) -> bool:
+        """交付した支払通知書の振込を、経理の担当者へ依頼する。PDFと、承認された証憑のファイルを添える。
+
+        **振込そのものはしない**（依頼の投稿だけ）。振込先は投稿の文には書かず、PDFの備考欄を見てもらう。
+        途中で失敗したら、送れた分を覚えておいて次の巡回で続きから出す。→ 出しきれたか
+        """
+        if not route.payment_room or notice.get("status") != ISSUED:
+            return False
+        request = notice.setdefault("payment_request", {"status": "pending", "sent": []})
+        if request.get("status") == "done":
+            return True
+        sent = request.setdefault("sent", [])
+        evidence = self._evidence_files(cstate, notice)
+        problems = []
+        try:
+            if "pdf" not in sent:
+                pdf = Path(notice["pdf"]).read_bytes()
+                if hashlib.sha256(pdf).hexdigest() != notice.get("pdf_sha256"):
+                    raise NoticeError("保存したPDFが承認時のものと一致しません")
+                self._chatwork.upload_file(route.payment_room, notice["filename"], pdf,
+                                           message=self._payment_text(route, contract, notice, len(evidence)))
+                self._posts += 1
+                sent.append("pdf")
+            for file_id, entry in evidence:
+                key = f"file:{file_id}"
+                if key in sent:
+                    continue
+                marks = "".join(circled(n) for n in sorted(entry["numbers"]))
+                data = self._evidence_bytes(contract, entry["receipt"])
+                if data is None or len(data) > MAX_UPLOAD_BYTES:
+                    why = "ファイルを取得できませんでした" if data is None else "ファイルが大きすぎます"
+                    link = self._receipt_link(int(contract.get("room_id", 0) or 0), entry["receipt"]).strip()
+                    problems.append(f"{marks} {entry['filename']}（{why}）　{link}")
+                else:
+                    self._chatwork.upload_file(route.payment_room, entry["filename"], data,
+                                               message=f"{route.banner}承認済みの証憑（{marks}）です。")
+                    self._posts += 1
+                sent.append(key)
+            if problems and "problems" not in sent:
+                self._send(route.payment_room, f"{route.banner}次の証憑は添付できませんでした。元の投稿でご確認ください。\n"
+                                               + "\n".join(problems))
+                sent.append("problems")
+        except Exception as exc:
+            print("[error] 振込の依頼の投稿に失敗: " + traceback.format_exc(), flush=True)
+            if not request.get("alerted"):
+                request["alerted"] = True
+                self._alert(route, f"{contract.get('payee', '')}様の{period_label(notice['period'])}分について、"
+                                   f"振込の依頼を出しきれませんでした（{exc}）。次の巡回で続きを試します。")
+            return False
+        request["status"] = "done"
+        notice["payment_requested_at"] = now.isoformat()
+        self._audit({"type": "paynotice_payment_request", "route": route.name, "contract": contract["id"],
+                     "period": notice["period"], "version": notice["version"], "evidence": len(evidence),
+                     "not_attached": len(problems)})
+        return True
+
+    def _payment_text(self, route: Route, contract: dict, notice: dict, evidence_count: int) -> str:
+        heads = " ".join(f"[To:{r['account_id']}]{r['name'] + 'さん' if r.get('name') else ''}"
+                         for r in route.payment_recipients or [] if r.get("account_id"))
+        approver = next((a.get("name") for a in route.approvers
+                         if int(a.get("account_id") or 0) == int(notice.get("approved_by") or 0)), "") or "承認者"
+        approved = _parse_iso(notice.get("approved_at"))
+        when = f"・{approved.month}/{approved.day} {approved:%H:%M}" if approved else ""
+        payment = date.fromisoformat(notice["payment_date"])
+        numbers = notice.get("numbers") or {}
+        fee = next((line["label"] for line in notice["lines"] if line["kind"] == "fee"), "業務委託費")
+        lines = [
+            f"{route.banner}【振込のお願い】{contract.get('payee', '')}様 {period_label(notice['period'])}分（{fee}）",
+            f"支払通知書を交付しました（承認: {approver}さん{when}）。次のとおり、振込の手配をお願いします。",
+            f"支払予定日: {jp_date(payment)}",
+            f"支払金額: {yen(notice['total'])}",
+        ]
+        for line in notice["lines"]:
+            number = numbers.get(line_key(line))
+            mark = f"{circled(int(number))} " if number else "・"
+            lines.append(f"{mark}{_short(line['date'])} {line['label']} {yen(int(line['quantity']) * int(line['price']))}")
+        lines.append("振込先は、添付の支払通知書の備考欄をご確認ください。")
+        attached = "添付: 支払通知書のPDF"
+        if evidence_count:
+            attached += f"（この投稿）と、承認済みの証憑{evidence_count}点（続けて投稿します）"
+        lines.append(attached)
+        return (heads + "\n" if heads else "") + "\n".join(lines)
+
+    def _evidence_files(self, cstate: dict, notice: dict) -> list[tuple[str, dict]]:
+        """承認された版に載っている証憑のファイル（1つの画像に複数の領収書があれば、まとめて1点）。"""
+        numbers = notice.get("numbers") or {}
+        files: dict[str, dict] = {}
+        for line in notice["lines"]:
+            receipt = self._receipt(cstate, line.get("receipt_id"))
+            if receipt is None:
+                continue
+            entry = files.setdefault(str(receipt.get("file_id")), {
+                "filename": str(receipt.get("filename") or "証憑"), "numbers": [], "receipt": receipt})
+            if numbers.get(line_key(line)):
+                entry["numbers"].append(int(numbers[line_key(line)]))
+        return list(files.items())
+
+    def _evidence_bytes(self, contract: dict, receipt: dict) -> bytes | None:
+        """証憑のファイルの中身。受付のときに控えたもの。無ければ、元の投稿から取り直す。"""
+        if receipt.get("stored"):
+            try:
+                return Path(receipt["stored"]).read_bytes()
+            except OSError:
+                pass
+        file_id, room_id = str(receipt.get("file_id") or ""), int(contract.get("room_id", 0) or 0)
+        if file_id.isdigit() and room_id:
+            try:
+                info = self._chatwork.get_file_info(room_id, int(file_id))
+                status, data = self._download(str(info.get("download_url", "")))
+                if status == 200 and data:
+                    return data
+            except Exception:
+                print("[warn] 証憑のファイルを取り直せませんでした: " + traceback.format_exc(), flush=True)
+        return None
 
     # --- 承認待ちの催促 ---
 

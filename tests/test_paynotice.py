@@ -37,8 +37,8 @@ from raizuinu.paynotice import (
     total_of,
 )
 
-PAYEE_ROOM, APPROVAL_ROOM, ADMIN_ROOM = 453639844, 384793683, 444945031
-ME, MIYAZAKI, ADACHI, SAKATA, IWANAGA, SHINODA = 11574026, 8923331, 6945415, 8681926, 11481620, 9228914
+PAYEE_ROOM, APPROVAL_ROOM, ADMIN_ROOM, PAYMENT_ROOM = 453639844, 384793683, 444945031, 64547366
+ME, MIYAZAKI, ADACHI, SAKATA, IWANAGA, SHINODA, ITO = 11574026, 8923331, 6945415, 8681926, 11481620, 9228914, 9129422
 TEMPLATE = "2026年10月(源泉なし)"
 HOLIDAYS = {"2026-11-03", "2026-11-23", "2027-01-01", "2027-01-11"}
 
@@ -186,6 +186,9 @@ def env(tmp_path):
     config.data["state_dir"] = str(tmp_path / "state")
     config.data["audit_log_dir"] = str(tmp_path / "audit")
     config.data["payment_notice"]["live"] = True
+    # 振込の依頼は、それを確かめるテストでだけ有効にする（`with_payment_request`）
+    config.data["payment_notice"]["saved_payment_request"] = config.data["payment_notice"]["payment_request"]
+    config.data["payment_notice"]["payment_request"] = {}
     cw, sheets, model = FakeChatwork(), FakeSheets(), FakeModel()
     clock = SimpleNamespace(now=datetime(2026, 11, 20, 10, 0, tzinfo=JST))
     runner = PaymentNoticeRunner(
@@ -881,6 +884,157 @@ def test_a_changed_pdf_is_not_delivered(env):
     assert all(u[0] == APPROVAL_ROOM for u in env.cw.uploads)
 
 
+# --- 5. 振込の依頼 ---
+
+
+def with_payment_request(env):
+    settings = env.config.data["payment_notice"]
+    settings["payment_request"] = settings["saved_payment_request"]
+
+
+def test_on_approval_the_payment_is_requested_with_the_pdf_and_the_receipts(env):
+    # 指示（2026-11-20）: 承認後、宮﨑さんへの交付と同時に「支払依頼・入金確認チャット」で坂田さん・伊藤さん・
+    # 岩永さんへ振込を依頼し、支払通知書のPDFと、承認済みの証憑（レシート）のデータを添える
+    with_payment_request(env)
+    request = two_receipts(env)
+    env.cw.reply(APPROVAL_ROOM, SAKATA, request, "承認")
+    env.clock.now = at(12, 1, 10, 14)
+    env.runner.run_once()
+    notice = state_of(env)["notices"]["2026-11"]
+    assert notice["status"] == ISSUED and notice["payment_request"]["status"] == "done"
+    shown, delivered, pay_pdf, first, second = env.cw.uploads
+    assert delivered[0] == PAYEE_ROOM                                  # 先に委託先へ交付
+    assert pay_pdf[0] == PAYMENT_ROOM and pay_pdf[2] == delivered[2]   # 同じPDFを振込の依頼にも添える
+    assert pay_pdf[1] == "12.1-宮﨑大樹様-ヤマトライジング業務委託費支払通知書2026年11月分.pdf"
+    text = pay_pdf[3]
+    assert text.startswith(f"[To:{SAKATA}]坂田さん [To:{ITO}]伊藤さん [To:{IWANAGA}]岩永さん\n"
+                           "【振込のお願い】宮﨑 大樹様 2026年11月分（ヤマトライジング業務委託費）")
+    assert "支払通知書を交付しました（承認: 坂田さん・12/1 10:14）。次のとおり、振込の手配をお願いします。" in text
+    assert "支払予定日: 12月15日（火）" in text and "支払金額: 102,440円" in text
+    assert "① 11/30 ヤマトライジング業務委託費 100,000円" in text
+    assert "② 11/12 立替：交通費（近畿日本鉄道） 1,240円" in text and "③ 11/15 立替：駐車料金（タイムズ24） 1,200円" in text
+    assert "振込先は、添付の支払通知書の備考欄をご確認ください。" in text
+    assert "添付: 支払通知書のPDF（この投稿）と、承認済みの証憑2点（続けて投稿します）" in text
+    assert "口座" not in text                                          # 振込先そのものは文に書かない
+    # 証憑は、受付のときに読んだファイルそのもの
+    assert (first[0], first[1], first[2], first[3]) == (PAYMENT_ROOM, "IMG_0001.jpg", b"\xff\xd8image-bytes", "承認済みの証憑（②）です。")
+    assert (second[0], second[1], second[3]) == (PAYMENT_ROOM, "IMG_0002.jpg", "承認済みの証憑（③）です。")
+    done = env.cw.posts(APPROVAL_ROOM)[-1]
+    assert "交付しました" in done and "あわせて「支払依頼・入金確認チャット」へ、振込の依頼を出しました（支払予定日は12月15日（火））。" in done
+    env.clock.now = at(12, 2, 9, 0)
+    env.runner.run_once()
+    assert len(env.cw.uploads) == 5                                    # 一度だけ
+
+
+def test_only_the_receipts_on_the_approved_version_are_sent(env):
+    with_payment_request(env)
+    request = two_receipts(env)
+    env.cw.reply(APPROVAL_ROOM, ADACHI, request, "②を外して")
+    env.model.replies.append({"intent": "revise", "question": "", "ops": [op("exclude_receipt", number=2)]})
+    env.clock.now = at(12, 1, 10, 0)
+    env.runner.run_once()
+    env.cw.reply(APPROVAL_ROOM, ADACHI, state_of(env)["notices"]["2026-11"]["request_ids"][0], "承認")
+    env.runner.run_once()
+    to_payment = [u for u in env.cw.uploads if u[0] == PAYMENT_ROOM]
+    assert [u[1] for u in to_payment] == ["12.1-宮﨑大樹様-ヤマトライジング業務委託費支払通知書2026年11月分.pdf", "IMG_0002.jpg"]
+    assert "承認済みの証憑1点" in to_payment[0][3] and "② 11/12" not in to_payment[0][3]
+    assert to_payment[1][3] == "承認済みの証憑（③）です。"            # 外した②の領収書は送らない
+
+
+def test_one_image_with_two_receipts_is_sent_once(env):
+    with_payment_request(env)
+    env.model.receipts["two.jpg"] = {"receipts": [receipt(), receipt(day="2026-11-13", amount=880)], "note": ""}
+    submit(env, names=("two.jpg",))
+    env.runner.run_once()
+    env.clock.now = at(12, 1, 9, 0)
+    env.runner.run_once()
+    env.cw.reply(APPROVAL_ROOM, IWANAGA, state_of(env)["notices"]["2026-11"]["request_ids"][0], "承認")
+    env.runner.run_once()
+    to_payment = [u for u in env.cw.uploads if u[0] == PAYMENT_ROOM]
+    assert len(to_payment) == 2 and to_payment[1][3] == "承認済みの証憑（②③）です。"
+
+
+def test_a_month_without_receipts_asks_for_the_fee_only(env):
+    with_payment_request(env)
+    env.clock.now = at(12, 1, 9, 0)
+    env.runner.run_once()
+    env.cw.reply(APPROVAL_ROOM, SAKATA, state_of(env)["notices"]["2026-11"]["request_ids"][0], "承認")
+    env.runner.run_once()
+    to_payment = [u for u in env.cw.uploads if u[0] == PAYMENT_ROOM]
+    assert len(to_payment) == 1 and to_payment[0][3].endswith("添付: 支払通知書のPDF")
+    assert "支払金額: 100,000円" in to_payment[0][3]
+
+
+def test_no_payment_is_requested_before_the_notice_is_delivered(env):
+    with_payment_request(env)
+    request = two_receipts(env)
+    env.runner.run_once()
+    assert [u for u in env.cw.uploads if u[0] == PAYMENT_ROOM] == []   # 承認前
+    env.cw.reply(APPROVAL_ROOM, SAKATA, request, "承認")
+    env.cw.fail_upload = 2                                             # 交付に失敗している間
+    env.clock.now = at(12, 1, 10, 0)
+    env.runner.run_once()
+    assert state_of(env)["notices"]["2026-11"]["status"] == AWAITING
+    assert [u for u in env.cw.uploads if u[0] == PAYMENT_ROOM] == []
+    env.runner.run_once()
+    assert state_of(env)["notices"]["2026-11"]["payment_request"]["status"] == "done"
+
+
+def test_a_payment_request_that_broke_off_continues_where_it_stopped(env):
+    with_payment_request(env)
+    request = two_receipts(env)
+    env.cw.reply(APPROVAL_ROOM, SAKATA, request, "承認")
+    env.clock.now = at(12, 1, 10, 0)
+    real = env.cw.upload_file
+    seen = []
+
+    def flaky(room_id, filename, data, message=""):
+        seen.append((room_id, filename))
+        if room_id == PAYMENT_ROOM and filename == "IMG_0002.jpg" and seen.count((room_id, filename)) == 1:
+            raise RuntimeError("upload failed")
+        return real(room_id, filename, data, message)
+
+    env.cw.upload_file = flaky
+    env.runner.run_once()
+    notice = state_of(env)["notices"]["2026-11"]
+    assert notice["status"] == ISSUED and notice["payment_request"]["status"] == "done"   # 同じ巡回の中でやり直して出しきる
+    names = [u[1] for u in env.cw.uploads if u[0] == PAYMENT_ROOM]
+    assert names.count("IMG_0001.jpg") == 1 and names.count("IMG_0002.jpg") == 1          # 送れた分は二度送らない
+    assert sum(1 for u in env.cw.uploads if u[0] == PAYMENT_ROOM and u[1].endswith(".pdf")) == 1
+    assert any("振込の依頼を出しきれませんでした" in p for p in env.cw.posts(APPROVAL_ROOM))
+
+
+def test_a_receipt_file_that_is_gone_is_pointed_to_instead(env):
+    with_payment_request(env)
+    request = december(env)
+    stored = Path(state_of(env)["receipts"][0]["stored"])
+    assert stored.read_bytes() == b"\xff\xd8image-bytes"
+    stored.unlink()
+    env.runner._download = lambda url: (404, b"")                      # 元の投稿からも取れない
+    env.cw.reply(APPROVAL_ROOM, SAKATA, request, "承認")
+    env.runner.run_once()
+    assert state_of(env)["notices"]["2026-11"]["payment_request"]["status"] == "done"
+    note = env.cw.posts(PAYMENT_ROOM)[-1]
+    assert "次の証憑は添付できませんでした" in note and "② IMG_0001.jpg（ファイルを取得できませんでした）" in note
+    assert f"#!rid{PAYEE_ROOM}-" in note
+
+
+def test_a_rehearsal_sends_the_payment_request_to_the_admin_room(env, tmp_path):
+    with_payment_request(env)
+    env.config.data["payment_notice"]["live"] = False
+    image = tmp_path / "sample.jpg"
+    image.write_bytes(b"\xff\xd8sample")
+    env.model.receipts["sample.jpg"] = {"receipts": [receipt(day="2026-10-20")], "note": ""}
+    env.runner.rehearse("2026-10", [image])
+    env.cw.reply(ADMIN_ROOM, ADACHI, state_of(env, "paynotice-rehearsal.json")["notices"]["2026-10"]["request_ids"][0], "承認")
+    env.runner.run_once()
+    assert [u[0] for u in env.cw.uploads] == [ADMIN_ROOM] * 4          # 確認用・交付・振込依頼のPDF・証憑
+    assert env.cw.uploads[2][3].startswith(f"[To:{ADACHI}]\n【リハーサル】【振込のお願い】宮﨑 大樹様 2026年10月分")
+    assert (env.cw.uploads[3][1], env.cw.uploads[3][2], env.cw.uploads[3][3]) == ("sample.jpg", b"\xff\xd8sample", "【リハーサル】承認済みの証憑（②）です。")
+    assert env.cw.posts(PAYMENT_ROOM) == [] and env.cw.posts(PAYEE_ROOM) == []   # 本番のルームには出さない
+    assert "あわせてこのルーム（リハーサルのため）へ、振込の依頼を出しました" in env.cw.posts(ADMIN_ROOM)[-1]
+
+
 # --- 承認待ちの催促 ---
 
 
@@ -989,3 +1143,6 @@ def test_the_settings_follow_the_contract():
     assert contract["fee"] == {"label": "ヤマトライジング業務委託費", "amount": 100000, "quantity": 1, "unit": "式"}
     assert contract["payment_day"] == 15 and contract["term"] == {"start": "2026-10-01", "end": "2027-09-30"}
     assert contract["room_id"] == PAYEE_ROOM and PAYEE_ROOM not in config.allowed_room_ids
+    payment = settings["payment_request"]
+    assert payment["room_id"] == PAYMENT_ROOM and PAYMENT_ROOM not in config.allowed_room_ids
+    assert [r["account_id"] for r in payment["recipients"]] == [SAKATA, ITO, IWANAGA]

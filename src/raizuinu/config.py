@@ -324,6 +324,8 @@ _DEFAULTS: dict[str, Any] = {
         # 承認を取るルームと承認者（account_id・name）。承認者のうち1名の「承認」で交付する
         "approval_room_id": 0,
         "approvers": [],
+        # 交付と同時に振込の依頼を出すルーム（room_id・room_name・recipients）。room_id が 0 なら出さない
+        "payment_request": {"room_id": 0, "room_name": "", "recipients": []},
         # 作成する時刻（翌月の第1営業日）と、承認待ちを催促する時刻
         "create_time": "09:00",
         "remind_time": "09:00",
