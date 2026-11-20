@@ -315,6 +315,36 @@ _DEFAULTS: dict[str, Any] = {
         "enabled": True,
         "check_minutes": 15,
     },
+    # 営業メールの見張り。通知ボットが流す「新着メール」のうち、取引先の担当者からのメールだけを
+    # 宛名の担当者へ知らせ、返信と期日を追う。room_id は許可ルーム（Q&Aの対象）に入れない
+    "mail_watch": {
+        "enabled": False,
+        "room_id": 0,
+        "notifier_account_id": 0,
+        # 知らせる時間帯（月〜金）。時間外に届いた分は次の時間帯の頭に知らせる
+        "notify_window": {"start": "08:30", "end": "19:30"},
+        # 当社のドメイン。ここからのメールは「返信が済んだか」の確認に使う
+        "own_domains": [],
+        # 読まずに外す差出人（広告・システムの自動通知）。ドメインか、アドレスそのもの
+        "skip_senders": [],
+        # 当社の担当者（name＝宛名に書かれる苗字・account_id・addresses＝本人の送信アドレス）
+        "staff": [],
+        # 担当者以外で営業のメールを送る社員（name・addresses）。返信者の名前の表示にだけ使う
+        "colleagues": [],
+        # 毎朝の一覧と、期日当日の確認の時刻
+        "morning_time": "09:00",
+        "final_time": "15:00",
+        # 返信は要らないが期日のあるメールを、朝の一覧に載せ始める日数
+        "deadline_only_days_before": 3,
+        # これを過ぎたら一覧から外す（期日がまだ先のものは残す）
+        "max_open_days": 30,
+        "max_per_run": 15,
+        "max_read_attempts": 3,
+        "max_tokens": 2000,
+        # 1通の知らせの長さの上限（超えたら分ける）
+        "max_chars": 6000,
+        "numbering": {"restart_after": 30},
+    },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {
         "enabled": False,

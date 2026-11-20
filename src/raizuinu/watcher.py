@@ -375,6 +375,12 @@ def main() -> None:
     except Exception:
         print("[error] FAXの見張りに失敗: " + traceback.format_exc(), flush=True)
     try:
+        from .mailwatch import MailWatcher
+
+        MailWatcher(config, chatwork, cost=_cost_tracker(config)).run_once()
+    except Exception:
+        print("[error] 営業メールの見張りに失敗: " + traceback.format_exc(), flush=True)
+    try:
         from .deadline import DeadlineFollower
 
         DeadlineFollower(config, chatwork).run_once()
@@ -387,6 +393,17 @@ def main() -> None:
     except Exception:
         print("[error] マニュアルリンク集の取り込みに失敗: " + traceback.format_exc(), flush=True)
     DiscussionWatcher(config, chatwork=chatwork).run_once()
+
+
+def _cost_tracker(config: Config) -> CostTracker:
+    return CostTracker(
+        state_dir=config.resolve_path(config.state_dir),
+        limit_jpy=config.monthly_cost_limit_jpy,
+        alert_threshold=config.cost_alert_threshold,
+        usd_jpy_rate=config.usd_jpy_rate,
+        pricing_usd_per_mtok=config.pricing_usd_per_mtok,
+        prompt_cache_ttl=config.prompt_cache_ttl,
+    )
 
 
 def archive_rooms(config: Config, chatwork: Any | None = None) -> dict[int, int]:

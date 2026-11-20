@@ -240,6 +240,45 @@
       "context_minutes": 120
     }
   },
+  "mail_watch": {
+    "_note": "営業メールの見張り（指示 2026-11-20）。「楽天軒　営業メール確認」ルームに通知管理くんが流すメールのうち、取引先の担当者からのメールだけを、宛名に書かれた担当者（staff）へ知らせる。返信が要るもの・期日のあるものには番号を振り、当社からの返信（own_domains）が流れてきたら中身を読んで完了にする。済んでいない分は毎朝 morning_time の一覧と、期日当日 final_time の確認で知らせる。メールは送らない。このルームは allowed_room_ids に入れない",
+    "enabled": true,
+    "room_id": 451262874,
+    "notifier_account_id": 10294683,
+    "notify_window": { "start": "08:30", "end": "19:30" },
+    "_own_domains_note": "当社のドメイン。ここから送ったメールは通知せず、返信が済んだかの確認に使う",
+    "own_domains": ["rakutenken.co.jp", "rakutenken.jp"],
+    "_skip_senders_note": "読まずに外す差出人（広告・メルマガ・システムの自動通知）。ドメインを書けば下位ドメインも含む。ここに無い差出人はモデルが種類を読み、取引先の担当者でなければ知らせない。増えたら1行足す",
+    "skip_senders": [
+      "superdelivery.com",
+      "raccoon.ne.jp",
+      "b4.cloudsign.jp",
+      "yu-nakagawa.co.jp",
+      "bengo4.com",
+      "canon-sas.co.jp",
+      "jpts-unity.jp",
+      "c-admin.jp",
+      "do-furusato.com"
+    ],
+    "_staff_note": "当社の担当者。name は宛名に書かれる苗字、addresses は本人が送信に使うアドレス（返信者の表示用）。宛名にどの担当者も無いメールは全員へ知らせる。担当者が増えたら1件足す",
+    "staff": [
+      { "account_id": 10604615, "name": "森", "addresses": ["ymori@rakutenken.co.jp"] },
+      { "account_id": 5631017, "name": "藤田", "addresses": ["fujita@rakutenken.jp"] }
+    ],
+    "_colleagues_note": "担当者以外で、営業のメールを送る社員（返信者の名前の表示にだけ使う。知らせの宛先にはならない）",
+    "colleagues": [
+      { "name": "福本", "addresses": ["jimu@rakutenken.co.jp"] }
+    ],
+    "morning_time": "09:00",
+    "final_time": "15:00",
+    "deadline_only_days_before": 3,
+    "max_open_days": 30,
+    "max_per_run": 15,
+    "max_read_attempts": 3,
+    "max_tokens": 2000,
+    "max_chars": 6000,
+    "numbering": { "restart_after": 30 }
+  },
   "key_alert": {
     "_note": "AnthropicのAPIキーの見張り。5分ごとの巡回に相乗りして check_minutes おきにキーを確かめ（料金のかからないモデル一覧のAPI）、認証エラー（401／403）なら管理者ルームへ一度だけ知らせる。通るようになったときも一度だけ。止まっている間は毎回確かめる（実例 2026-11-16: 有効期限つきのキーが切れ、どこにも知らせずに全機能が止まった）",
     "enabled": true,
