@@ -932,13 +932,15 @@ class PaymentNoticeRunner:
             display.append({"number": number, "kind": "receipt", "receipt_id": receipt["id"], "uid": None,
                             "label": receipt.get("label") or receipt_label(receipt)})
             why = "外す指示あり" if receipt["status"] == EXCLUDED else "、".join(receipt.get("issues") or [])
-            detail = " ".join(x for x in (
-                receipt.get("filename", ""),
-                _short(receipt.get("date")) if _parse_date(receipt.get("date")) else "",
-                receipt.get("payee"),
-                yen(receipt["amount"]) if receipt.get("amount") else "",
-            ) if x)
-            kept_out.append((number, f"{circled(number)} {detail}（{why}）" + self._receipt_link(room_id, receipt)))
+            # 載っている行と同じ書き方にする（日付・内容・金額）。実例（2026-11-20 のリハーサル）: 外した行だけ
+            # 「train.jpg 10/20 近畿日本鉄道株式会社 680円」と、先頭にファイル名・支払先は正式名という別の書き方で、
+            # 同じ行に見えなかった。読めなかった項目は「日付不明」「金額不明」と書く
+            amount = yen(receipt["amount"]) if receipt.get("amount") else "金額不明"
+            label = receipt.get("label") or receipt_label(receipt)
+            link = self._receipt_link(room_id, receipt)
+            if receipt.get("message_id") and receipt.get("filename") and blocks_listing(receipt.get("issues") or []):
+                link += f"（{receipt['filename']}）"  # 読めなかった証憑は、1通に複数あってもどの画像か分かるように
+            kept_out.append((number, f"{circled(number)} {_short(receipt.get('date'))} {label} {amount}（{why}）{link}"))
         lines += [text for _, text in sorted(shown)]
         if kept_out:
             lines.append("載せていない証憑（番号はそのままです）:")

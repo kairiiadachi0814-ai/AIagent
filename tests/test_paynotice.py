@@ -579,8 +579,9 @@ def test_numbers_stay_with_their_lines_across_versions(env):
     assert "支払通知書（第2版）" in second
     assert "① 11/30 ヤマトライジング業務委託費 100,000円" in second
     assert "③ 11/15 立替：駐車料金（タイムズ24） 1,200円" in second          # ③のまま
-    assert "載せていない証憑（番号はそのままです）:\n② IMG_0001.jpg 11/12 近畿日本鉄道 1,240円（外す指示あり）" in second
-    assert "② 11/15" not in second and "③ IMG_0001" not in second
+    # 外した行も、載っていたときと同じ書き方（先頭にファイル名を足さない。指摘 2026-11-20）
+    assert "載せていない証憑（番号はそのままです）:\n② 11/12 立替：交通費（近畿日本鉄道） 1,240円（外す指示あり）　証憑: https://" in second
+    assert "② 11/15" not in second and "IMG_0001.jpg" not in second
     # 次の指示も、最初に見た番号のまま通じる
     env.cw.reply(APPROVAL_ROOM, ADACHI, last_bot_reply(env), "③の金額を1,300円に。②はやはり載せて")
     env.model.replies.append({"intent": "revise", "question": "", "ops": [
@@ -731,7 +732,8 @@ def test_an_unreadable_receipt_is_listed_once_a_person_gives_the_amount(env):
     notice = state_of(env)["notices"]["2026-11"]
     request = env.cw.posts(APPROVAL_ROOM)[0]
     assert notice["total"] == 100000 and "載せていない証憑（番号はそのままです）:" in request
-    assert "② IMG_0001.jpg 近畿日本鉄道（金額を読み取れませんでした、日付を読み取れませんでした）" in request
+    assert "② 日付不明 立替：交通費（近畿日本鉄道） 金額不明（金額を読み取れませんでした、日付を読み取れませんでした）　証憑: https://" in request
+    assert request.count("（IMG_0001.jpg）") == 1   # 読めなかった証憑は、どの画像かをリンクの後ろに添える
     env.cw.reply(APPROVAL_ROOM, IWANAGA, notice["request_ids"][0], "②は11/12の交通費で1,240円です")
     env.model.replies.append({"intent": "revise", "question": "", "ops": [
         op("set_receipt_amount", number=2, amount=1240), op("set_receipt_date", number=2, day="2026-11-12")]})
