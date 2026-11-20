@@ -247,6 +247,19 @@ def check_receipt(receipt: dict, submitted: date, term_start: date | None, other
     return issues
 
 
+_REGISTRATION_RE = re.compile(r"^T\d{13}$")
+
+
+def clean_registration(text: Any) -> tuple[str, bool]:
+    """適格請求書発行事業者の登録番号 → (整えた番号, 形が正しいか)。正しい形は T＋数字13桁。
+
+    実例（2026-11-20 の読み取りテスト）: 駐車場の領収書の番号を「T41200001210276」（数字14桁）と読んだ。
+    桁数が合わない番号は読み違いの疑いがあるので、そのまま信じない。
+    """
+    value = re.sub(r"[\s\-‐－ー]", "", unicodedata.normalize("NFKC", str(text or ""))).upper()
+    return value, bool(_REGISTRATION_RE.match(value))
+
+
 def blocks_listing(issues: list[str]) -> bool:
     """載せられない問題か（金額・日付が読めない、金額が大きすぎる）。"""
     return any("読み取れません" in i or "金額が大きい" in i for i in issues)
@@ -526,8 +539,14 @@ class PaymentNoticeRunner:
                 return contract
         raise NoticeError(f"契約「{contract_id}」が設定にありません")
 
-    def rehearse(self, period: str, receipt_files: list[Path], contract_id: str | None = None) -> dict:
-        """管理者ルームでの通し稽古を始める（証憑はファイルから読む。日付の条件は見ない）。"""
+    def rehearse(self, period: str, receipt_files: list[Path], contract_id: str | None = None,
+                 from_room: bool = False) -> dict:
+        """管理者ルームでの通し稽古を始める（日付の条件は見ない）。
+
+        証憑はファイルから読むか、`from_room` なら委託先のルームに上がっている添付（委託先本人とテスト役の分）を
+        読む。後者は、読み取りテストで使った実物の領収書を支払通知書に載せて確かめるためのもの（指示 2026-11-20）。
+        控えはリハーサル用で、本番の支払通知書には載らない。
+        """
         route = self.route(REHEARSAL)
         contract = self.contract(contract_id)
         state = self._load(route)
@@ -540,6 +559,26 @@ class PaymentNoticeRunner:
             found = self.read_receipt(path.read_bytes(), path.name)
             self._add_receipts(contract, cstate, found, file_id=f"file{index}", message_id="", filename=path.name,
                                submitted=submitted, period=period)
+        if from_room:
+            room_id = int(contract["room_id"])
+            people = {int(a) for a in [contract.get("account_id"), *(contract.get("submitter_account_ids") or []),
+                                       *(contract.get("test_submitter_account_ids") or [])] if a}
+            for message in self._chatwork.get_recent_messages(room_id, limit=100):
+                if _account_of(message) not in people:
+                    continue
+                sent = datetime.fromtimestamp(int(message.get("send_time", 0)), JST)
+                for file_id, name in attachments_of(str(message.get("body") or "")):
+                    suffix = Path(name).suffix.lower()
+                    if suffix not in IMAGE_TYPES and suffix != ".pdf":
+                        continue
+                    info = self._chatwork.get_file_info(room_id, file_id)
+                    status, data = self._download(str(info.get("download_url", "")))
+                    if status != 200 or not data:
+                        raise NoticeError(f"{name} を取得できませんでした（HTTP {status}）")
+                    found = self.read_receipt(data, name)
+                    self._add_receipts(contract, cstate, found, file_id=str(file_id),
+                                       message_id=str(message.get("message_id")), filename=name,
+                                       submitted=sent, period=period)
         self._owned, self._owned_room = state.setdefault("owned", []), route.approval_room
         notice = self._create(route, contract, cstate, period, self._now())
         self._save(route, state)
@@ -688,8 +727,10 @@ class PaymentNoticeRunner:
                 "purpose": str(raw.get("purpose") or "").strip(),
                 "kind": str(raw.get("kind") or ""),
                 "tax_note": str(raw.get("tax_note") or ""),
-                "registration": str(raw.get("registration") or "").strip(),
             }
+            # 登録番号は、形（T＋13桁）が合うものだけ控える（合わない番号は読み違いの疑い）
+            number, valid = clean_registration(raw.get("registration"))
+            receipt["registration"] = number if valid else ""
             issues = check_receipt(receipt, submitted.date(), term_start, cstate["receipts"])
             receipt["issues"] = issues
             receipt["status"] = REVIEW if blocks_listing(issues) else OK
@@ -843,8 +884,10 @@ class PaymentNoticeRunner:
                     f"　日付: {jp_date(day) if day else '読み取れず'}／支払先: {receipt['payee'] or '読み取れず'}／"
                     f"金額: {yen(receipt['amount']) if receipt['amount'] else '読み取れず'}"
                 )
+                number, valid = clean_registration(raw.get("registration"))
+                shown = "記載なし" if not number else (number if valid else f"{number}（桁数が合わず、読み違いの疑いがあります）")
                 lines.append(f"　用途: {receipt['purpose'] or '読み取れず'}／種類: {raw.get('kind') or '-'}／"
-                             f"税率の記載: {raw.get('tax_note') or '-'}／登録番号: {raw.get('registration') or '記載なし'}")
+                             f"税率の記載: {raw.get('tax_note') or '-'}／登録番号: {shown}")
                 lines.append(f"　支払通知書の内容欄: {receipt_label(receipt)}")
                 for issue in issues:
                     lines.append(f"　【要確認】{issue}")
@@ -1602,6 +1645,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="支払通知書の月次発行")
     parser.add_argument("--rehearse", metavar="YYYY-MM", help="管理者ルームで通し稽古を始める（対象の月）")
     parser.add_argument("--receipt", action="append", default=[], help="--rehearse で使う証憑のファイル（複数可）")
+    parser.add_argument("--from-room", action="store_true",
+                        help="--rehearse で、委託先のルームに上がっている添付（本人とテスト役の分）を証憑として使う")
     parser.add_argument("--create", metavar="YYYY-MM", help="本番の経路で、その月の支払通知書を作って承認を求める")
     parser.add_argument("--read", metavar="FILE", help="証憑の読み取りだけを試す")
     parser.add_argument("--contract", default=None, help="契約のID（1件だけなら省略可）")
@@ -1614,7 +1659,8 @@ def main(argv: list[str] | None = None) -> None:
         path = Path(args.read)
         print(json.dumps(runner.read_receipt(path.read_bytes(), path.name), ensure_ascii=False, indent=2))
     elif args.rehearse:
-        notice = runner.rehearse(args.rehearse, [Path(p) for p in args.receipt], args.contract)
+        notice = runner.rehearse(args.rehearse, [Path(p) for p in args.receipt], args.contract,
+                                 from_room=args.from_room)
         print(f"リハーサルを始めました: {period_label(args.rehearse)}分 第{notice['version']}版 合計{yen(notice['total'])}")
     elif args.create:
         notice = runner.create(args.create, args.contract)

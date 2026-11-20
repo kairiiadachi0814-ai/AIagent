@@ -26,6 +26,7 @@ from raizuinu.paynotice import (
     NoticeError,
     PaymentNoticeRunner,
     attachments_of,
+    clean_registration,
     build_lines,
     check_receipt,
     is_plain_approval,
@@ -410,6 +411,11 @@ def test_a_testers_receipt_is_read_and_reported_but_not_kept(env):
     assert "■ real.jpg" in reply
     assert "日付: 11月12日（木）／支払先: 近畿日本鉄道株式会社／金額: 680円" in reply
     assert "用途: 交通費（近鉄奈良〜大阪難波）／種類: 領収書／税率の記載: 10%／登録番号: T1120001052417" in reply
+    env.model.receipts["odd.jpg"] = {"receipts": [{**receipt(), "registration": "T41200001210276"}], "note": ""}
+    env.cw.attach(PAYEE_ROOM, ADACHI, ["odd.jpg"])
+    env.runner.run_once()
+    assert "登録番号: T41200001210276（桁数が合わず、読み違いの疑いがあります）" in env.cw.posts(PAYEE_ROOM)[1]
+    env.cw.sent.pop()
     assert "支払通知書の内容欄: 立替：交通費（近鉄奈良〜大阪難波） 近畿日本鉄道" in reply
     assert not (env.tmp / "state" / "paynotice.json").exists()   # 本番の控えには何も残らない
     env.runner.run_once()
@@ -900,6 +906,35 @@ def test_a_rehearsal_stays_inside_the_admin_room(env, tmp_path):
     assert env.cw.posts(PAYEE_ROOM) == [] and env.cw.posts(APPROVAL_ROOM) == []   # 本番のルームには何も出ない
     assert env.runner.cleanup_rehearsal() == ["テスト_2026年10月(源泉なし)"]
     assert list(env.sheets.tabs) == [TEMPLATE]
+
+
+def test_a_rehearsal_can_use_the_real_receipts_in_the_payee_room(env):
+    # 指示（2026-11-20）: 読み取りテストで足立さんが上げた実物の領収書を、支払通知書に載せて確かめる
+    env.config.data["payment_notice"]["live"] = False
+    env.model.receipts["stamp.JPG"] = {"receipts": [receipt(day="2026-09-25", payee="LAWSON 近鉄奈良駅前店", amount=200, purpose="収入印紙")], "note": ""}
+    env.model.receipts["parking.JPG"] = {"receipts": [receipt(day="2026-11-16", payee="パーキングプレイス油阪町第1（株式会社リープリング）", amount=300, purpose="駐車料金")], "note": ""}
+    first = env.cw.attach(PAYEE_ROOM, ADACHI, ["stamp.JPG"], at=at(11, 20, 21, 21))
+    second = env.cw.attach(PAYEE_ROOM, ADACHI, ["parking.JPG"], at=at(11, 20, 21, 21))
+    env.cw.attach(PAYEE_ROOM, IWANAGA, ["業務委託契約書.pdf"])   # 関係のない人の添付は使わない
+    notice = env.runner.rehearse("2026-11", [], from_room=True)
+    assert notice["total"] == 100500 and "テスト_2026年11月(源泉なし)" in env.sheets.tabs
+    request = env.cw.posts(ADMIN_ROOM)[0]
+    assert "【リハーサル】【承認のお願い】宮﨑 大樹様 2026年11月分 支払通知書（第1版）" in request
+    assert "① 11/30 ヤマトライジング業務委託費 100,000円" in request
+    assert f"② 9/25 立替：収入印紙（LAWSON 近鉄奈良駅前店） 200円 ※課税対象外　証憑: https://www.chatwork.com/#!rid{PAYEE_ROOM}-{first}" in request
+    assert "【要確認】日付（2026-09-25）が契約の開始日より前です" in request
+    assert f"③ 11/16 立替：駐車料金（パーキングプレイス油阪町第1） 300円 ※課税対象外　証憑: https://www.chatwork.com/#!rid{PAYEE_ROOM}-{second}" in request
+    cells = env.sheets.tabs["テスト_2026年11月(源泉なし)"]["cells"]
+    assert (cells["B21"], cells["N21"], cells["K21"]) == (date(2026, 9, 25), 200, "※")
+    assert (cells["B22"], cells["D22"], cells["N22"]) == (date(2026, 11, 16), "立替：駐車料金（パーキングプレイス油阪町第1）", 300)
+    assert env.cw.posts(PAYEE_ROOM) == [] and not (env.tmp / "state" / "paynotice.json").exists()   # 本番には何も残さない
+
+
+def test_a_registration_number_must_be_t_and_thirteen_digits():
+    assert clean_registration("T2810826779764") == ("T2810826779764", True)
+    assert clean_registration("Ｔ2810-8267-79764") == ("T2810826779764", True)
+    assert clean_registration("T41200001210276") == ("T41200001210276", False)   # 実例: 14桁に読んだ
+    assert clean_registration("") == ("", False)
 
 
 def test_while_not_live_the_real_rooms_are_left_alone(env):
