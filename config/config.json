@@ -240,6 +240,41 @@
       "context_minutes": 120
     }
   },
+  "payment_notice": {
+    "_note": "支払通知書の月次発行（指示 2026-11-20）。業務委託先が専用ルームに送った領収書の画像を読み取り、翌月の第1営業日にスプレッドシートのひな形タブを複製して支払通知書を作り、PDFにして approval_room_id で承認を求める。approvers のうち1名の「承認」を得たら、その版のPDFをそのまま委託先のルームへ交付する（期限は締日の翌日から issue_within_business_days 営業日）。live が false の間は本番を動かさず、リハーサル（承認依頼も交付も管理者ルーム）だけが動く。委託先のルームは allowed_room_ids に入れない",
+    "enabled": true,
+    "live": false,
+    "approval_room_id": 384793683,
+    "approvers": [
+      { "account_id": 6945415, "name": "足立" },
+      { "account_id": 8681926, "name": "坂田" },
+      { "account_id": 11481620, "name": "岩永" }
+    ],
+    "create_time": "09:00",
+    "remind_time": "09:00",
+    "issue_within_business_days": 5,
+    "_closed_days_note": "祝日（config/holidays.json）のほかに営業日から外す日。年末年始の休業などを \"2026-12-29/2027-01-03\" のように書く",
+    "closed_days": [],
+    "contracts": [
+      {
+        "_note": "宮﨑大樹さんと株式会社ヤマトライジングの業務委託契約（2026/10/1〜2027/9/30）。報酬は月額10万円（税込）・月末締め・翌月15日払い（契約5条・6条）。経費は事前に承認されたものを立替精算し、月末までに出た証憑をその月の分とする（7条）。fee を変えれば定例の行が変わる。expense.tax_exempt は立替経費の行に「※」（課税対象外）を付けるか",
+        "id": "miyazaki",
+        "payee": "宮﨑 大樹",
+        "to_name": "宮﨑",
+        "room_id": 453639844,
+        "account_id": 8923331,
+        "spreadsheet_id": "1Bwx-IjQD-HzBwat-pHHn347dxs-W4c0RTZFvTVkY0mc",
+        "template_sheet": "2026年10月(源泉なし)",
+        "sheet_title": "{year}年{month}月(源泉なし)",
+        "file_name": "宮﨑大樹様-ヤマトライジング業務委託費支払通知書{year}年{month}月分.pdf",
+        "term": { "start": "2026-10-01", "end": "2027-09-30" },
+        "first_period": "2026-11",
+        "payment_day": 15,
+        "fee": { "label": "ヤマトライジング業務委託費", "amount": 100000, "quantity": 1, "unit": "式" },
+        "expense": { "tax_exempt": true, "unit": "式" }
+      }
+    ]
+  },
   "mail_watch": {
     "_note": "営業メールの見張り（指示 2026-11-20）。「楽天軒　営業メール確認」ルームに通知管理くんが流すメールのうち、取引先の担当者からのメールだけを、宛名に書かれた担当者（staff）へ知らせる。返信が要るもの・期日のあるものには番号を振り、当社からの返信（own_domains）が流れてきたら中身を読んで完了にする。済んでいない分は毎朝 morning_time の一覧と、期日当日 final_time の確認で知らせる。メールは送らない。このルームは allowed_room_ids に入れない",
     "enabled": true,

@@ -381,6 +381,12 @@ def main() -> None:
     except Exception:
         print("[error] 営業メールの見張りに失敗: " + traceback.format_exc(), flush=True)
     try:
+        from .paynotice import PaymentNoticeRunner
+
+        PaymentNoticeRunner(config, chatwork, cost=_cost_tracker(config)).run_once()
+    except Exception:
+        print("[error] 支払通知書の処理に失敗: " + traceback.format_exc(), flush=True)
+    try:
         from .deadline import DeadlineFollower
 
         DeadlineFollower(config, chatwork).run_once()

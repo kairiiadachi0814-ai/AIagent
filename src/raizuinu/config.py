@@ -315,6 +315,28 @@ _DEFAULTS: dict[str, Any] = {
         "enabled": True,
         "check_minutes": 15,
     },
+    # 支払通知書の月次発行。業務委託先の証憑を受け付け、支払通知書を作り、承認者1名の承認を得て交付する。
+    # live が false の間はリハーサル（承認依頼も交付も管理者ルーム）だけが動く。
+    # 委託先のルームは許可ルーム（Q&Aの対象）に入れない
+    "payment_notice": {
+        "enabled": False,
+        "live": False,
+        # 承認を取るルームと承認者（account_id・name）。承認者のうち1名の「承認」で交付する
+        "approval_room_id": 0,
+        "approvers": [],
+        # 作成する時刻（翌月の第1営業日）と、承認待ちを催促する時刻
+        "create_time": "09:00",
+        "remind_time": "09:00",
+        # 交付の期限（締日の翌日から起算した営業日数。契約で決まる）
+        "issue_within_business_days": 5,
+        # 祝日のほかに営業日から外す日（"2026-12-29/2027-01-03" のように範囲でも書ける）
+        "closed_days": [],
+        "max_read_attempts": 3,
+        "max_tokens": 4000,
+        # 契約ごとの設定（id・payee・room_id・account_id・spreadsheet_id・template_sheet・fee など）。
+        # 契約が増えたら1件足す
+        "contracts": [],
+    },
     # 営業メールの見張り。通知ボットが流す「新着メール」のうち、取引先の担当者からのメールだけを
     # 宛名の担当者へ知らせ、返信と期日を追う。room_id は許可ルーム（Q&Aの対象）に入れない
     "mail_watch": {
