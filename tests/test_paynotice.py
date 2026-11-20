@@ -432,7 +432,8 @@ def test_the_request_shows_every_line_and_the_way_to_answer(env):
     assert "経費は、事前に承認されたものかどうかも合わせてご確認ください。" in request
     assert "この投稿への返信で「承認」" in request and "どなたか1名で結構です" in request
     room, filename, data, _ = env.cw.uploads[0]
-    assert room == APPROVAL_ROOM and filename == "宮﨑大樹様-ヤマトライジング業務委託費支払通知書2026年11月分.pdf"
+    # 名前の先頭は発行日（月.日・半角）。12/1 に作ったので「12.1-」
+    assert room == APPROVAL_ROOM and filename == "12.1-宮﨑大樹様-ヤマトライジング業務委託費支払通知書2026年11月分.pdf"
     assert data.startswith(b"%PDF-") and env.cw.posts(PAYEE_ROOM)[1:] == []  # 委託先にはまだ何も出さない
 
 
@@ -552,6 +553,20 @@ def test_a_correction_rebuilds_the_notice_and_asks_again(env):
     assert len(env.cw.uploads) == 2 and all(u[0] == APPROVAL_ROOM for u in env.cw.uploads)
     # 行の一覧をモデルへ渡している
     assert "2（②）: 証憑「立替：交通費（近畿日本鉄道）」" in env.model.calls[-1][1]
+
+
+def test_the_file_name_follows_the_issue_date(env):
+    request = december(env)
+    env.cw.reply(APPROVAL_ROOM, ADACHI, request, "発行日を12月3日にしてください")
+    env.model.replies.append({"intent": "revise", "question": "", "ops": [op("set_issue_date", day="2026-12-03")]})
+    env.clock.now = at(12, 1, 10, 0)
+    env.runner.run_once()
+    notice = state_of(env)["notices"]["2026-11"]
+    assert notice["issue_date"] == "2026-12-03" and env.sheets.tabs["2026年11月(源泉なし)"]["cells"]["Q4"] == date(2026, 12, 3)
+    assert env.cw.uploads[-1][1] == "12.3-宮﨑大樹様-ヤマトライジング業務委託費支払通知書2026年11月分.pdf"
+    env.cw.reply(APPROVAL_ROOM, ADACHI, notice["request_ids"][0], "承認")
+    env.runner.run_once()
+    assert env.cw.uploads[-1][0] == PAYEE_ROOM and env.cw.uploads[-1][1].startswith("12.3-宮﨑大樹様-")
 
 
 def test_an_approval_of_the_old_version_does_not_deliver_it(env):

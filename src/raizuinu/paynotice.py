@@ -737,7 +737,7 @@ class PaymentNoticeRunner:
         path.write_bytes(pdf)
         notice["pdf"] = str(path)
         notice["pdf_sha256"] = hashlib.sha256(pdf).hexdigest()
-        notice["filename"] = self._filename(contract, period)
+        notice["filename"] = self._filename(contract, period, issue_date)
         cstate["notices"][period] = notice
         self._request_approval(route, contract, cstate, notice, pdf)
         self._audit({"type": "paynotice_request", "route": route.name, "contract": contract["id"], "period": period,
@@ -797,10 +797,12 @@ class PaymentNoticeRunner:
         next_month = closing + timedelta(days=1)
         return self._calendar.on_or_before(next_month.replace(day=int(contract.get("payment_day", 15))))
 
-    def _filename(self, contract: dict, period: str) -> str:
+    def _filename(self, contract: dict, period: str, issue_date: date) -> str:
+        """PDFの名前。先頭に発行日を「月.日」（半角・ゼロ埋めなし）で付ける（指示 2026-11-20。
+        作成手順の「〇.10-宮﨑大樹様-…」の「〇.10」は発行日）。発行日を直せば名前も変わる。"""
         year, month = (int(part) for part in period.split("-"))
-        pattern = str(contract.get("file_name") or "支払通知書{year}年{month}月分.pdf")
-        return pattern.format(year=year, month=month)
+        pattern = str(contract.get("file_name") or "{issue_month}.{issue_day}-支払通知書{year}年{month}月分.pdf")
+        return pattern.format(year=year, month=month, issue_month=issue_date.month, issue_day=issue_date.day)
 
     def _pdf_path(self, route: Route, contract: dict, period: str, version: int) -> Path:
         return self._root / "paynotice" / route.name / str(contract["id"]) / f"{period}-v{version}.pdf"
