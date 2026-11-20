@@ -56,6 +56,7 @@ MAX_IMAGE_BYTES = 4_500_000   # これを超える画像は縮めてから読む
 MAX_IMAGE_SIDE = 2000
 MAX_AMOUNT = 10_000_000       # 読み違いの歯止め（これを超える金額は人が確かめる）
 MAX_RELAY_CHARS = 300
+MAX_OWNED = 300               # 承認ルームでの自分の投稿を覚えておく数（返信の見分け用）
 
 _FILE_RE = re.compile(r"\[download:(\d+)\](.*?)\[/download\]", re.S)
 _SIZE_TAIL_RE = re.compile(r"\s*\([\d.,]+\s*[KMG]?B\)\s*$", re.I)
@@ -401,6 +402,8 @@ class PaymentNoticeRunner:
         self._calendar = calendar
         self._root = config.resolve_path(config.state_dir)
         self._posts = 0
+        self._owned: list[str] = []   # 承認ルームでの自分の投稿ID（状態の owned と同じリスト）
+        self._owned_room = 0
 
     # --- 公開API ---
 
@@ -410,12 +413,58 @@ class PaymentNoticeRunner:
         if not settings.get("enabled"):
             return 0
         posted = 0
-        for route in self.routes():
-            try:
-                posted += self._run_route(route)
-            except Exception:
-                print(f"[error] 支払通知書（{route.name}）の処理に失敗: " + traceback.format_exc(), flush=True)
+        # 5分ごとの巡回と、承認の返信を合図にした即時処理（webhook側）の両方から呼ばれる。
+        # 同時に走ると二重に作り直し・交付するため、状態ファイルの隣のロックで直列にする
+        with self._locked():
+            for route in self.routes():
+                try:
+                    posted += self._run_route(route)
+                except Exception:
+                    print(f"[error] 支払通知書（{route.name}）の処理に失敗: " + traceback.format_exc(), flush=True)
         return posted
+
+    def owns_reply(self, room_id: int, target_id: str) -> bool:
+        """その返信先は、支払通知書の承認ルームでの自分の投稿か（承認依頼・PDF・催促・直した旨の返事）。
+
+        webhook 側が、これへの返信を通常の質問応答へ回さないために使う。実例（2026-11-20 19:32・19:36）:
+        承認依頼への「②を外して」「①を15万円に変更して」に、質問応答が「承知しました。作り直しますね」と
+        返した（こちらの処理とは無関係の返事で、後者は実際には誰も作り直していなかった）。
+        """
+        if not target_id or not self._settings().get("enabled"):
+            return False
+        for route in self.routes():
+            if int(route.approval_room or 0) != int(room_id):
+                continue
+            state = self._load(route)
+            if str(target_id) in set(state.get("owned") or []):
+                return True
+            for cstate in (state.get("contracts") or {}).values():
+                for notice in (cstate.get("notices") or {}).values():
+                    if str(target_id) in set(notice.get("request_ids") or []) | set(notice.get("old_request_ids") or []):
+                        return True
+        return False
+
+    def _locked(self):
+        """状態ファイルのロック（Linuxの flock。無い環境では何もしない）。"""
+        import contextlib
+
+        try:
+            import fcntl
+        except ImportError:  # Windows（テスト環境）
+            return contextlib.nullcontext()
+
+        @contextlib.contextmanager
+        def lock():
+            path = self._root / "paynotice.lock"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+
+        return lock()
 
     def routes(self) -> list[Route]:
         settings = self._settings()
@@ -472,6 +521,7 @@ class PaymentNoticeRunner:
             found = self.read_receipt(path.read_bytes(), path.name)
             self._add_receipts(contract, cstate, found, file_id=f"file{index}", message_id="", filename=path.name,
                                submitted=submitted, period=period)
+        self._owned, self._owned_room = state.setdefault("owned", []), route.approval_room
         notice = self._create(route, contract, cstate, period, self._now())
         self._save(route, state)
         return notice
@@ -484,6 +534,7 @@ class PaymentNoticeRunner:
         cstate = self._cstate(state, contract)
         if period in cstate["notices"]:
             raise NoticeError(f"{period_label(period)}分は既に作成済みです")
+        self._owned, self._owned_room = state.setdefault("owned", []), route.approval_room
         notice = self._create(route, contract, cstate, period, self._now())
         self._save(route, state)
         return notice
@@ -517,6 +568,8 @@ class PaymentNoticeRunner:
         now = self._now()
         before = json.dumps(state, sort_keys=True, ensure_ascii=False)
         self._posts = 0
+        self._owned = state.setdefault("owned", [])
+        self._owned_room = route.approval_room
         for contract in self.contracts():
             cstate = self._cstate(state, contract)
             if route.intake:
@@ -527,6 +580,7 @@ class PaymentNoticeRunner:
         self._approvals(route, state, now)
         self._retry_delivery(route, state, now)
         self._remind(route, state, now)
+        del self._owned[:-MAX_OWNED]
         if json.dumps(state, sort_keys=True, ensure_ascii=False) != before:
             self._save(route, state)
         return self._posts
@@ -929,42 +983,58 @@ class PaymentNoticeRunner:
                     self._reply(route.approval_room, message,
                                 f"その版は作り直しています。最新は第{notice['version']}版ですので、そちらの投稿への返信でお願いします。")
                     break
+            else:
+                # 支払通知書についての自分の投稿（交付の知らせ・古い版の案内など）への返信で、
+                # どの版の話か決められないもの。黙らずに、返信先を案内する
+                if targets & set(state.get("owned") or []):
+                    current = waiting()
+                    if current:
+                        _, _, notice = current[0]
+                        link = message_url(route.approval_room, notice["request_ids"][0]) if notice.get("request_ids") else ""
+                        self._reply(route.approval_room, message,
+                                    f"承認や直しのご指示は、第{notice['version']}版の承認依頼の投稿への返信でお願いします。\n{link}")
 
     def _on_reply(self, route: Route, contract: dict, cstate: dict, notice: dict, message: dict, me: int,
                   now: datetime) -> None:
         body = strip_own_mention(str(message.get("body") or ""), me)
         text = strip_tags(body).strip()
+        def answer(reply_text: str, to: dict | None = None) -> None:
+            # この返事への返信も、同じ版への返信として読めるように結び付ける
+            mid = self._reply(route.approval_room, message, reply_text)
+            if mid:
+                (to or notice).setdefault("request_ids", []).append(mid)
+
         if is_plain_approval(text):
             self._approve(route, contract, cstate, notice, message, now)
             return
         try:
             found = self._read_reply(text, notice)
         except ModelUnavailable:
-            self._reply(route.approval_room, message,
-                        "ご返信を読み取れませんでした。承認の場合は「承認」とだけ、もう一度ご返信ください。")
+            answer("ご返信を読み取れませんでした。承認の場合は「承認」とだけ、もう一度ご返信ください。")
             return
         if found.get("intent") == "approve" and not found.get("ops"):
             self._approve(route, contract, cstate, notice, message, now)
             return
         if found.get("intent") != "revise" or not found.get("ops"):
             hint = f"（{found['question']}）" if found.get("question") else ""
-            self._reply(route.approval_room, message,
-                        f"承認か直しのご指示かを読み取れませんでした{hint}。承認の場合は「承認」、"
-                        "直す場合は「②を外して」「業務委託費を50,000円に」のようにお知らせください。")
+            answer(f"承認か直しのご指示かを読み取れませんでした{hint}。承認の場合は「承認」、"
+                   "直す場合は「②を外して」「業務委託費を50,000円に」のようにお知らせください。")
             return
         try:
             done = self._apply(cstate, notice, found["ops"])
         except NoticeError as exc:
-            self._reply(route.approval_room, message, f"ご指示を反映できませんでした（{exc}）。もう一度お知らせください。")
+            answer(f"ご指示を反映できませんでした（{exc}）。もう一度お知らせください。")
             return
         try:
             rebuilt = self._create(route, contract, cstate, notice["period"], now, previous=notice)
         except Exception as exc:
             print("[error] 支払通知書の作り直しに失敗: " + traceback.format_exc(), flush=True)
-            self._reply(route.approval_room, message, f"作り直しに失敗しました（{exc}）。")
+            answer(f"作り直しに失敗しました（{exc}）。")
             return
-        self._reply(route.approval_room, message,
-                    "直しました（" + "、".join(done) + f"）。第{rebuilt['version']}版を上に投稿しています。ご確認のうえ、そちらへ「承認」とご返信ください。")
+        # 実例（2026-11-20 19:35）: この「直しました」への返信で次の直し（「①を15万円に変更して」）が来た。
+        # 承認依頼そのものへの返信でなかったため読めず、誰も作り直さなかった
+        answer("直しました（" + "、".join(done) + f"）。第{rebuilt['version']}版を投稿しています。"
+               "ご確認のうえ「承認」とご返信ください（続けて直すときも、返信でお知らせください）。", to=rebuilt)
         self._audit({"type": "paynotice_revised", "route": route.name, "contract": contract["id"],
                      "period": notice["period"], "version": rebuilt["version"], "by": _account_of(message)})
 
@@ -1261,7 +1331,9 @@ class PaymentNoticeRunner:
         except Exception:
             print("[warn] 支払通知書の投稿に失敗: " + traceback.format_exc(), flush=True)
             return ""
-        self._posts = getattr(self, "_posts", 0) + 1
+        self._posts += 1
+        if mid and int(room_id) == int(self._owned_room or 0):
+            self._owned.append(mid)
         return mid
 
     def _reply(self, room_id: int, message: dict, text: str) -> str:

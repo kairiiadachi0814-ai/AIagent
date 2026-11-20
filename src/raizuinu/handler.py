@@ -181,6 +181,12 @@ class RaizuinuHandler:
             from .linksync import HandbookSync
 
             self._handbook_sync = HandbookSync(cfg, self._chatwork, cost=self._cost)
+        # 支払通知書の承認依頼への返信（「承認」「②を外して」）。質問応答へ回さず、その場で処理を進める
+        self._pay_notice = overrides.get("pay_notice")
+        if self._pay_notice is None and (cfg.data.get("payment_notice") or {}).get("enabled"):
+            from .paynotice import PaymentNoticeRunner
+
+            self._pay_notice = PaymentNoticeRunner(cfg, self._chatwork, cost=self._cost)
         # 通知管理くんのメンションを合図に、その場でFAXを読みに行く（5分の巡回を待たない）
         self._fax_watch_factory = overrides.get("fax_watch_factory")
         if self._fax_watch_factory is None and (cfg.fax_watch or {}).get("enabled"):
@@ -319,6 +325,21 @@ class RaizuinuHandler:
         question = event.question
         if not question:
             return
+
+        # 支払通知書の承認依頼（とその続きの投稿）への返信は、支払通知書の処理だけが返事をする。
+        # 実例（2026-11-20 19:32・19:36）: 「②を外して」「①を15万円に変更して」に、質問応答が
+        # 「承知しました。作り直しますね」と返した（実際の処理とは無関係の、裏付けのない返事）
+        if self._pay_notice is not None:
+            from .doctask import reply_target
+
+            if self._pay_notice.owns_reply(event.room_id, reply_target(event.body or "")):
+                try:
+                    self._pay_notice.run_once()  # 5分の巡回を待たずに進める
+                except Exception:
+                    print("[warn] 支払通知書の即時処理に失敗: " + traceback.format_exc(), flush=True)
+                self._audit_safely({"type": "paynotice_reply", "room_id": event.room_id,
+                                    "account_id": event.account_id, "message_id": event.message_id})
+                return
 
         # 聞き返し中の依頼は1往復ぶんだけ有効。読んだ時点で消し、
         # 再度聞き返すときに改めて保存する

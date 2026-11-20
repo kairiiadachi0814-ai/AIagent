@@ -549,10 +549,90 @@ def test_a_correction_rebuilds_the_notice_and_asks_again(env):
     posts = env.cw.posts(APPROVAL_ROOM)
     assert "支払通知書（第2版）" in posts[-2] and "① 11/30 ヤマトライジング業務委託費 50,000円" in posts[-2]
     assert "載せていない証憑:" in posts[-2] and "（外す指示あり）" in posts[-2]
-    assert "直しました（業務委託費を50,000円に、②を外す）。第2版を上に投稿しています。" in posts[-1]
+    assert "直しました（業務委託費を50,000円に、②を外す）。第2版を投稿しています。" in posts[-1]
     assert len(env.cw.uploads) == 2 and all(u[0] == APPROVAL_ROOM for u in env.cw.uploads)
     # 行の一覧をモデルへ渡している
     assert "2（②）: 証憑「立替：交通費（近畿日本鉄道）」" in env.model.calls[-1][1]
+
+
+def last_bot_reply(env, room=APPROVAL_ROOM):
+    return next(m["message_id"] for m in reversed(env.cw.rooms[room]) if m["account"]["account_id"] == ME
+                and m["body"].startswith("[rp aid="))
+
+
+def test_a_second_correction_as_a_reply_to_the_fixed_it_message_is_read(env):
+    # 実例（2026-11-20 19:35 のリハーサル）: 「②を外して」で第2版ができた後、「直しました」の返事への返信で
+    # 「①を15万円に変更して」と頼まれた。承認依頼そのものへの返信でなかったため読めず、作り直さなかった
+    request = december(env)
+    env.cw.reply(APPROVAL_ROOM, ADACHI, request, "②を外して")
+    env.model.replies.append({"intent": "revise", "question": "", "ops": [op("exclude_receipt", number=2)]})
+    env.clock.now = at(12, 1, 10, 0)
+    env.runner.run_once()
+    fixed = last_bot_reply(env)
+    assert "直しました（②を外す）" in env.cw.posts(APPROVAL_ROOM)[-1]
+    env.cw.reply(APPROVAL_ROOM, ADACHI, fixed, "①を15万円に変更して")
+    env.model.replies.append({"intent": "revise", "question": "", "ops": [op("set_fee_amount", amount=150000)]})
+    env.runner.run_once()
+    notice = state_of(env)["notices"]["2026-11"]
+    assert notice["version"] == 3 and notice["total"] == 150000
+    assert "直しました（業務委託費を150,000円に）。第3版を投稿しています。" in env.cw.posts(APPROVAL_ROOM)[-1]
+    # 続けて、その返事への返信で承認できる
+    env.cw.reply(APPROVAL_ROOM, ADACHI, last_bot_reply(env), "承認")
+    env.runner.run_once()
+    assert state_of(env)["notices"]["2026-11"]["status"] == ISSUED
+    assert env.cw.uploads[-1][0] == PAYEE_ROOM and env.cw.uploads[-1][2] == env.cw.uploads[-2][2]
+
+
+def test_the_fixed_it_message_of_an_old_version_does_not_approve_the_new_one(env):
+    request = december(env)
+    env.cw.reply(APPROVAL_ROOM, ADACHI, request, "②を外して")
+    env.model.replies.append({"intent": "revise", "question": "", "ops": [op("exclude_receipt", number=2)]})
+    env.clock.now = at(12, 1, 10, 0)
+    env.runner.run_once()
+    second = last_bot_reply(env)   # 第2版の「直しました」
+    env.cw.reply(APPROVAL_ROOM, ADACHI, second, "業務委託費を5万円に")
+    env.model.replies.append({"intent": "revise", "question": "", "ops": [op("set_fee_amount", amount=50000)]})
+    env.runner.run_once()
+    env.cw.reply(APPROVAL_ROOM, SAKATA, second, "承認")   # 第3版ができた後に、第2版の返事へ承認
+    env.runner.run_once()
+    notice = state_of(env)["notices"]["2026-11"]
+    assert notice["status"] == AWAITING and notice["version"] == 3
+    assert "最新は第3版です" in env.cw.posts(APPROVAL_ROOM)[-1]
+
+
+def test_replies_to_our_posts_are_ours_not_questions(env):
+    request = december(env)
+    runner = env.runner
+    assert runner.owns_reply(APPROVAL_ROOM, request)
+    assert not runner.owns_reply(APPROVAL_ROOM, "999999") and not runner.owns_reply(APPROVAL_ROOM, "")
+    assert not runner.owns_reply(PAYEE_ROOM, request)          # 別のルームの同じ番号は関係ない
+    env.cw.reply(APPROVAL_ROOM, ADACHI, request, "②を外して")
+    env.model.replies.append({"intent": "revise", "question": "", "ops": [op("exclude_receipt", number=2)]})
+    env.clock.now = at(12, 1, 10, 0)
+    runner.run_once()
+    assert runner.owns_reply(APPROVAL_ROOM, request)           # 古い版の承認依頼
+    assert runner.owns_reply(APPROVAL_ROOM, last_bot_reply(env))   # 「直しました」の返事
+    pdf_post = next(m["message_id"] for m in reversed(env.cw.rooms[APPROVAL_ROOM]) if "[download:" in m["body"])
+    runner.run_once()
+    assert runner.owns_reply(APPROVAL_ROOM, pdf_post)          # 添付したPDFの投稿
+
+
+def test_a_reply_to_the_delivery_note_is_pointed_to_the_request(env):
+    # 交付の知らせなど、どの版の話か決められない投稿への返信は、黙らずに返信先を案内する
+    request = december(env)
+    env.cw.reply(APPROVAL_ROOM, ADACHI, request, "⑨を外して")
+    env.model.replies.append({"intent": "revise", "question": "", "ops": [op("exclude_receipt", number=9)]})
+    env.clock.now = at(12, 1, 10, 0)
+    env.runner.run_once()
+    asked = last_bot_reply(env)   # 「ご指示を反映できませんでした」— これは同じ版への返事として読む
+    env.cw.reply(APPROVAL_ROOM, ADACHI, asked, "承認")
+    env.runner.run_once()
+    assert state_of(env)["notices"]["2026-11"]["status"] == ISSUED
+    delivered = last_bot_reply(env)   # 「承認ありがとうございます。…交付しました」
+    env.cw.reply(APPROVAL_ROOM, SAKATA, delivered, "ありがとうございます")
+    env.runner.run_once()
+    assert env.runner.owns_reply(APPROVAL_ROOM, delivered)
+    assert "交付しました" in env.cw.posts(APPROVAL_ROOM)[-1]   # 承認待ちが無ければ、何も足さない
 
 
 def test_the_file_name_follows_the_issue_date(env):
