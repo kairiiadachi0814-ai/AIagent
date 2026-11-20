@@ -78,6 +78,18 @@ def test_a_row_is_added_inside_the_range_and_copied(client):
     assert paste["copyPaste"]["source"]["endColumnIndex"] == 18
 
 
+def test_a_row_format_is_copied_without_touching_values(client):
+    sheets, http = client
+    sheets.copy_row_format(77, 21, 22, 24, "R")
+    paste = http.calls[-1][3]["requests"][0]["copyPaste"]
+    assert paste["pasteType"] == "PASTE_FORMAT"
+    assert (paste["source"]["startRowIndex"], paste["source"]["endRowIndex"]) == (20, 21)
+    assert (paste["destination"]["startRowIndex"], paste["destination"]["endRowIndex"]) == (21, 24)
+    calls = len(http.calls)
+    sheets.copy_row_format(77, 21, 22, 21, "R")   # 写す先が無ければ何もしない
+    assert len(http.calls) == calls
+
+
 def test_the_pdf_leaves_out_cell_notes(client):
     sheets, http = client
     assert sheets.export_pdf(77) == b"%PDF-1.4 fake"

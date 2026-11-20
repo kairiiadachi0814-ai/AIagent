@@ -769,6 +769,10 @@ class PaymentNoticeRunner:
         first, last = int(layout["first_row"]), int(layout["last_row"])
         for _ in range(max(0, len(lines) - (last - first + 1))):
             client.add_row_like(sheet_id, last, str(layout["last_column"]))
+        # ひな形は2行目（21行目）までしか書式が整っていない（3行目から文字が小さく、配置も違う。
+        # 2026-11-20 のリハーサルで確認）。証憑の行は2行目の書式にそろえる
+        format_row = int(layout.get("format_row") or first + 1)
+        client.copy_row_format(sheet_id, format_row, format_row + 1, first + len(lines) - 1, str(layout["last_column"]))
         values: dict[str, Any] = {str(layout["issue_date"]): date.fromisoformat(notice["issue_date"])}
         for offset, line in enumerate(lines):
             row = first + offset

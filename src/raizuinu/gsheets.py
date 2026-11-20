@@ -168,6 +168,19 @@ class SheetsClient:
             }},
         ])
 
+    def copy_row_format(self, sheet_id: int, source_row: int, first_row: int, last_row: int, last_column: str) -> None:
+        """source_row の書式（文字の大きさ・配置・表示形式）を first_row〜last_row へ写す。値と結合は変えない。"""
+        if last_row < first_row:
+            return
+        end = column_index(last_column) + 1
+        self._batch([{"copyPaste": {
+            "source": {"sheetId": sheet_id, "startRowIndex": source_row - 1, "endRowIndex": source_row,
+                       "startColumnIndex": 0, "endColumnIndex": end},
+            "destination": {"sheetId": sheet_id, "startRowIndex": first_row - 1, "endRowIndex": last_row,
+                            "startColumnIndex": 0, "endColumnIndex": end},
+            "pasteType": "PASTE_FORMAT",
+        }}])
+
     def delete_sheet(self, sheet_id: int) -> None:
         """タブを消す。呼ぶ側は、自分で作ったタブのIDだけを渡すこと。"""
         self._batch([{"deleteSheet": {"sheetId": int(sheet_id)}}])

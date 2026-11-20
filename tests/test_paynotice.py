@@ -103,7 +103,7 @@ class FakeSheets:
     def __init__(self):
         self.tabs = {TEMPLATE: {"id": 1, "cells": {"L20": 1, "M20": "式", "N20": 100000}, "rows": 0}}
         self._next = 100
-        self.deleted, self.wrong_total = [], None
+        self.deleted, self.wrong_total, self.formatted = [], None, []
 
     def sheets(self):
         return [{"id": t["id"], "title": name, "index": i, "hidden": False, "rows": 45}
@@ -120,6 +120,10 @@ class FakeSheets:
 
     def add_row_like(self, sheet_id, row, last_column):
         next(t for t in self.tabs.values() if t["id"] == sheet_id)["rows"] += 1
+
+    def copy_row_format(self, sheet_id, source_row, first_row, last_row, last_column):
+        if last_row >= first_row:
+            self.formatted.append((source_row, first_row, last_row))
 
     def write(self, title, values):
         self.tabs[title]["cells"].update(values)
@@ -435,6 +439,7 @@ def test_the_request_shows_every_line_and_the_way_to_answer(env):
 def test_a_month_without_receipts_has_only_the_fee(env):
     env.clock.now = at(12, 1, 9, 0)
     env.runner.run_once()
+    assert env.sheets.formatted == []   # 2行目までは、ひな形の書式のまま
     notice = state_of(env)["notices"]["2026-11"]
     assert notice["total"] == 100000 and len(notice["lines"]) == 1
     assert "事前に承認されたもの" not in env.cw.posts(APPROVAL_ROOM)[0]
@@ -457,6 +462,7 @@ def test_more_receipts_than_rows_add_rows(env):
     env.runner.run_once()
     tab = env.sheets.tabs["2026年11月(源泉なし)"]
     assert tab["rows"] == 2 and tab["cells"]["N36"] == 116   # 17行（定例1＋16件）で、ひな形の15行に2行足す
+    assert env.sheets.formatted == [(21, 22, 36)]            # 3行目からは、2行目の書式にそろえる
     assert state_of(env)["notices"]["2026-11"]["total"] == 100000 + sum(100 + d for d in range(1, 17))
 
 
