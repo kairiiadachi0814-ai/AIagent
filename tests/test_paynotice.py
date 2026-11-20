@@ -583,6 +583,39 @@ def test_nothing_is_delivered_without_an_approval(env):
     assert "承認か直しのご指示かを読み取れませんでした" in env.cw.posts(APPROVAL_ROOM)[-1]
 
 
+def test_an_approval_on_the_pdf_right_after_it_was_posted_is_ours(env):
+    # 実例（2026-11-20 21:32 のリハーサル）: 添付の1分後に、PDFの投稿へ「承認」と返信された。添付の投稿IDを
+    # まだ控えていなかったので webhook 側が見分けられず、マニュアル更新の処理が「どの件のお返事か分からなかった」と返した
+    december(env)
+    pdf_post = next(m["message_id"] for m in env.cw.rooms[APPROVAL_ROOM] if "[download:" in m["body"])
+    path = env.tmp / "state" / "paynotice.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    notice = state["contracts"]["miyazaki"]["notices"]["2026-11"]
+    notice["request_ids"] = [i for i in notice["request_ids"] if i != pdf_post]   # 添付の直後（まだ結び付けていない）
+    path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    assert env.runner.owns_reply(APPROVAL_ROOM, pdf_post)        # ファイルIDで見分ける
+    other = env.cw.attach(APPROVAL_ROOM, SHINODA, ["別の資料.pdf"])
+    assert not env.runner.owns_reply(APPROVAL_ROOM, other)       # 人が上げた別のファイルは、こちらのものではない
+    env.cw.reply(APPROVAL_ROOM, ADACHI, pdf_post, "承認")
+    env.runner.run_once()                                         # webhook 側が、その場で回す
+    assert state_of(env)["notices"]["2026-11"]["status"] == ISSUED
+
+
+def test_the_pdf_of_an_old_version_is_treated_as_the_old_request(env):
+    request = december(env)
+    old_pdf = next(m["message_id"] for m in env.cw.rooms[APPROVAL_ROOM] if "[download:" in m["body"])
+    env.cw.reply(APPROVAL_ROOM, ADACHI, request, "②を外して")
+    env.model.replies.append({"intent": "revise", "question": "", "ops": [op("exclude_receipt", number=2)]})
+    env.clock.now = at(12, 1, 10, 0)
+    env.runner.run_once()
+    assert env.runner.owns_reply(APPROVAL_ROOM, old_pdf)
+    env.cw.reply(APPROVAL_ROOM, SAKATA, old_pdf, "承認")          # 古い版のPDFへの承認では交付しない
+    env.runner.run_once()
+    notice = state_of(env)["notices"]["2026-11"]
+    assert notice["status"] == AWAITING and "最新は第2版です" in env.cw.posts(APPROVAL_ROOM)[-1]
+    assert all(u[0] == APPROVAL_ROOM for u in env.cw.uploads)
+
+
 def test_a_reply_to_the_attached_pdf_counts_too(env):
     # 添付の投稿IDは作った時点では分からない（APIはファイルIDしか返さない）。次に一覧を見たときに結び付ける
     december(env)

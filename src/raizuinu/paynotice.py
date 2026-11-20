@@ -458,6 +458,7 @@ class PaymentNoticeRunner:
         """
         if not target_id or not self._settings().get("enabled"):
             return False
+        file_ids: set[str] = set()
         for route in self.routes():
             if int(route.approval_room or 0) != int(room_id):
                 continue
@@ -468,7 +469,28 @@ class PaymentNoticeRunner:
                 for notice in (cstate.get("notices") or {}).values():
                     if str(target_id) in set(notice.get("request_ids") or []) | set(notice.get("old_request_ids") or []):
                         return True
-        return False
+                    file_ids |= self._file_ids(notice)
+        if not file_ids:
+            return False
+        # PDFを添付した投稿は、投稿IDをまだ控えていないことがある（APIはファイルIDしか返さず、結び付けは
+        # 次に一覧を見たとき）。返信先の投稿を見て、こちらが添付したファイルかどうかで見分ける。
+        # 実例（2026-11-20 21:32）: 添付の1分後にPDFの投稿へ「承認」と返信され、見分けられずに
+        # マニュアル更新の処理が「どの件のお返事か分からなかった」と返した
+        try:
+            messages = self._chatwork.get_recent_messages(int(room_id), limit=100)
+        except Exception:
+            print("[warn] 返信先の確認に失敗: " + traceback.format_exc(), flush=True)
+            return False
+        body = next((str(m.get("body") or "") for m in messages if str(m.get("message_id")) == str(target_id)), "")
+        return any(f"[download:{file_id}]" in body for file_id in file_ids)
+
+    @staticmethod
+    def _file_ids(notice: dict) -> set[str]:
+        """その支払通知書について、こちらが添付したファイルのID（確認用のPDF・古い版・交付したPDF）。"""
+        ids = set(notice.get("request_file_ids") or []) | set(notice.get("old_request_file_ids") or [])
+        if notice.get("delivery_file_id"):
+            ids.add(str(notice["delivery_file_id"]))
+        return {str(i) for i in ids if i}
 
     def owns_room(self, room_id: int) -> bool:
         """委託先の専用ルームか（webhook 側が、メンションを合図にその場で受付を回すために使う）。"""
@@ -949,6 +971,8 @@ class PaymentNoticeRunner:
             "built_at": now.isoformat(),
             "request_ids": [],
             "old_request_ids": list((previous or {}).get("old_request_ids") or []) + list((previous or {}).get("request_ids") or []),
+            "old_request_file_ids": list((previous or {}).get("old_request_file_ids") or [])
+            + list((previous or {}).get("request_file_ids") or []),
             "reminded": dict((previous or {}).get("reminded") or {}),
             # 行の番号は一度振ったら変えない（外した行も、その番号のまま「載せていない証憑」に残す）
             "numbers": self._numbers_of(previous),
@@ -1151,7 +1175,7 @@ class PaymentNoticeRunner:
             print("[warn] 承認ルームの取得に失敗: " + traceback.format_exc(), flush=True)
             return
         newest = max((int(m.get("message_id", 0)) for m in messages), default=0)
-        self._link_uploads(waiting(), messages)
+        self._link_uploads(state, messages)
         last_seen = state.get("approval_last_seen")
         if not waiting():
             state["approval_last_seen"] = max(newest, int(last_seen or 0))
@@ -1545,15 +1569,26 @@ class PaymentNoticeRunner:
         self._send(route.approval_room, self._heads(route) + "\n" + route.banner + text)
 
     @staticmethod
-    def _link_uploads(waiting: list[tuple[dict, dict, dict]], messages: list[dict]) -> None:
-        """PDFを添付した投稿を承認依頼に結び付ける（その投稿への返信も、承認として読めるように）。"""
-        for _, _, notice in waiting:
-            for file_id in notice.get("request_file_ids") or []:
+    def _link_uploads(state: dict, messages: list[dict]) -> None:
+        """PDFを添付した投稿を、その版の承認依頼に結び付ける（その投稿への返信も、承認として読めるように）。
+
+        古い版のPDFは古い版の依頼に、交付したPDFは自分の投稿の控えに結び付ける。
+        """
+        posts = [(str(m.get("message_id")), str(m.get("body") or "")) for m in messages]
+
+        def link(file_ids: Any, into: list) -> None:
+            for file_id in file_ids or []:
                 marker = f"[download:{file_id}]"
-                for message in messages:
-                    mid = str(message.get("message_id"))
-                    if marker in str(message.get("body") or "") and mid not in notice.setdefault("request_ids", []):
-                        notice["request_ids"].append(mid)
+                for mid, body in posts:
+                    if marker in body and mid not in into:
+                        into.append(mid)
+
+        for cstate in (state.get("contracts") or {}).values():
+            for notice in (cstate.get("notices") or {}).values():
+                link(notice.get("request_file_ids"), notice.setdefault("request_ids", []))
+                link(notice.get("old_request_file_ids"), notice.setdefault("old_request_ids", []))
+                link([notice.get("delivery_file_id")] if notice.get("delivery_file_id") else [],
+                     state.setdefault("owned", []))
 
     def _audit(self, record: dict) -> None:
         try:
