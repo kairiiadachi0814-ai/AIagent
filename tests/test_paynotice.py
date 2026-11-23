@@ -191,11 +191,13 @@ def env(tmp_path):
     config.data["payment_notice"]["payment_request"] = {}
     cw, sheets, model = FakeChatwork(), FakeSheets(), FakeModel()
     clock = SimpleNamespace(now=datetime(2026, 11, 20, 10, 0, tzinfo=JST))
+    naps = []
     runner = PaymentNoticeRunner(
         config, cw, client=model, now=lambda: clock.now, sheets=lambda spreadsheet_id: sheets,
-        download=lambda url: (200, b"\xff\xd8image-bytes"), calendar=Calendar(HOLIDAYS),
+        download=lambda url: (200, b"\xff\xd8image-bytes"), calendar=Calendar(HOLIDAYS), sleep=naps.append,
     )
-    return SimpleNamespace(config=config, cw=cw, sheets=sheets, model=model, clock=clock, runner=runner, tmp=tmp_path)
+    return SimpleNamespace(config=config, cw=cw, sheets=sheets, model=model, clock=clock, runner=runner, tmp=tmp_path,
+                           naps=naps)
 
 
 def state_of(env, name="paynotice.json"):
@@ -926,6 +928,67 @@ def test_on_approval_the_payment_is_requested_with_the_pdf_and_the_receipts(env)
     assert len(env.cw.uploads) == 5                                    # 一度だけ
 
 
+def test_the_request_and_the_receipts_appear_in_the_order_they_were_sent(env):
+    # 実例（2026-11-20 21:51 のリハーサル）: Chatworkは添付を受け取ってから投稿として並べるまでに間があり、
+    # その長さがファイルごとに違う。続けて送ったら「証憑② → 依頼文とPDF → 証憑③」の順に並んだ。
+    # 1つ前の添付が投稿として並んだのを確かめてから、次を送る
+    with_payment_request(env)
+    request = two_receipts(env)
+    cw = env.cw
+    slow = []   # [残りの確認回数, 並べる投稿]
+
+    def upload(room_id, filename, data, message=""):
+        cw._next += 1
+        file_id = cw._next
+        cw.uploads.append((room_id, filename, data, message))
+        delay = 3 if filename.endswith(".pdf") and room_id == PAYMENT_ROOM else 0   # PDFだけ並ぶのが遅い
+        slow.append([delay, room_id, f"{message}[download:{file_id}]{filename}[/download]"])
+        release()
+        return str(file_id)
+
+    def release():
+        for entry in list(slow):
+            if entry[0] <= 0:
+                cw._add(entry[1], ME, entry[2])
+                slow.remove(entry)
+
+    def recent(room_id, limit=100):
+        for entry in slow:
+            entry[0] -= 1
+        release()
+        return list(cw.rooms.get(room_id, []))[-limit:]
+
+    cw.upload_file, cw.get_recent_messages = upload, recent
+    cw.reply(APPROVAL_ROOM, SAKATA, request, "承認")
+    env.clock.now = at(12, 1, 10, 14)
+    env.runner.run_once()
+    order = [m["body"].split("[download:")[0][:14] for m in cw.rooms[PAYMENT_ROOM]]
+    assert order == ["[To:8681926]坂田", "承認済みの証憑（②）です。", "承認済みの証憑（③）です。"]   # 依頼文とPDF → ② → ③
+    assert len(env.naps) >= 2                                              # 並ぶのを待った
+    assert state_of(env)["notices"]["2026-11"]["payment_request"]["status"] == "done"
+
+
+def test_a_post_that_never_shows_up_does_not_block_the_rest(env):
+    with_payment_request(env)
+    env.config.data["payment_notice"]["payment_request"]["order_wait_seconds"] = 3
+    request = december(env)
+    cw = env.cw
+    real = cw.upload_file
+
+    def upload(room_id, filename, data, message=""):
+        if room_id != PAYMENT_ROOM:
+            return real(room_id, filename, data, message)
+        cw.uploads.append((room_id, filename, data, message))   # 一覧には出てこない
+        cw._next += 1
+        return str(cw._next)
+
+    cw.upload_file = upload
+    cw.reply(APPROVAL_ROOM, SAKATA, request, "承認")
+    env.runner.run_once()
+    assert state_of(env)["notices"]["2026-11"]["payment_request"]["status"] == "done"
+    assert [u[1] for u in cw.uploads if u[0] == PAYMENT_ROOM][1:] == ["IMG_0001.jpg"] and len(env.naps) == 6   # 3秒ずつ待って先へ
+
+
 def test_only_the_receipts_on_the_approved_version_are_sent(env):
     with_payment_request(env)
     request = two_receipts(env)
@@ -1030,6 +1093,7 @@ def test_a_rehearsal_sends_the_payment_request_to_the_admin_room(env, tmp_path):
     env.runner.run_once()
     assert [u[0] for u in env.cw.uploads] == [ADMIN_ROOM] * 4          # 確認用・交付・振込依頼のPDF・証憑
     assert env.cw.uploads[2][3].startswith(f"[To:{ADACHI}]\n【リハーサル】【振込のお願い】宮﨑 大樹様 2026年10月分")
+    assert "（承認: 足立さん・" in env.cw.uploads[2][3]   # リハーサルでも承認者を名前で書く
     assert (env.cw.uploads[3][1], env.cw.uploads[3][2], env.cw.uploads[3][3]) == ("sample.jpg", b"\xff\xd8sample", "【リハーサル】承認済みの証憑（②）です。")
     assert env.cw.posts(PAYMENT_ROOM) == [] and env.cw.posts(PAYEE_ROOM) == []   # 本番のルームには出さない
     assert "あわせてこのルーム（リハーサルのため）へ、振込の依頼を出しました" in env.cw.posts(ADMIN_ROOM)[-1]

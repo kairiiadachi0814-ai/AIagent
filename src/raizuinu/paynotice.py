@@ -58,6 +58,8 @@ MAX_IMAGE_SIDE = 2000
 MAX_AMOUNT = 10_000_000       # 読み違いの歯止め（これを超える金額は人が確かめる）
 MAX_RELAY_CHARS = 300
 MAX_OWNED = 300               # 承認ルームでの自分の投稿を覚えておく数（返信の見分け用）
+ORDER_WAIT_SECONDS = 30       # 添付が投稿として並ぶのを待つ上限（並びを保つため）
+ORDER_POLL_SECONDS = 1.0
 
 _FILE_RE = re.compile(r"\[download:(\d+)\](.*?)\[/download\]", re.S)
 _SIZE_TAIL_RE = re.compile(r"\s*\([\d.,]+\s*[KMG]?B\)\s*$", re.I)
@@ -411,6 +413,7 @@ class PaymentNoticeRunner:
         sheets: Callable[[str], Any] | None = None,
         download: Callable[[str], tuple[int, bytes]] | None = None,
         calendar: Calendar | None = None,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         self._config = config
         self._chatwork = chatwork
@@ -419,6 +422,11 @@ class PaymentNoticeRunner:
         self._now = now or (lambda: datetime.now(JST))
         self._sheets = sheets or self._default_sheets
         self._download = download or _http_download
+        if sleep is None:
+            import time
+
+            sleep = time.sleep
+        self._sleep = sleep
         if calendar is None:
             from .letterpack import load_holidays
 
@@ -1411,6 +1419,8 @@ class PaymentNoticeRunner:
             file_id = self._chatwork.upload_file(room_id, notice["filename"], pdf,
                                                  message=self._delivery_text(route, contract, notice, target))
             self._posts += 1
+            if int(route.payment_room or 0) == room_id:
+                self._wait_posted(room_id, file_id)  # 続く振込の依頼より先に並ぶように
         except Exception as exc:
             print("[error] 支払通知書の交付に失敗: " + traceback.format_exc(), flush=True)
             if not notice.get("delivery_failed_at"):
@@ -1499,9 +1509,8 @@ class PaymentNoticeRunner:
                 pdf = Path(notice["pdf"]).read_bytes()
                 if hashlib.sha256(pdf).hexdigest() != notice.get("pdf_sha256"):
                     raise NoticeError("保存したPDFが承認時のものと一致しません")
-                self._chatwork.upload_file(route.payment_room, notice["filename"], pdf,
-                                           message=self._payment_text(route, contract, notice, len(evidence)))
-                self._posts += 1
+                self._upload_in_order(route.payment_room, notice["filename"], pdf,
+                                      self._payment_text(route, contract, notice, len(evidence)))
                 sent.append("pdf")
             for file_id, entry in evidence:
                 key = f"file:{file_id}"
@@ -1514,9 +1523,8 @@ class PaymentNoticeRunner:
                     link = self._receipt_link(int(contract.get("room_id", 0) or 0), entry["receipt"]).strip()
                     problems.append(f"{marks} {entry['filename']}（{why}）　{link}")
                 else:
-                    self._chatwork.upload_file(route.payment_room, entry["filename"], data,
-                                               message=f"{route.banner}承認済みの証憑（{marks}）です。")
-                    self._posts += 1
+                    self._upload_in_order(route.payment_room, entry["filename"], data,
+                                          f"{route.banner}承認済みの証憑（{marks}）です。")
                 sent.append(key)
             if problems and "problems" not in sent:
                 self._send(route.payment_room, f"{route.banner}次の証憑は添付できませんでした。元の投稿でご確認ください。\n"
@@ -1536,19 +1544,54 @@ class PaymentNoticeRunner:
                      "not_attached": len(problems)})
         return True
 
+    def _upload_in_order(self, room_id: int, filename: str, data: bytes, message: str) -> str:
+        """ファイルを添付し、それが投稿としてルームに並ぶまで待つ。→ ファイルID
+
+        Chatworkは、ファイルを受け取ってから投稿として並べるまでに間があり、その長さがファイルごとに違う。
+        続けて送ると、送った順に並ばない——実例（2026-11-20 21:51 のリハーサル）: 「依頼文とPDF → 証憑② → 証憑③」の
+        順に送ったが、PDFの投稿が並ぶ前に証憑②が並び、「証憑② → 依頼文とPDF → 証憑③」になった。
+        """
+        file_id = str(self._chatwork.upload_file(int(room_id), filename, data, message=message) or "")
+        self._posts += 1
+        self._wait_posted(int(room_id), file_id)
+        return file_id
+
+    def _wait_posted(self, room_id: int, file_id: Any) -> bool:
+        """添付した投稿がルームの一覧に出るまで待つ（上限つき。出なくても先へ進む）。"""
+        if not file_id:
+            return False
+        settings = self._settings().get("payment_request") or {}
+        limit = float(settings.get("order_wait_seconds", ORDER_WAIT_SECONDS))
+        client = getattr(self._chatwork, "_client", self._chatwork)  # 巡回の取りまとめ（1回分の控え）を通さず、いまの一覧を見る
+        marker = f"[download:{file_id}]"
+        waited = 0.0
+        while True:
+            try:
+                if any(marker in str(m.get("body") or "") for m in client.get_recent_messages(room_id, limit=20)):
+                    return True
+            except Exception:
+                print("[warn] 添付の投稿の確認に失敗: " + traceback.format_exc(), flush=True)
+            if waited >= limit:
+                print(f"[warn] 添付 {file_id} が投稿として並ぶのを確認できませんでした（{limit:.0f}秒）。先へ進みます", flush=True)
+                return False
+            self._sleep(ORDER_POLL_SECONDS)
+            waited += ORDER_POLL_SECONDS
+
     def _payment_text(self, route: Route, contract: dict, notice: dict, evidence_count: int) -> str:
         heads = " ".join(f"[To:{r['account_id']}]{r['name'] + 'さん' if r.get('name') else ''}"
                          for r in route.payment_recipients or [] if r.get("account_id"))
-        approver = next((a.get("name") for a in route.approvers
-                         if int(a.get("account_id") or 0) == int(notice.get("approved_by") or 0)), "") or "承認者"
+        known = list(route.approvers) + list(self._settings().get("approvers") or [])
+        approver = next((a["name"] for a in known if a.get("name")
+                         and int(a.get("account_id") or 0) == int(notice.get("approved_by") or 0)), "")
         approved = _parse_iso(notice.get("approved_at"))
-        when = f"・{approved.month}/{approved.day} {approved:%H:%M}" if approved else ""
+        when = f"{approved.month}/{approved.day} {approved:%H:%M}" if approved else ""
+        approval = "・".join(x for x in (f"{approver}さん" if approver else "", when) if x) or "済み"
         payment = date.fromisoformat(notice["payment_date"])
         numbers = notice.get("numbers") or {}
         fee = next((line["label"] for line in notice["lines"] if line["kind"] == "fee"), "業務委託費")
         lines = [
             f"{route.banner}【振込のお願い】{contract.get('payee', '')}様 {period_label(notice['period'])}分（{fee}）",
-            f"支払通知書を交付しました（承認: {approver}さん{when}）。次のとおり、振込の手配をお願いします。",
+            f"支払通知書を交付しました（承認: {approval}）。次のとおり、振込の手配をお願いします。",
             f"支払予定日: {jp_date(payment)}",
             f"支払金額: {yen(notice['total'])}",
         ]
