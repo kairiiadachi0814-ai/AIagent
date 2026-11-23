@@ -59,6 +59,7 @@ MAX_IMAGE_SIDE = 2000
 MAX_AMOUNT = 10_000_000       # 読み違いの歯止め（これを超える金額は人が確かめる）
 MAX_RELAY_CHARS = 300
 MAX_OWNED = 300               # 承認ルームでの自分の投稿を覚えておく数（返信の見分け用）
+TEST_INDENT = "　 "            # 読み取りテストの返信で、番号「① 」の下にそろえる字下げ
 ORDER_WAIT_SECONDS = 30       # 添付が投稿として並ぶのを待つ上限（並びを保つため）
 ORDER_POLL_SECONDS = 1.0
 
@@ -264,6 +265,68 @@ def clean_registration(text: Any) -> tuple[str, bool]:
     return value, bool(_REGISTRATION_RE.match(value))
 
 
+REG_OK, REG_LENGTH, REG_CHECK, REG_REPAIRED = "ok", "length", "check", "repaired"
+REG_NOTES = {
+    REG_LENGTH: "桁数が合わず、読み違いの疑いがあります",
+    REG_CHECK: "法人番号の検査用の数字と合いません。個人の事業者の番号でなければ、読み違いの疑いがあります",
+}
+_RUN_RE = re.compile(r"(\d)\1+")
+
+
+def registration_check_digit(body: str) -> int:
+    """法人番号の検査用の数字（13桁の先頭の1桁）。body は残りの12桁。
+
+    9 −（下の桁から数えて奇数番目の数字×1 と 偶数番目の数字×2 の合計 を9で割った余り）。
+    実物で確かめた番号（2026-11-23 の読み取りテスト）: T4120001256055・T3810281025762・T2810826779764。
+    """
+    total = sum(int(d) * (1 if i % 2 == 0 else 2) for i, d in enumerate(reversed(body)))
+    return 9 - total % 9
+
+
+def registration_verdict(text: Any) -> tuple[str, str]:
+    """登録番号 → (整えた番号, 判定)。判定は "" 記載なし／REG_OK／REG_LENGTH 桁数が合わない／REG_CHECK 検査用の数字が合わない。
+
+    登録番号は、法人なら「T＋法人番号」で、先頭の1桁が残り12桁から決まる。1文字の読み違いはここで分かる。
+    個人の事業者の番号は法人番号ではないので、合わなくても誤りとは決めつけない（REG_CHECK は「確かめてほしい」まで）。
+    """
+    number, shaped = clean_registration(text)
+    if not number:
+        return "", ""
+    if not shaped:
+        return number, REG_LENGTH
+    return number, REG_OK if int(number[1]) == registration_check_digit(number[2:]) else REG_CHECK
+
+
+def repair_registration(number: str) -> str:
+    """桁が1つ多い・少ない番号を、同じ数字が続く所の数え違いとみて直す。→ 直した番号（1つに決められなければ空）
+
+    実例: 「T4120001256055」を「T41200001256055」（2026-11-23）、「T4120001210276」を「T41200001210276」
+    （2026-11-20）と、0 が3つ続く所を4つに読んだ。続いている所から1つ除いた（足した）候補のうち、
+    検査用の数字が合うものが**ちょうど1つ**のときだけ採る。採った番号は、人に確かめてもらう。
+    """
+    match = re.match(r"^T(\d{12}|\d{14})$", number or "")
+    if not match:
+        return ""
+    digits = match.group(1)
+    candidates = set()
+    for run in _RUN_RE.finditer(digits):
+        if len(digits) == 14:
+            candidates.add(digits[:run.start()] + digits[run.start() + 1:])
+        else:
+            candidates.add(digits[:run.start()] + run.group(1) + digits[run.start():])
+    good = sorted(c for c in candidates if int(c[0]) == registration_check_digit(c[1:]))
+    return "T" + good[0] if len(good) == 1 else ""
+
+
+def registration_of(raw: dict) -> tuple[str, str, str]:
+    """読み取った証憑の登録番号 → (番号, 判定, 添える一言)。`read_receipt` が確かめた結果があればそれを使う。"""
+    if "registration_verdict" in raw:
+        return str(raw.get("registration") or ""), str(raw.get("registration_verdict") or ""), \
+            str(raw.get("registration_note") or "")
+    number, verdict = registration_verdict(raw.get("registration"))
+    return number, verdict, REG_NOTES.get(verdict, "")
+
+
 def blocks_listing(issues: list[str]) -> bool:
     """載せられない問題か（金額・日付が読めない、金額が大きすぎる）。"""
     return any("読み取れません" in i or "金額が大きい" in i for i in issues)
@@ -285,7 +348,8 @@ RECEIPT_SYSTEM = """あなたは経理担当の補助として、領収書・レ
 - purpose: 何の支払いかを短く（「交通費（近鉄奈良〜大阪難波）」「駐車料金」「文具」「会議飲食代」）。品目や但し書きから読み取れる範囲で。分からなければ空。
 - kind: 「領収書」「レシート」「利用明細」「その他」のいずれか。
 - tax_note: 税率の記載（「10%」「8%（軽減）」「10%と8%」「記載なし」）。
-- registration: 適格請求書発行事業者の登録番号（T＋13桁）。記載が無ければ空。
+- registration: 適格請求書発行事業者の登録番号（「T」＋数字13桁）。左から1文字ずつ読み、同じ数字が続く所（「000」など）は
+  数を数えて、13桁になることを確かめる。13桁に読めないときは、数を合わせずに読めたとおりに書く。記載が無ければ空。
 
 書かれていることだけを書き、推測で埋めないでください。数字が不鮮明で確信が持てないときは、amount を 0 にして note にその旨を書きます。"""
 
@@ -312,6 +376,32 @@ RECEIPT_SCHEMA: dict[str, Any] = {
         "note": {"type": "string"},
     },
     "required": ["receipts", "note"],
+    "additionalProperties": False,
+}
+
+REGISTRATION_SYSTEM = """登録番号だけを読み直す担当です。証憑の画像と、先に読んだ登録番号（桁数か検査用の数字が合わなかったもの）の一覧が渡されます。
+一覧の証憑それぞれについて、画像に書かれた登録番号（適格請求書発行事業者の登録番号。「T」に続けて数字13桁）を読み直してください。
+
+- 先の読みは当てにせず、画像を見て左から1文字ずつ読みます。
+- 同じ数字が続く所（「000」「0000」など）は数え違いが起きやすいので、1つずつ数えます。
+- 読んだ数字が13桁になることを確かめます。ならなければ、続いている所をもう一度見直します。
+- それでも13桁に読めないとき・不鮮明なときは、数を合わせるために足したり削ったりせず、読めたとおりに書きます。
+- registration は「T」と数字だけ（区切りなし）。記載が見当たらなければ空。index は一覧の番号です。"""
+
+REGISTRATION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "numbers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"index": {"type": "integer"}, "registration": {"type": "string"}},
+                "required": ["index", "registration"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["numbers"],
     "additionalProperties": False,
 }
 
@@ -811,8 +901,8 @@ class PaymentNoticeRunner:
                 "stored": stored,
             }
             # 登録番号は、形（T＋13桁）が合うものだけ控える（合わない番号は読み違いの疑い）
-            number, valid = clean_registration(raw.get("registration"))
-            receipt["registration"] = number if valid else ""
+            number, verdict, _ = registration_of(raw)
+            receipt["registration"] = number if verdict and verdict != REG_LENGTH else ""
             issues = check_receipt(receipt, submitted.date(), term_start, cstate["receipts"])
             receipt["issues"] = issues
             receipt["status"] = REVIEW if blocks_listing(issues) else OK
@@ -950,7 +1040,7 @@ class PaymentNoticeRunner:
                 note = str(found.get("note") or "").strip()
                 lines.append("　領収書として読み取れませんでした。" + (f"（{note}）" if note else ""))
                 continue
-            for raw in receipts:
+            for position, raw in enumerate(receipts):
                 receipt = {
                     "date": str(raw.get("date") or "").strip(),
                     "payee": str(raw.get("payee") or "").strip(),
@@ -962,17 +1052,22 @@ class PaymentNoticeRunner:
                 seen.append(receipt)
                 count += 1
                 day = _parse_date(receipt["date"])
+                # 証憑ごとに番号を振り、1枚ずつ間を空ける（指摘 2026-11-23: 3枚写った写真の結果が羅列になり、
+                # どこからどこまでが1枚か確かめにくかった）。番号は、この返信の中の通し番号
+                if position:
+                    lines.append("")
                 lines.append(
-                    f"　日付: {jp_date(day) if day else '読み取れず'}／支払先: {receipt['payee'] or '読み取れず'}／"
+                    f"{circled(count)} 日付: {jp_date(day) if day else '読み取れず'}／支払先: {receipt['payee'] or '読み取れず'}／"
                     f"金額: {yen(receipt['amount']) if receipt['amount'] else '読み取れず'}"
                 )
-                number, valid = clean_registration(raw.get("registration"))
-                shown = "記載なし" if not number else (number if valid else f"{number}（桁数が合わず、読み違いの疑いがあります）")
-                lines.append(f"　用途: {receipt['purpose'] or '読み取れず'}／種類: {raw.get('kind') or '-'}／"
-                             f"税率の記載: {raw.get('tax_note') or '-'}／登録番号: {shown}")
-                lines.append(f"　支払通知書の内容欄: {receipt_label(receipt)}")
+                number, _, note = registration_of(raw)
+                shown = "記載なし" if not number else number + (f"（{note}）" if note else "")
+                lines.append(f"{TEST_INDENT}用途: {receipt['purpose'] or '読み取れず'}／種類: {raw.get('kind') or '-'}／"
+                             f"税率の記載: {raw.get('tax_note') or '-'}")
+                lines.append(f"{TEST_INDENT}登録番号: {shown}")
+                lines.append(f"{TEST_INDENT}支払通知書の内容欄: {receipt_label(receipt)}")
                 for issue in issues:
-                    lines.append(f"　【要確認】{issue}")
+                    lines.append(f"{TEST_INDENT}【要確認】{issue}")
         lines.append("読み違いがあれば、どの項目が違うかを教えてください。")
         self._reply(room_id, message, "\n".join(lines))
         self._audit({"type": "paynotice_test_read", "contract": contract["id"],
@@ -1727,7 +1822,58 @@ class PaymentNoticeRunner:
             block = {"type": "image", "source": {"type": "base64", "media_type": media_type,
                                                  "data": base64.standard_b64encode(data).decode("ascii")}}
         content = [block, {"type": "text", "text": f"この画像（{filename}）に写っている証憑を書き出してください。"}]
-        return self._ask_model(RECEIPT_SYSTEM, RECEIPT_SCHEMA, content)
+        found = self._ask_model(RECEIPT_SYSTEM, RECEIPT_SCHEMA, content)
+        self._settle_registrations(found, block, filename)
+        return found
+
+    def _settle_registrations(self, found: dict, block: dict, filename: str) -> None:
+        """読んだ登録番号を確かめ、合わないものは読み直す。結果を各証憑の registration／_verdict／_note に書く。
+
+        実例（2026-11-23 の読み取りテスト）: 3枚写ったレシートの1枚目「T4120001256055」を「T41200001256055」と読んだ
+        （0 が3つ続く所を4つに。2026-11-20 にも別の番号で同じ読み違い）。対策は3段:
+        (1) 桁数（T＋13桁）と検査用の数字で確かめる。
+        (2) 合わない番号だけ、画像をもう一度見せて読み直させる（1つの画像につき1回）。検査用の数字まで合えば採る。
+        (3) それでも桁が1つ違うなら、続いている数字の数え違いとして直せるかを見る（`repair_registration`）。
+            直した番号には、その旨と「画像でご確認ください」を添える。決められなければ、疑いがある旨を添える。
+        """
+        receipts = [r for r in found.get("receipts") or [] if isinstance(r, dict)]
+        doubtful = []
+        for index, raw in enumerate(receipts, 1):
+            number, verdict = registration_verdict(raw.get("registration"))
+            raw.update(registration=number, registration_verdict=verdict, registration_note=REG_NOTES.get(verdict, ""))
+            if verdict in (REG_LENGTH, REG_CHECK):
+                doubtful.append((index, raw, number, verdict))
+        if not doubtful:
+            return
+        again: dict[int, Any] = {}
+        rows = [
+            f"{index}: 支払先「{raw.get('payee') or '不明'}」／金額 {raw.get('amount') or '不明'}円／先の読み「{number}」"
+            + (f"（数字が{len(number) - 1}桁で、13桁と合わない）" if verdict == REG_LENGTH else "（13桁だが、検査用の数字が合わない）")
+            for index, raw, number, verdict in doubtful
+        ]
+        try:
+            answer = self._ask_model(
+                REGISTRATION_SYSTEM, REGISTRATION_SCHEMA,
+                [block, {"type": "text", "text": f"この画像（{filename}）の、次の証憑の登録番号を読み直してください。\n" + "\n".join(rows)}],
+                effort="medium",
+            )
+            for entry in answer.get("numbers") or []:
+                if isinstance(entry, dict) and isinstance(entry.get("index"), int):
+                    again[entry["index"]] = entry.get("registration")
+        except ModelUnavailable:
+            pass  # 読み直せなくても、最初の読みと補正で先へ進む
+        for index, raw, number, verdict in doubtful:
+            second, second_verdict = registration_verdict(again.get(index))
+            if second_verdict == REG_OK:
+                raw.update(registration=second, registration_verdict=REG_OK, registration_note="")
+                continue
+            fixed = repair_registration(number) or repair_registration(second)
+            if fixed:
+                raw.update(registration=fixed, registration_verdict=REG_REPAIRED,
+                           registration_note=f"「{number}」と読みましたが桁数が合わないため、検査用の数字が合う形に直しています。"
+                                             "画像でご確認ください")
+            elif verdict == REG_LENGTH and second_verdict == REG_CHECK:
+                raw.update(registration=second, registration_verdict=REG_CHECK, registration_note=REG_NOTES[REG_CHECK])
 
     def _read_reply(self, text: str, notice: dict) -> dict:
         rows = []
@@ -1738,7 +1884,7 @@ class PaymentNoticeRunner:
         ask = "[支払通知書の行]\n" + "\n".join(rows) + f"\n\n[承認者の返信]\n{text}"
         return self._ask_model(REVISE_SYSTEM, REVISE_SCHEMA, ask)
 
-    def _ask_model(self, system: str, schema: dict, content: Any) -> dict:
+    def _ask_model(self, system: str, schema: dict, content: Any, effort: str = "low") -> dict:
         from .answer import _call_with_continuation
 
         cfg = self._config
@@ -1750,7 +1896,7 @@ class PaymentNoticeRunner:
             kwargs = {
                 "model": cfg.model,
                 "max_tokens": int(self._settings().get("max_tokens", 4000)),
-                "output_config": {"effort": "low", "format": {"type": "json_schema", "schema": schema}},
+                "output_config": {"effort": effort, "format": {"type": "json_schema", "schema": schema}},
                 "system": system,
             }
             response, usage, _ = _call_with_continuation(

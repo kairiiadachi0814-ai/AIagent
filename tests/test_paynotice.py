@@ -27,6 +27,8 @@ from raizuinu.paynotice import (
     PaymentNoticeRunner,
     attachments_of,
     clean_registration,
+    registration_verdict,
+    repair_registration,
     build_lines,
     check_receipt,
     is_plain_approval,
@@ -151,6 +153,7 @@ class FakeSheets:
 class FakeModel:
     def __init__(self):
         self.receipts, self.replies, self.calls, self.fail = {}, [], [], 0
+        self.rereads = {}   # 登録番号の読み直し: ファイル名 → {"numbers": [...]}
         self.messages = SimpleNamespace(create=self._create)
 
     def _create(self, messages, **kwargs):
@@ -158,7 +161,11 @@ class FakeModel:
             self.fail -= 1
             raise RuntimeError("overloaded")
         content = messages[0]["content"]
-        if "領収書・レシート" in kwargs["system"]:
+        if kwargs["system"].startswith("登録番号だけ"):
+            text = content[-1]["text"]
+            found = next((v for k, v in self.rereads.items() if k in text), {"numbers": []})
+            self.calls.append(("reread", text))
+        elif "領収書・レシート" in kwargs["system"]:
             text = content[-1]["text"]
             found = next((v for k, v in self.receipts.items() if k in text), {"receipts": [], "note": "証憑ではありません"})
             self.calls.append(("receipt", text))
@@ -407,24 +414,89 @@ def test_a_testers_receipt_is_read_and_reported_but_not_kept(env):
     # 指示（2026-11-20）: 宮﨑さんではなく足立さんが、宮﨑さんのルームに領収書の写真を上げて読み取りを試す
     env.config.data["payment_notice"]["live"] = False   # 本番前でも動く
     env.model.receipts["real.jpg"] = {"receipts": [{**receipt(payee="近畿日本鉄道株式会社", purpose="交通費（近鉄奈良〜大阪難波）", amount=680),
-                                                    "registration": "T1120001052417"}], "note": ""}
+                                                    "registration": "T2810826779764"}], "note": ""}
     mid = env.cw.attach(PAYEE_ROOM, ADACHI, ["real.jpg"])
     assert env.runner.run_once() == 1
     reply = env.cw.posts(PAYEE_ROOM)[0]
     assert reply.startswith(f"[rp aid={ADACHI} to={PAYEE_ROOM}-{mid}]\n【読み取りテスト】次のように読み取りました。"
                             "テストのため控えには残さず、支払通知書にも載せません。")
     assert "■ real.jpg" in reply
-    assert "日付: 11月12日（木）／支払先: 近畿日本鉄道株式会社／金額: 680円" in reply
-    assert "用途: 交通費（近鉄奈良〜大阪難波）／種類: 領収書／税率の記載: 10%／登録番号: T1120001052417" in reply
-    env.model.receipts["odd.jpg"] = {"receipts": [{**receipt(), "registration": "T41200001210276"}], "note": ""}
+    assert "① 日付: 11月12日（木）／支払先: 近畿日本鉄道株式会社／金額: 680円" in reply
+    assert "　 用途: 交通費（近鉄奈良〜大阪難波）／種類: 領収書／税率の記載: 10%\n　 登録番号: T2810826779764\n" in reply
+    env.model.receipts["odd.jpg"] = {"receipts": [{**receipt(), "registration": "T12345678901234"}], "note": ""}
     env.cw.attach(PAYEE_ROOM, ADACHI, ["odd.jpg"])
     env.runner.run_once()
-    assert "登録番号: T41200001210276（桁数が合わず、読み違いの疑いがあります）" in env.cw.posts(PAYEE_ROOM)[1]
+    assert "登録番号: T12345678901234（桁数が合わず、読み違いの疑いがあります）" in env.cw.posts(PAYEE_ROOM)[1]
     env.cw.sent.pop()
     assert "支払通知書の内容欄: 立替：交通費（近鉄奈良〜大阪難波） 近畿日本鉄道" in reply
     assert not (env.tmp / "state" / "paynotice.json").exists()   # 本番の控えには何も残らない
     env.runner.run_once()
     assert len(env.cw.posts(PAYEE_ROOM)) == 1                   # 同じ投稿を二度読まない
+
+
+def test_each_receipt_in_one_photo_gets_its_own_number(env):
+    # 指摘（2026-11-23）: レシート3枚を1枚の写真で上げたら、読み取りの結果が羅列になり確かめにくかった。
+    # 証憑ごとに①②…を振り、1枚ずつ間を空ける。番号は返信の中の通し番号（2つ目の写真は続き）
+    env.model.receipts["three.jpg"] = {"receipts": [
+        {**receipt(day="2026-11-03", payee="MY NEIGHBOR", amount=6917, purpose="飲食代"), "registration": "T4120001256055"},
+        {**receipt(day="2026-11-03", payee="セブン-イレブン 大阪靱本町2丁目店", amount=500, purpose="飲食料品"), "registration": "T3810281025762"},
+        {**receipt(day="2026-11-03", payee="LAWSON 近鉄奈良駅前店", amount=873, purpose="飲食料品"), "registration": "T2810826779764"},
+    ], "note": ""}
+    env.model.receipts["one.jpg"] = {"receipts": [receipt()], "note": ""}
+    env.cw.attach(PAYEE_ROOM, ADACHI, ["three.jpg", "one.jpg"])
+    env.runner.run_once()
+    reply = env.cw.posts(PAYEE_ROOM)[0]
+    assert ("■ three.jpg（3件）\n"
+            "① 日付: 11月3日（火）／支払先: MY NEIGHBOR／金額: 6,917円\n"
+            "　 用途: 飲食代／種類: 領収書／税率の記載: 10%\n"
+            "　 登録番号: T4120001256055\n"
+            "　 支払通知書の内容欄: 立替：飲食代（MY NEIGHBOR）\n"
+            "\n"
+            "② 日付: 11月3日（火）／支払先: セブン-イレブン 大阪靱本町2丁目店／金額: 500円\n") in reply
+    assert "\n\n③ 日付: 11月3日（火）／支払先: LAWSON 近鉄奈良駅前店／金額: 873円\n" in reply
+    assert "■ one.jpg\n④ 日付: 11月12日（木）" in reply
+    assert [c[0] for c in env.model.calls] == ["receipt", "receipt"]   # 番号が合っていれば読み直さない
+
+
+def test_a_registration_number_that_does_not_add_up_is_read_again(env):
+    # 実例（2026-11-23）: 「T4120001256055」を「T41200001256055」と読んだ（0 が3つ続く所を4つに）
+    wrong = {**receipt(payee="MY NEIGHBOR", amount=6917, purpose="飲食代"), "registration": "T41200001256055"}
+    env.model.receipts["a.jpg"] = {"receipts": [receipt(amount=300), wrong], "note": ""}
+    env.model.rereads["a.jpg"] = {"numbers": [{"index": 2, "registration": "T4120001256055"}]}
+    env.cw.attach(PAYEE_ROOM, ADACHI, ["a.jpg"])
+    env.runner.run_once()
+    reply = env.cw.posts(PAYEE_ROOM)[0]
+    assert "登録番号: T4120001256055\n" in reply and "T41200001256055" not in reply   # 読み直して、検査用の数字まで合った
+    kind, asked = env.model.calls[-1]
+    assert kind == "reread" and "2: 支払先「MY NEIGHBOR」／金額 6917円／先の読み「T41200001256055」（数字が14桁で、13桁と合わない）" in asked
+    assert "1: " not in asked                                                       # 番号の無い証憑は聞かない
+
+
+def test_a_miscounted_run_is_repaired_and_shown_as_such(env):
+    # 読み直しても同じ読み違いなら、続いている数字の数え違いとして直し、その旨を添えて人に確かめてもらう
+    env.model.receipts["b.jpg"] = {"receipts": [{**receipt(), "registration": "T41200001256055"}], "note": ""}
+    env.model.rereads["b.jpg"] = {"numbers": [{"index": 1, "registration": "T41200001256055"}]}
+    env.cw.attach(PAYEE_ROOM, ADACHI, ["b.jpg"])
+    env.runner.run_once()
+    assert ("登録番号: T4120001256055（「T41200001256055」と読みましたが桁数が合わないため、"
+            "検査用の数字が合う形に直しています。画像でご確認ください）") in env.cw.posts(PAYEE_ROOM)[0]
+
+
+def test_a_number_that_fails_the_check_digit_is_flagged_not_dropped(env):
+    # 13桁でも、1文字の読み違いは検査用の数字で分かる。個人の事業者の番号かもしれないので、決めつけない
+    env.model.receipts["c.jpg"] = {"receipts": [{**receipt(), "registration": "T4120001256065"}], "note": ""}
+    env.cw.attach(PAYEE_ROOM, ADACHI, ["c.jpg"])
+    env.runner.run_once()
+    assert ("登録番号: T4120001256065（法人番号の検査用の数字と合いません。"
+            "個人の事業者の番号でなければ、読み違いの疑いがあります）") in env.cw.posts(PAYEE_ROOM)[0]
+
+
+def test_the_kept_registration_number_is_the_checked_one(env):
+    env.model.receipts["IMG_0001.jpg"] = {"receipts": [{**receipt(), "registration": "T41200001256055"}], "note": ""}
+    env.model.receipts["IMG_0002.jpg"] = {"receipts": [{**receipt(amount=500), "registration": "T12345678901234"}], "note": ""}
+    submit(env, names=("IMG_0001.jpg", "IMG_0002.jpg"))
+    env.runner.run_once()
+    assert [r["registration"] for r in state_of(env)["receipts"]] == ["T4120001256055", ""]   # 直せない番号は控えない
 
 
 def test_a_test_reading_shows_what_could_not_be_read(env):
@@ -1200,6 +1272,23 @@ def test_a_rehearsal_can_use_the_real_receipts_in_the_payee_room(env):
     assert (cells["B21"], cells["N21"], cells["K21"]) == (date(2026, 9, 25), 200, "※")
     assert (cells["B22"], cells["D22"], cells["N22"]) == (date(2026, 11, 16), "立替：駐車料金（パーキングプレイス油阪町第1）", 300)
     assert env.cw.posts(PAYEE_ROOM) == [] and not (env.tmp / "state" / "paynotice.json").exists()   # 本番には何も残さない
+
+
+def test_a_registration_number_carries_a_check_digit():
+    for real in ("T4120001256055", "T3810281025762", "T2810826779764", "T4120001210276"):   # 実物の番号
+        assert registration_verdict(real) == (real, "ok")
+    assert registration_verdict("T4120001256065") == ("T4120001256065", "check")             # 1文字違い
+    assert registration_verdict("T41200001256055") == ("T41200001256055", "length")
+    assert registration_verdict("") == ("", "")
+
+
+def test_a_miscounted_run_of_digits_can_be_repaired():
+    assert repair_registration("T41200001256055") == "T4120001256055"   # 実例 2026-11-23: 0 を1つ多く読んだ
+    assert repair_registration("T41200001210276") == "T4120001210276"   # 実例 2026-11-20
+    assert repair_registration("T412001256055") == "T4120001256055"     # 1つ少なく読んだ
+    assert repair_registration("T12345678901234") == ""                 # 続いている数字が無い
+    assert repair_registration("T4120001256055") == ""                  # 13桁は触らない
+    assert repair_registration("T412000001256055") == ""                # 2桁以上の違いは直さない
 
 
 def test_a_registration_number_must_be_t_and_thirteen_digits():
