@@ -260,7 +260,7 @@ def main() -> None:
     pending_updates = load_jsonl(state_dir / "pending_updates.jsonl")
 
     handbook = HandbookLoader(
-        roots=[config.resolve_path(r) for r in config.handbook["roots"]],
+        roots=config.handbook_roots,
         include=config.handbook["include"],
         exclude=config.handbook["exclude"],
     ).load()

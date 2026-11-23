@@ -16,7 +16,7 @@ def sign(body: bytes) -> str:
     return base64.b64encode(digest).decode()
 
 
-def payload(room_id=12345, message_id="200001") -> bytes:
+def payload(room_id=12345, message_id="200001", body="[To:999] 銀行明細の取得手順は？") -> bytes:
     return json.dumps(
         {
             "webhook_event_type": "mention_to_me",
@@ -25,7 +25,7 @@ def payload(room_id=12345, message_id="200001") -> bytes:
                 "to_account_id": 999,
                 "room_id": room_id,
                 "message_id": message_id,
-                "body": "[To:999] 銀行明細の取得手順は？",
+                "body": body,
                 "send_time": 1700000000,
             },
         }
@@ -92,6 +92,73 @@ def make_handler(tmp_path, monkeypatch, allowed_rooms=(12345,), answer=None):
         handbook_loader=HandbookLoader([tmp_path], ["*.md"], [], 300),
     )
     return handler, chatwork, generator, audit
+
+
+class TestPaymentNoticeReplies:
+    """支払通知書の承認依頼への返信は、質問応答へ回さない。
+
+    実例（2026-11-20 19:32・19:36 のリハーサル）: 承認依頼への「②を外して」「①を15万円に変更して」に、
+    質問応答が「承知しました。作り直しますね」と返した。後者は実際には誰も作り直していなかった。
+    """
+
+    class FakeRunner:
+        def __init__(self, owned):
+            self.owned, self.runs = set(owned), 0
+
+        def owns_reply(self, room_id, target_id):
+            return room_id == 12345 and target_id in self.owned
+
+        def owns_room(self, room_id):
+            return room_id == 453639844
+
+        def run_once(self):
+            self.runs += 1
+            return 1
+
+    def make(self, tmp_path, monkeypatch, owned=("777",)):
+        handler, chatwork, generator, audit = make_handler(tmp_path, monkeypatch)
+        handler._pay_notice = self.FakeRunner(owned)
+        return handler, chatwork, generator, audit
+
+    def test_a_reply_to_the_request_is_left_to_the_notice_flow(self, tmp_path, monkeypatch):
+        handler, chatwork, generator, audit = self.make(tmp_path, monkeypatch)
+        body = payload(body="[rp aid=999 to=12345-777]経理財務アシスタントさん\n①を15万円に変更して")
+        assert handler.handle_webhook(body, sign(body)).status == 200
+        assert chatwork.sent == [] and generator.calls == []   # 質問応答は返事をしない
+        assert handler._pay_notice.runs == 1                   # 支払通知書の処理をその場で進める
+        assert audit.records[-1]["type"] == "paynotice_reply"
+
+    def test_other_replies_and_questions_are_answered_as_usual(self, tmp_path, monkeypatch):
+        handler, chatwork, generator, audit = self.make(tmp_path, monkeypatch)
+        body = payload(body="[rp aid=999 to=12345-555]経理財務アシスタントさん\n銀行明細の取得方法は？")
+        handler.handle_webhook(body, sign(body))
+        assert len(chatwork.sent) == 1 and handler._pay_notice.runs == 0
+        body = payload(body="[To:999]経理財務アシスタントさん\n銀行明細の取得方法は？", message_id="200002")
+        handler.handle_webhook(body, sign(body))
+        assert len(chatwork.sent) == 2 and handler._pay_notice.runs == 0
+
+    def test_a_mention_in_the_payee_room_starts_the_intake_and_answers_nothing(self, tmp_path, monkeypatch):
+        # 委託先のルームは許可ルームではない。質問には答えず、証憑の受付を回すだけ
+        handler, chatwork, generator, audit = self.make(tmp_path, monkeypatch)
+        body = payload(room_id=453639844, body="[To:999]経理財務アシスタントさん\n領収書です[download:9]a.jpg[/download]")
+        result = handler.handle_webhook(body, sign(body))
+        assert result.status == 200 and "証憑の受付" in result.detail
+        assert handler._pay_notice.runs == 1 and chatwork.sent == [] and generator.calls == []
+        handler.handle_webhook(body, sign(body))   # 再送では二度回さない
+        assert handler._pay_notice.runs == 1
+        other = payload(room_id=99999, message_id="200009")
+        assert "許可外ルーム" in handler.handle_webhook(other, sign(other)).detail
+
+    def test_a_failure_in_the_notice_flow_does_not_fall_back_to_an_answer(self, tmp_path, monkeypatch):
+        handler, chatwork, generator, audit = self.make(tmp_path, monkeypatch)
+
+        def boom():
+            raise RuntimeError("sheets down")
+
+        handler._pay_notice.run_once = boom
+        body = payload(body="[rp aid=999 to=12345-777]経理財務アシスタントさん\n承認")
+        assert handler.handle_webhook(body, sign(body)).status == 200
+        assert chatwork.sent == [] and generator.calls == []   # 巡回がやり直すので、ここでは何も返さない
 
 
 class TestHandleWebhook:
