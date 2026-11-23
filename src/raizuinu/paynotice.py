@@ -48,6 +48,7 @@ from .faxwatch import JST, WEEKDAYS, _account_of, _parse_iso, at_clock, circled,
     reply_targets, strip_own_mention, strip_tags
 
 LIVE, REHEARSAL = "live", "rehearsal"
+TRIAL_BANNER = "【試し送信】"   # 振込の依頼だけを試しに出すとき（rehearse_payment）
 AWAITING, ISSUED = "awaiting", "issued"
 OK, REVIEW, EXCLUDED = "ok", "review", "excluded"
 
@@ -638,6 +639,32 @@ class PaymentNoticeRunner:
         notice = self._create(route, contract, cstate, period, self._now())
         self._save(route, state)
         return notice
+
+    def rehearse_payment(self, period: str, contract_id: str | None = None) -> int:
+        """リハーサルの控えにある支払通知書で、振込の依頼だけを管理者ルームへ試しに出す。→ 投稿した数
+
+        並びや文面を確かめるためのもの（指示 2026-11-23）。**リハーサルの経路でしか動かず、控えは変えない**
+        （承認待ちのままなら、承認すれば通常どおり交付と依頼が出る）。本番の経路には同じ入口を作らない
+        ——承認の無い支払通知書を、支払依頼のルームへ出す道になるため。
+        """
+        import copy
+        from dataclasses import replace
+
+        route = self.route(REHEARSAL)
+        contract = self.contract(contract_id)
+        with self._locked():
+            cstate = self._cstate(self._load(route), contract)
+            notice = (cstate.get("notices") or {}).get(period)
+            if not notice or not notice.get("pdf"):
+                raise NoticeError(f"{period_label(period)}分のリハーサルがありません。先に --rehearse で作ってください")
+            trial = copy.deepcopy(notice)
+            trial.pop("payment_request", None)
+            trial["status"], trial["trial"] = ISSUED, notice.get("status") != ISSUED
+            before = self._posts
+            if not self._request_payment(replace(route, banner=route.banner + TRIAL_BANNER), contract, cstate, trial,
+                                         self._now()):
+                raise NoticeError("振込の依頼を出しきれませんでした")
+            return self._posts - before
 
     def cleanup_rehearsal(self) -> list[str]:
         """リハーサルで作ったテスト用のタブを消し、リハーサルの控えを白紙に戻す。→ 消したタブの名前"""
@@ -1586,12 +1613,15 @@ class PaymentNoticeRunner:
         approved = _parse_iso(notice.get("approved_at"))
         when = f"{approved.month}/{approved.day} {approved:%H:%M}" if approved else ""
         approval = "・".join(x for x in (f"{approver}さん" if approver else "", when) if x) or "済み"
+        opening = f"支払通知書を交付しました（承認: {approval}）。次のとおり、振込の手配をお願いします。"
+        if notice.get("trial"):   # 承認前の試し送信。交付した・承認済みとは書かない
+            opening = "※並びと文面を確かめるための試し送信です（承認・交付はまだです）。本番では次の形で振込の手配をお願いします。"
         payment = date.fromisoformat(notice["payment_date"])
         numbers = notice.get("numbers") or {}
         fee = next((line["label"] for line in notice["lines"] if line["kind"] == "fee"), "業務委託費")
         lines = [
             f"{route.banner}【振込のお願い】{contract.get('payee', '')}様 {period_label(notice['period'])}分（{fee}）",
-            f"支払通知書を交付しました（承認: {approval}）。次のとおり、振込の手配をお願いします。",
+            opening,
             f"支払予定日: {jp_date(payment)}",
             f"支払金額: {yen(notice['total'])}",
         ]
@@ -1895,6 +1925,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--receipt", action="append", default=[], help="--rehearse で使う証憑のファイル（複数可）")
     parser.add_argument("--from-room", action="store_true",
                         help="--rehearse で、委託先のルームに上がっている添付（本人とテスト役の分）を証憑として使う")
+    parser.add_argument("--payment-test", metavar="YYYY-MM",
+                        help="リハーサルの支払通知書で、振込の依頼だけを管理者ルームへ試しに出す（控えは変えない）")
     parser.add_argument("--create", metavar="YYYY-MM", help="本番の経路で、その月の支払通知書を作って承認を求める")
     parser.add_argument("--read", metavar="FILE", help="証憑の読み取りだけを試す")
     parser.add_argument("--contract", default=None, help="契約のID（1件だけなら省略可）")
@@ -1910,6 +1942,8 @@ def main(argv: list[str] | None = None) -> None:
         notice = runner.rehearse(args.rehearse, [Path(p) for p in args.receipt], args.contract,
                                  from_room=args.from_room)
         print(f"リハーサルを始めました: {period_label(args.rehearse)}分 第{notice['version']}版 合計{yen(notice['total'])}")
+    elif args.payment_test:
+        print(f"振込の依頼を試しに出しました: {runner.rehearse_payment(args.payment_test, args.contract)}件")
     elif args.create:
         notice = runner.create(args.create, args.contract)
         print(f"承認を求めました: {period_label(args.create)}分 第{notice['version']}版 合計{yen(notice['total'])}")

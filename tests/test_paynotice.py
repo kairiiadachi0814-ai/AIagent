@@ -1099,6 +1099,27 @@ def test_a_rehearsal_sends_the_payment_request_to_the_admin_room(env, tmp_path):
     assert "あわせてこのルーム（リハーサルのため）へ、振込の依頼を出しました" in env.cw.posts(ADMIN_ROOM)[-1]
 
 
+def test_the_payment_request_alone_can_be_tried_in_the_rehearsal(env, tmp_path):
+    # 指示 2026-11-23: 振込の依頼だけをもう一度テストで送る。承認待ちの控えは変えない
+    with_payment_request(env)
+    env.config.data["payment_notice"]["live"] = False
+    image = tmp_path / "sample.jpg"
+    image.write_bytes(b"\xff\xd8sample")
+    env.model.receipts["sample.jpg"] = {"receipts": [receipt(day="2026-10-20")], "note": ""}
+    env.runner.rehearse("2026-10", [image])
+    before = state_of(env, "paynotice-rehearsal.json")
+    assert env.runner.rehearse_payment("2026-10") == 2
+    assert [(u[0], u[1][-4:]) for u in env.cw.uploads[1:]] == [(ADMIN_ROOM, ".pdf"), (ADMIN_ROOM, ".jpg")]   # PDF → 証憑
+    text = env.cw.uploads[1][3]
+    assert text.startswith(f"[To:{ADACHI}]\n【リハーサル】【試し送信】【振込のお願い】宮﨑 大樹様 2026年10月分")
+    assert "試し送信です（承認・交付はまだです）" in text and "交付しました" not in text
+    assert env.cw.uploads[2][3] == "【リハーサル】【試し送信】承認済みの証憑（②）です。"
+    assert state_of(env, "paynotice-rehearsal.json") == before                      # 控えは変えない（承認待ちのまま）
+    assert env.cw.posts(PAYMENT_ROOM) == [] and env.cw.posts(PAYEE_ROOM) == []      # 本番のルームには出さない
+    with pytest.raises(NoticeError):
+        env.runner.rehearse_payment("2026-09")                                      # リハーサルの無い月
+
+
 # --- 承認待ちの催促 ---
 
 
