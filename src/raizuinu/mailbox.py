@@ -24,6 +24,7 @@ import os
 import re
 import ssl
 from datetime import datetime, timedelta, timezone
+from email.header import decode_header
 from email.utils import getaddresses, parsedate_to_datetime
 from typing import Any, Callable
 
@@ -167,7 +168,65 @@ def _tidy(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+_JIS_ESCAPES = {b"\x1b$B": "kanji", b"\x1b$@": "kanji", b"\x1b(B": "ascii", b"\x1b(J": "ascii", b"\x1b(I": "kana"}
+
+
+def decode_jis(data: bytes) -> str:
+    """ISO-2022-JP（JIS）を読む。「髙」「①」「㈱」などの機種依存文字も読めるよう、Shift_JIS に直してから読む。
+
+    日本の業務メールは ISO-2022-JP にこれらの文字を混ぜて送ってくることが多く、標準の読み方では
+    その文字で止まる（実例 2026-11-24: 件名に「髙島屋」を含むメールの件名が丸ごと読めなかった）。
+    """
+    out, mode, i = bytearray(), "ascii", 0
+    data = bytes(data or b"")
+    while i < len(data):
+        escape = data[i:i + 3]
+        if escape in _JIS_ESCAPES:
+            mode, i = _JIS_ESCAPES[escape], i + 3
+            continue
+        byte = data[i]
+        if mode == "kanji" and i + 1 < len(data) and 0x21 <= byte <= 0x7E and 0x21 <= data[i + 1] <= 0x7E:
+            second = data[i + 1]
+            lead = ((byte - 0x21) >> 1) + (0x81 if byte <= 0x5E else 0xC1)
+            trail = second + (0x1F if second <= 0x5F else 0x20) if byte % 2 else second + 0x7E
+            out += bytes((lead, trail))
+            i += 2
+            continue
+        out.append(byte | 0x80 if mode == "kana" and 0x21 <= byte <= 0x5F else byte)
+        i += 1
+    return out.decode("cp932", "replace")
+
+
+def _is_jis(charset: Any) -> bool:
+    return str(charset or "").lower().replace("_", "-").startswith("iso-2022-jp")
+
+
+def decode_bytes(data: bytes, charset: Any) -> str:
+    """文字コードの名前に従って読む。読めない文字があっても止めない。"""
+    if _is_jis(charset):
+        return decode_jis(data)
+    for candidate in (str(charset or ""), "utf-8", "cp932"):
+        if not candidate or candidate.lower() == "unknown-8bit":
+            continue
+        try:
+            return data.decode(candidate)
+        except (LookupError, UnicodeError):
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def header_text(value: Any) -> str:
+    """件名・差出人名のヘッダーを読める文字にする（「=?iso-2022-jp?B?...?=」の形を解く）。"""
+    try:
+        chunks = decode_header(str(value or ""))
+    except Exception:
+        return str(value or "")
+    return "".join(decode_bytes(chunk, charset) if isinstance(chunk, bytes) else str(chunk) for chunk, charset in chunks)
+
+
 def _part_text(part: Any) -> str:
+    if _is_jis(part.get_content_charset()):
+        return decode_jis(part.get_payload(decode=True) or b"")
     try:
         return str(part.get_content())
     except (LookupError, UnicodeError, ValueError, KeyError):
@@ -194,8 +253,10 @@ def _ids(value: Any) -> list[str]:
 def parse_message(raw: bytes, received: datetime | None = None, partial: bool = False) -> dict[str, Any]:
     """メール1通 → 差出人・宛先・CC・件名・本文（今回の部分と引用）・添付の名前・返信関係のID。"""
     message = email.message_from_bytes(raw, policy=email.policy.default)
-    senders = getaddresses([str(v) for v in message.get_all("From", [])])
-    sender_name, sender = (senders[0][0].strip(), senders[0][1].lower()) if senders else ("", "")
+    # 件名と差出人名は、符号化されたままのヘッダーを自分で解く（機種依存文字で止まらないように）
+    plain = email.message_from_bytes(raw, policy=email.policy.compat32)
+    senders = getaddresses([str(v) for v in plain.get_all("From", [])])
+    sender_name, sender = (header_text(senders[0][0]).strip(), senders[0][1].lower()) if senders else ("", "")
     if received is None:
         try:
             received = parsedate_to_datetime(str(message.get("Date", "")))
@@ -234,7 +295,7 @@ def parse_message(raw: bytes, received: datetime | None = None, partial: bool = 
         "cc": _addresses(message, "Cc"),
         "received": received,
         "written": written,  # 差出人が送った日時（フォルダを移しても変わらない）
-        "subject": re.sub(r"\s+", " ", str(message.get("Subject", "") or "")).strip(),
+        "subject": re.sub(r"\s+", " ", header_text(plain.get("Subject", "") or "")).strip(),
         "attachments": names,
         "text": fresh,
         "quoted": quoted,

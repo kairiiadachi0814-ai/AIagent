@@ -339,7 +339,8 @@ def test_a_mail_and_its_reply_in_the_same_round_are_read_in_order(env):
     incoming(env, box="森", at=datetime(2026, 11, 19, 10, 30, tzinfo=JST))
     env.watcher.run_once()
     posts = room_posts(env)
-    assert "への返信を確認しました" in posts[0] and "取引先からメールが届いています。" in posts[1]
+    # 知らせる順も、届いたメール → 返信の確認
+    assert "取引先からメールが届いています。" in posts[0] and "への返信を確認しました" in posts[1]
     assert state_of(env)["open"] == []
 
 

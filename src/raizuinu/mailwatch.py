@@ -429,6 +429,8 @@ class MailWatcher:
         self._posted: list[str] = []  # 自分の投稿ID（状態の post_log と同じリスト）
         self._reader_factory = reader_factory  # メールサーバーの読み取りの差し替え（テスト用）
         self._notices: list[dict] = []
+        self._announced = 0
+        self._short_posts: dict[str, dict] = {}
         self._imap_new: dict[tuple[str, str], list[int]] = {}
 
     # --- 公開API ---
@@ -491,6 +493,8 @@ class MailWatcher:
         )
         arrived: list[dict] = []
         reads = 0
+        self._announced = 0
+        self._short_posts = {}
 
         # 1) メールサーバーを直接読む。届いたメールを先に、当社が送ったメールを後に見る
         #    （同じ巡回で届いたメールとその返信を、正しい順で突き合わせるため）
@@ -556,14 +560,16 @@ class MailWatcher:
             state["last_seen"] = mid
             self._save_state(state)
         self._backfill_links(state)
+        self._flush_short_posts(state)
         if arrived:
             self._announce(state, arrived, now)
+            self._announced += len(arrived)
         if self._morning_list(state, now):
             # その日の最初の巡回が午後だったとき、朝の一覧と当日の確認を続けて出さない
             state["lists"]["final"] = now.date().isoformat()
         self._final_check(state, now)
         self._save_state(state)
-        return len(arrived)
+        return self._announced
 
     # --- 届いたメール ---
 
@@ -572,7 +578,7 @@ class MailWatcher:
         settings = self._settings()
         mid = str(mail.get("ref"))
         if self._is_ours(mail):
-            return self._own_mail(state, mail, now)
+            return self._own_mail(state, mail, now, arrived)
         if matches_sender(mail["sender"], settings.get("skip_senders")):
             self._audit({"type": "mail_skip", "message_id": mid, "reason": "rule"})
             return 0
@@ -667,7 +673,7 @@ class MailWatcher:
 
     # --- 当社が送ったメール（返信の確認）---
 
-    def _own_mail(self, state: dict, mail: dict, now: datetime) -> int:
+    def _own_mail(self, state: dict, mail: dict, now: datetime, arrived: list[dict] | None = None) -> int:
         mid = str(mail.get("ref"))
         if is_forward(mail["subject"]):
             self._audit({"type": "mail_skip", "message_id": mid, "reason": "own_forward"})
@@ -693,6 +699,11 @@ class MailWatcher:
             self._audit({"type": "mail_skip", "message_id": mid, "reason": "own"})
             return 0
         link_id = str(mail.get("link_id") or "") or self._find_notice(mail)
+        if arrived:
+            # 同じ巡回で届いたメールの知らせを、その返信の確認より先に出す（読む順を崩さない）
+            self._announce(state, arrived, now)
+            self._announced += len(arrived)
+            arrived.clear()
         calls = 0
         for item in candidates:
             found = self._check_reply(item, mail)
@@ -714,10 +725,12 @@ class MailWatcher:
             }
             item.setdefault("replies", []).append(reply)
             if verdict == ANSWERED:
+                self._short_posts.pop(item["id"], None)
                 self._close(state, item, "reply", 0, now)
                 self._post_reply_confirmed(state, item, reply)
             else:
-                self._post_reply_short(item, reply)
+                # 途中経過の返信が続くことがある（実例 2026-11-23: 15分の間に2通）。知らせるのは最後の1通だけ
+                self._short_posts[item["id"]] = reply
         self._remember(state, mail, key)
         return calls
 
@@ -733,8 +746,19 @@ class MailWatcher:
         lines.append(f"{self._mark(item)} は完了にします。{self._remaining_phrase(state)}")
         self._send("\n".join(lines))
 
+    def _flush_short_posts(self, state: dict) -> None:
+        for item_id, reply in list(self._short_posts.items()):
+            item = next((i for i in state["open"] if i.get("id") == item_id), None)
+            if item is not None:
+                self._post_reply_short(item, reply)
+        self._short_posts = {}
+
     def _post_reply_short(self, item: dict, reply: dict) -> None:
-        """返信はあったが、求めに答えきっていないように読めるとき。決めつけず担当者に尋ねる。"""
+        """返信はあったが、求めに答えきっていないように読めるとき。決めつけず、呼び出さずに置く。
+
+        送った本人は途中経過だと分かっているので、ここでは To を付けない（残っていることは
+        翌朝の一覧で知らせる）。
+        """
         kind = "受け取りの連絡や後日の回答の予告" if reply["verdict"] == ACK_ONLY else "求めの一部への回答"
         lines = [
             f"{self._mark(item)} {self._who(item)} への返信を確認しました（{reply['by']}・{self._when(reply['at'])}）が、"
@@ -752,7 +776,7 @@ class MailWatcher:
             f"これで済んでいましたら、この投稿への返信で「{self._mark(item)} 対応完了」とお知らせください。"
             "お知らせがあるまで、返信待ちとして残しておきます。"
         )
-        mid = self._send(self._with_heads(item["recipients"], lines))
+        mid = self._send("\n".join(lines))
         if mid:
             item.setdefault("post_ids", []).append(mid)
 

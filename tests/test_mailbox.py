@@ -22,7 +22,9 @@ from raizuinu.mailbox import (
     MailboxError,
     MailboxReader,
     decode_folder,
+    decode_jis,
     fingerprint_sha256,
+    header_text,
     html_to_text,
     other_folders,
     parse_list_line,
@@ -77,6 +79,24 @@ def test_japanese_mails_in_the_usual_encodings_are_read(charset):
     mail = parse_message(build(subject="【要返信】年末年始のご案内", body="森様\n年末年始の休業日をご連絡ください。", charset=charset))
     assert mail["subject"] == "【要返信】年末年始のご案内"
     assert mail["text"] == "森様\n年末年始の休業日をご連絡ください。"
+
+
+def test_old_japanese_encoding_with_vendor_characters_is_read():
+    # 実例（2026-11-24）: 件名に「髙島屋」を含む ISO-2022-JP のメールで、件名が符号化されたまま残った。
+    # 「髙」「①」「㈱」は ISO-2022-JP の規格外だが、日本の業務メールでは普通に混ざる
+    encoded = "=?iso-2022-jp?B?GyRCIVobKEIxMi8xMSgbJEI2YhsoQikbJEIkXiRHJEshJ3xiRWcbKEI=?="
+    assert header_text(encoded) == "【12/11(金)までに：髙島"
+    assert header_text(encoded + "\n =?iso-2022-jp?B?GyRCMjAbKEI=?=") == "【12/11(金)までに：髙島屋"
+    assert header_text("=?UTF-8?B?44CQ6KaB6L+U5L+h44CR?= Re: abc") == "【要返信】 Re: abc"
+    assert header_text("plain subject") == "plain subject"
+    jis = b"\x1b$B-!\x1b(B" + b" (" + b"\x1b$B-j\x1b(B" + b") " + b"\x1b(I6E\x1b(B"
+    assert decode_jis(jis) == "① (㈱) ｶﾅ"
+    raw = (b"From: =?iso-2022-jp?B?GyRCfGJFZxsoQg==?= <a@takashimaya.co.jp>\r\nTo: ymori@rakutenken.co.jp\r\n"
+           b"Subject: =?iso-2022-jp?B?GyRCfGJFZzIwGyhC?=\r\nContent-Type: text/plain; charset=iso-2022-jp\r\n\r\n"
+           b"\x1b$B?9MM\x1b(B\r\n\x1b$B-!\x1b(B 12/11\x1b$B$^$G$K\x1b(B\r\n")
+    mail = parse_message(raw)
+    assert mail["sender_name"] == "髙島" and mail["subject"] == "髙島屋"
+    assert mail["text"] == "森様\n① 12/11までに"
 
 
 def test_the_time_the_server_received_it_is_used_when_given():

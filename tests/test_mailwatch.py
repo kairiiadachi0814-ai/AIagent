@@ -415,7 +415,7 @@ def test_a_reply_that_only_acknowledges_keeps_the_mail_open(env):
     reply_from_fujita(env, text="遠藤様\n確認して改めてご連絡します。", cut=True)
     env.watcher.run_once()
     body = env.cw.sent[1][1]
-    assert body.startswith(f"[To:{MORI}]森さん\n")
+    assert "[To:" not in body  # 途中経過の返信では呼び出さない（残っていることは翌朝の一覧で知らせる）
     assert "受け取りの連絡や後日の回答の予告のように読めました。" in body
     assert "残っていそうな点: ロゴシールを貼るかどうかの回答" in body
     assert "後半は確認できていません" in body
@@ -465,6 +465,18 @@ def test_a_colleague_who_replies_is_called_by_name(env):
     env.cw.mail("jimu@rakutenken.co.jp", "Re: 確認：天津甘栗：パッケージの件", "遠藤様\n貼りません。")
     env.watcher.run_once()
     assert "への返信を確認しました（福本さん・" in env.cw.sent[-1][1]
+
+
+def test_several_interim_replies_in_one_round_are_noted_once(env):
+    # 実例（2026-11-23）: 15分の間に途中経過の返信が2通続いた。知らせるのは最後の1通だけ
+    partner_mail(env)
+    env.watcher.run_once()
+    env.model.checks["天津甘栗"] = check(ACK_ONLY, "追って報告すると伝えました。", "ロゴシールを貼るかどうかの回答")
+    reply_from_fujita(env, text="遠藤様\n確認します。", received="2026-11-19 10:10")
+    reply_from_fujita(env, text="遠藤様\n追ってご報告します。", received="2026-11-19 10:25")
+    env.watcher.run_once()
+    assert len(env.cw.sent) == 2 and "（藤田さん・11/19（木）10:25）" in env.cw.sent[1][1]
+    assert len(state_of(env)["open"][0]["replies"]) == 2
 
 
 def test_forwards_and_unrelated_mails_of_ours_change_nothing(env):
