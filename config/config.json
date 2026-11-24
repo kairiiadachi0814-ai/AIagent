@@ -325,7 +325,21 @@
     "max_read_attempts": 3,
     "max_tokens": 2000,
     "max_chars": 6000,
-    "numbering": { "restart_after": 30 }
+    "numbering": { "restart_after": 30 },
+    "_imap_note": "メールサーバーを直接読む（指示 2026-11-24）。mailboxes のうち、password_env の環境変数が入っている箱だけ読む（IMAP・読み取り専用。既読にしない）。入っていない箱と、つながらない間は、通知ルームの通知（本文の先頭のみ）で見張る。パスワードは足立さんが /etc/raizuinu/env に直接書く。接続確認は tools/check_mailbox.py",
+    "imap": {
+      "enabled": true,
+      "max_body_chars": 4000,
+      "max_quoted_chars": 2000,
+      "max_fetch_per_folder": 30,
+      "alert_after_failures": 3
+    },
+    "_mailboxes_note": "name は持ち主の苗字（staff の name と同じなら、その受信箱に届いたメールの担当者になる）。user を書かなければ address でログインする。sent_folder を書かなければ送信済みフォルダを自動で探す。tls.pin_sha256 は、証明書を検証できないサーバーにつなぐときだけ書く（その指紋と一致するときだけつなぐ）",
+    "mailboxes": [
+      { "name": "森", "address": "ymori@rakutenken.co.jp", "host": "sv1151.wpx.ne.jp", "port": 993, "password_env": "MAIL_PASSWORD_MORI" },
+      { "name": "藤田", "address": "fujita@rakutenken.jp", "host": "mail.rakutenken.jp", "port": 993, "password_env": "MAIL_PASSWORD_FUJITA" },
+      { "name": "福本", "address": "jimu@rakutenken.co.jp", "host": "sv1151.wpx.ne.jp", "port": 993, "password_env": "MAIL_PASSWORD_FUKUMOTO" }
+    ]
   },
   "key_alert": {
     "_note": "AnthropicのAPIキーの見張り。5分ごとの巡回に相乗りして check_minutes おきにキーを確かめ（料金のかからないモデル一覧のAPI）、認証エラー（401／403）なら管理者ルームへ一度だけ知らせる。通るようになったときも一度だけ。止まっている間は毎回確かめる（実例 2026-11-16: 有効期限つきのキーが切れ、どこにも知らせずに全機能が止まった）",

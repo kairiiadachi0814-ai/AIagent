@@ -368,6 +368,19 @@ _DEFAULTS: dict[str, Any] = {
         # 1通の知らせの長さの上限（超えたら分ける）
         "max_chars": 6000,
         "numbering": {"restart_after": 30},
+        # メールサーバーを直接読む（IMAP・読み取り専用）。mailboxes のうち、password_env の環境変数が
+        # 入っている箱だけ読む。入っていない箱は通知ルームの通知で見張る
+        "imap": {
+            "enabled": True,
+            # モデルへ渡す本文の長さ（今回書かれた部分／引用された過去のやり取り）
+            "max_body_chars": 4000,
+            "max_quoted_chars": 2000,
+            "max_fetch_per_folder": 30,
+            # 続けてこの回数読めなかったら、管理者ルームへ知らせる（1日1回）
+            "alert_after_failures": 3,
+        },
+        # 受信箱（name・address・host・port・password_env。任意で user・sent_folder・tls.pin_sha256）
+        "mailboxes": [],
     },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）
     "discussion_watch": {

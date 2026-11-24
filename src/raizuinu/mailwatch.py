@@ -21,12 +21,19 @@
 - 知らせるのは月〜金の 8:30〜19:30 だけ（FAX確認と同じ。祝日は平日と同じ扱い）
 - 監査ログにも状態にもメールの本文は残さない（状態に持つのは件名と要約まで）
 
+メールの読み方は2通り（指示 2026-11-24: メールサーバーを直接確認する）:
+- メールサーバーの受信箱・送信済みを直接読む（`mailbox.py`。IMAP・読み取り専用）。全文・宛先（To／CC）・
+  返信関係のIDが分かる。`mail_watch.mailboxes` のうち、パスワードの環境変数が入っている箱だけ読む
+- 通知ルームの「新着メール」通知（先頭約400字）。直接読めない箱のメールと、サーバーに
+  つながらない間の代わり。同じメールを両方で見たら、先に読んだ方だけを使う
+
 すぐ試す: python -m raizuinu.mailwatch --dry-run（投稿せず、直近のメールでの動きを表示）
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import traceback
@@ -69,6 +76,9 @@ VERDICTS = [ANSWERED, PARTIAL, ACK_ONLY, UNRELATED]
 SHORT_REPORT_CHARS = 30
 MAX_CLOSED_LOG = 300
 MAX_RECENT = 60  # 再送の見分けに覚えておくメールの数
+MAX_SEEN_IDS = 400  # 同じメールが複数の受信箱に届いたときの見分け（Message-ID）
+CROSS_SOURCE_SECONDS = 15 * 60  # サーバーで読んだメールと通知ルームの通知を同じメールと見る時間差
+CHATWORK, IMAP = "chatwork", "imap"
 
 _TITLE_RE = re.compile(r"\[title\](.*?)\[/title\]", re.S)
 _RULE_RE = re.compile(r"^[ \t]*[─━―]{4,}[ \t]*$", re.M)
@@ -274,7 +284,8 @@ def check_deadline(date_text: Any, quote: Any, received: date) -> date | None:
 # --- モデルへの指示 ---
 
 READ_SYSTEM = """あなたは{company}の営業担当あてに届いたメールを仕分ける担当です。
-メールは通知用に整形されていて、本文は先頭の一部（約400字）だけです。後ろが省略されていることがあります。
+本文は、長いときや通知経由のときに後ろが省略されています（その場合は「本文はここで省略されている」と書かれています）。
+「引用されている過去のやり取り」が付いているときは参考にし、依頼や期日がそこにしか書かれていない場合（転送されたメールなど）はそこから読みます。
 書かれていることだけで判断し、推測で埋めないでください。
 
 各項目の決め方:
@@ -299,7 +310,7 @@ READ_SYSTEM = """あなたは{company}の営業担当あてに届いたメール
 「先に届いて、まだ返信・対応が済んでいないメール」が添えられているときは、このメールはその続きです。needs_reply は、このメールが届いた後もなお当社の返信が要るかで決めてください。"""
 
 CHECK_SYSTEM = """あなたは、取引先から届いたメールに{company}の担当者が返信したかを確かめる担当です。
-[届いたメール] と [当社が送ったメール] を読み、次を決めてください。メールの本文は先頭の一部だけで、後ろが省略されていることがあります。
+[届いたメール] と [当社が送ったメール] を読み、次を決めてください。本文は後ろが省略されていることがあります（その場合は「本文はここで省略されている」と書かれています）。「引用されている過去のやり取り」は当社が今回書いた部分ではないので、返信の中身としては数えません。
 
 - verdict:
   「回答済み」= 先方の求めに答えている、または求められた資料を送っている。
@@ -350,8 +361,12 @@ def mail_text(mail: dict) -> str:
     """モデルへ渡すメールの文面。"""
     received = mail.get("received")
     when = f"{received:%Y-%m-%d}（{WEEKDAYS[received.weekday()]}） {received:%H:%M}" if received else "不明"
-    lines = [
-        f"差出人: {mail.get('sender', '')}",
+    lines = [f"差出人: {mail.get('sender', '')}"]
+    if mail.get("to"):
+        lines.append(f"宛先（To）: {'、'.join(mail['to'])}")
+    if mail.get("cc"):
+        lines.append(f"CC: {'、'.join(mail['cc'])}")
+    lines += [
         f"受信: {when}",
         f"件名: {mail.get('subject', '')}",
         f"添付: {'、'.join(mail.get('attachments') or []) or 'なし'}",
@@ -360,6 +375,8 @@ def mail_text(mail: dict) -> str:
     ]
     if mail.get("truncated"):
         lines.append("（本文はここで省略されている）")
+    if mail.get("quoted"):
+        lines += ["", "[引用されている過去のやり取り（転送された文面を含む）]", str(mail["quoted"])]
     return "\n".join(lines)
 
 
@@ -399,6 +416,7 @@ class MailWatcher:
         now: Callable[[], datetime] | None = None,
         state_path: Path | None = None,
         dry_run: bool = False,
+        reader_factory: Callable[[dict], Any] | None = None,
     ) -> None:
         self._config = config
         self._chatwork = chatwork
@@ -409,6 +427,9 @@ class MailWatcher:
         self._state_path = state_path or config.resolve_path(config.state_dir) / "mailwatch.json"
         self._usage: dict[str, int] = {}
         self._posted: list[str] = []  # 自分の投稿ID（状態の post_log と同じリスト）
+        self._reader_factory = reader_factory  # メールサーバーの読み取りの差し替え（テスト用）
+        self._notices: list[dict] = []
+        self._imap_new: dict[tuple[str, str], list[int]] = {}
 
     # --- 公開API ---
 
@@ -436,30 +457,67 @@ class MailWatcher:
             return 0
         return self._run(state, messages, now)
 
-    def replay(self, messages: list[dict]) -> int:
-        """渡された発言を「いま届いた」ものとして処理する（--dry-run 用。状態は白紙から）。"""
+    def replay(self, messages: list[dict], imap_last: int = 0) -> int:
+        """渡された発言を「いま届いた」ものとして処理する（--dry-run 用。状態は白紙から）。
+
+        imap_last を渡すと、メールサーバーの各フォルダの直近 imap_last 通も同じように処理する。
+        """
         state = self._blank_state()
         state["last_seen"] = min((int(m.get("message_id", 0)) for m in messages), default=1) - 1
-        return self._run(state, messages, self._now())
+        return self._run(state, messages, self._now(), imap_last=imap_last)
 
     def open_items(self) -> list[dict]:
         return list(self._load_state().get("open") or [])
 
     # --- 巡回の本体 ---
 
-    def _run(self, state: dict, messages: list[dict], now: datetime) -> int:
+    def _run(self, state: dict, messages: list[dict], now: datetime, imap_last: int = 0) -> int:
         settings = self._settings()
         notifier = int(settings.get("notifier_account_id", 0) or 0)
         me = self._me()
         self._posted = state.setdefault("post_log", [])
         limit = int(settings.get("max_per_run", 15) or 0)
         max_attempts = int(settings.get("max_read_attempts", 3))
+        self._notices = self._index_notices(messages, notifier)
         fresh = sorted(
             (m for m in messages if int(m.get("message_id", 0)) > int(state["last_seen"])),
             key=lambda m: int(m.get("message_id", 0)),
         )
         arrived: list[dict] = []
         reads = 0
+
+        # 1) メールサーバーを直接読む。届いたメールを先に、当社が送ったメールを後に見る
+        #    （同じ巡回で届いたメールとその返信を、正しい順で突き合わせるため）
+        try:
+            fetched = self._collect_imap(state, now, last=imap_last)
+        except Exception:
+            print("[error] メールサーバーの読み取りに失敗: " + traceback.format_exc(), flush=True)
+            fetched = []
+        by_time = lambda m: m["received"]  # noqa: E731
+        ordered = sorted((m for m in fetched if not self._is_ours(m)), key=by_time)
+        ordered += sorted((m for m in fetched if self._is_ours(m)), key=by_time)
+        for mail in ordered:
+            if limit and reads >= limit and not self._dry_run:
+                break
+            ref = mail["ref"]
+            try:
+                reads += self._handle_mail(state, mail, arrived, now)
+            except ModelUnavailable:
+                retries = state.setdefault("retries", {})
+                retries[ref] = int(retries.get(ref, 0)) + 1
+                if retries[ref] < max_attempts:
+                    print(f"[warn] 営業メール {ref} を読めませんでした。次の巡回でやり直します", flush=True)
+                    break
+                self._report_unread(mail)
+            except Exception:
+                print(f"[error] 営業メール {ref} の処理に失敗: " + traceback.format_exc(), flush=True)
+            state.get("retries", {}).pop(ref, None)
+            self._imap_done(state, mail)
+            self._save_state(state)
+        self._imap_compact(state)
+        self._save_state(state)
+
+        # 2) 通知ルームの発言（直接読めない箱のメールの通知と、人からの返事）
         for message in fresh:
             mid = int(message.get("message_id", 0))
             account = _account_of(message)
@@ -472,7 +530,8 @@ class MailWatcher:
                             break  # 続きは次の巡回で（順番は崩さない）
                         if mail["received"] is None:
                             mail["received"] = datetime.fromtimestamp(int(message.get("send_time", 0)), JST)
-                        reads += self._handle_mail(state, message, mail, arrived, now)
+                        mail.update(source=CHATWORK, ref=str(mid), link_id=str(mid))
+                        reads += self._handle_mail(state, mail, arrived, now)
                 elif account != me:
                     self._handle_human(state, message, me, now)
             except ModelUnavailable:
@@ -483,13 +542,14 @@ class MailWatcher:
                     self._save_state(state)
                     break
                 if mail is not None:
-                    self._report_unread(message, mail)
+                    self._report_unread(mail)
             except Exception:
                 # 1通の失敗で全体を止めない（そのメールは飛ばして先へ進む）
                 print(f"[error] 営業メール {mid} の処理に失敗: " + traceback.format_exc(), flush=True)
             state.get("retries", {}).pop(str(mid), None)
             state["last_seen"] = mid
             self._save_state(state)
+        self._backfill_links(state)
         if arrived:
             self._announce(state, arrived, now)
         if self._morning_list(state, now):
@@ -501,30 +561,29 @@ class MailWatcher:
 
     # --- 届いたメール ---
 
-    def _handle_mail(self, state: dict, message: dict, mail: dict, arrived: list[dict], now: datetime) -> int:
+    def _handle_mail(self, state: dict, mail: dict, arrived: list[dict], now: datetime) -> int:
         """1通を仕分ける。→ モデルを呼んだ回数。"""
         settings = self._settings()
-        mid = str(message.get("message_id"))
-        if matches_sender(mail["sender"], settings.get("own_domains")):
-            return self._own_mail(state, message, mail, now)
+        mid = str(mail.get("ref"))
+        if self._is_ours(mail):
+            return self._own_mail(state, mail, now)
         if matches_sender(mail["sender"], settings.get("skip_senders")):
             self._audit({"type": "mail_skip", "message_id": mid, "reason": "rule"})
             return 0
         key = thread_key(mail["subject"])
         domain = mail["sender"].rpartition("@")[2]
-        # 同じメールが二度流れることがある（差出人・件名・受信日時が同じ）。二度目は知らせない
-        fingerprint = f"{mail['sender']}|{key}|{mail['received'].isoformat()}"
-        recent = state.setdefault("recent", [])
-        if fingerprint in recent:
+        # 同じメールを二度知らせない（通知の再送、複数の受信箱への同報、サーバーと通知ルームの両方）
+        if self._seen_before(state, mail, key):
             self._audit({"type": "mail_skip", "message_id": mid, "reason": "duplicate"})
             return 0
+        references = set(mail.get("references") or [])
         earlier = [
             i for i in state["open"]
-            if same_thread(i.get("key", ""), key) and str(i.get("sender", "")).rpartition("@")[2] == domain
+            if str(i.get("sender", "")).rpartition("@")[2] == domain
+            and (same_thread(i.get("key", ""), key) or (i.get("message_id") and i["message_id"] in references))
         ]
         found = self._read(mail, earlier)
-        recent.append(fingerprint)  # 読めてから覚える（読めずにやり直す分を再送と取り違えない）
-        del recent[:-MAX_RECENT]
+        self._remember(state, mail, key)  # 読めてから覚える（読めずにやり直す分を再送と取り違えない）
         if found.get("category") != PARTNER:
             self._audit({"type": "mail_skip", "message_id": mid, "reason": f"category:{found.get('category')}",
                          "usage": found.get("_usage")})
@@ -549,11 +608,15 @@ class MailWatcher:
 
     def _make_item(self, mid: str, mail: dict, found: dict, key: str) -> dict:
         staff = self._staff()
-        whole = f"{mail['subject']}\n{mail['text']}"
+        whole = f"{mail['subject']}\n{mail['text']}\n{mail.get('quoted', '')}"
         names = [
             s["name"] for s in staff
             if s["name"] in (found.get("staff") or []) and addressed_to(s["name"], mail["text"])
         ]
+        via = "宛名" if names else ""
+        if not names:
+            # 本文に宛名が無いときは、メールの宛先（To）→ CC → 届いた受信箱の持ち主の順で決める
+            names, via = self._staff_by_headers(mail)
         received: datetime = mail["received"]
         quote = str(found.get("deadline_quote") or "").strip()
         # 抜き書きは実際にメールに書かれている文でなければ採らない（作文された期日を通さない）。
@@ -573,6 +636,10 @@ class MailWatcher:
             "partner": str(found.get("partner") or "").strip(),
             "addressee": str(found.get("addressee") or "").strip(),
             "staff": names,
+            "via": via,
+            "source": mail.get("source", CHATWORK),
+            "link_id": str(mail.get("link_id") or "") or self._find_notice(mail),
+            "message_id": str(mail.get("message_id") or ""),
             "recipients": [s["account_id"] for s in staff if not names or s["name"] in names],
             "received_at": received.isoformat(),
             "summary": str(found.get("summary") or "").strip(),
@@ -594,26 +661,32 @@ class MailWatcher:
 
     # --- 当社が送ったメール（返信の確認）---
 
-    def _own_mail(self, state: dict, message: dict, mail: dict, now: datetime) -> int:
-        mid = str(message.get("message_id"))
+    def _own_mail(self, state: dict, mail: dict, now: datetime) -> int:
+        mid = str(mail.get("ref"))
         if is_forward(mail["subject"]):
             self._audit({"type": "mail_skip", "message_id": mid, "reason": "own_forward"})
             return 0
         key = thread_key(mail["subject"])
-        candidates = [
-            i for i in state["open"]
-            if same_thread(i.get("key", ""), key) and int(i.get("id", 0)) < int(mid)
-        ]
+        if self._seen_before(state, mail, key):
+            self._audit({"type": "mail_skip", "message_id": mid, "reason": "duplicate"})
+            return 0
+        # 届いたメールより後に送ったものだけが、その返信になり得る
+        sent_at = mail["received"]
+        before = [i for i in state["open"] if (_parse_iso(i.get("received_at")) or sent_at) <= sent_at]
+        references = set(mail.get("references") or [])
+        # 返信関係のID（メールサーバーから読んだときだけ分かる）→ 件名 → 宛名の取引先名、の順で探す
+        candidates = [i for i in before if i.get("message_id") and i["message_id"] in references]
+        if not candidates:
+            candidates = [i for i in before if same_thread(i.get("key", ""), key)]
         if not candidates:
             # 件名を変えて返信することがある（「産地証明書を提出してほしい」に「マロングラッセ産地証明」
             # という新しい件名で送る）。宛名にその取引先の名前があるメールは、中身を読んで確かめる
-            candidates = [
-                i for i in state["open"]
-                if int(i.get("id", 0)) < int(mid) and written_to(i.get("partner", ""), mail["text"])
-            ]
+            candidates = [i for i in before if written_to(i.get("partner", ""), mail["text"])]
         if not candidates:
+            self._remember(state, mail, key)
             self._audit({"type": "mail_skip", "message_id": mid, "reason": "own"})
             return 0
+        link_id = str(mail.get("link_id") or "") or self._find_notice(mail)
         calls = 0
         for item in candidates:
             found = self._check_reply(item, mail)
@@ -625,6 +698,7 @@ class MailWatcher:
                 continue
             reply = {
                 "id": mid,
+                "link_id": link_id,
                 "at": mail["received"].isoformat(),
                 "by": self._staff_name(mail["sender"]),
                 "verdict": verdict,
@@ -638,24 +712,23 @@ class MailWatcher:
                 self._post_reply_confirmed(state, item, reply)
             else:
                 self._post_reply_short(item, reply)
+        self._remember(state, mail, key)
         return calls
 
     def _post_reply_confirmed(self, state: dict, item: dict, reply: dict) -> None:
         """返信を確かめて閉じたことを、To 無しで一言置く（黙って閉じない）。"""
-        room_id = self._room_id()
         lines = [
             f"{self._mark(item)} {self._who(item)} への返信を確認しました（{reply['by']}・{self._when(reply['at'])}）。",
             f"返信の内容: {reply['summary']}",
-            f"返信のメール: {message_url(room_id, reply['id'])}",
         ]
+        lines += self._link_lines("返信のメール", self._reply_link(reply))
         if reply.get("truncated"):
-            lines.append("※返信の本文は先頭の部分しか通知に表示されていません。見えている範囲で、求めに答えていると判断しました。")
+            lines.append("※返信の本文は先頭の部分しか読めていません。見えている範囲で、求めに答えていると判断しました。")
         lines.append(f"{self._mark(item)} は完了にします。{self._remaining_phrase(state)}")
         self._send("\n".join(lines))
 
     def _post_reply_short(self, item: dict, reply: dict) -> None:
         """返信はあったが、求めに答えきっていないように読めるとき。決めつけず担当者に尋ねる。"""
-        room_id = self._room_id()
         kind = "受け取りの連絡や後日の回答の予告" if reply["verdict"] == ACK_ONLY else "求めの一部への回答"
         lines = [
             f"{self._mark(item)} {self._who(item)} への返信を確認しました（{reply['by']}・{self._when(reply['at'])}）が、"
@@ -666,9 +739,9 @@ class MailWatcher:
             lines.append(f"残っていそうな点: {reply['remaining']}")
         if item.get("ask"):
             lines.append(f"先方の求め: {item['ask']}")
-        lines.append(f"返信のメール: {message_url(room_id, reply['id'])}")
+        lines += self._link_lines("返信のメール", self._reply_link(reply))
         if reply.get("truncated"):
-            lines.append("※返信の本文は先頭の部分しか通知に表示されていないため、後半は確認できていません。")
+            lines.append("※返信の本文は先頭の部分しか読めていないため、後半は確認できていません。")
         lines.append(
             f"これで済んでいましたら、この投稿への返信で「{self._mark(item)} 対応完了」とお知らせください。"
             "お知らせがあるまで、返信待ちとして残しておきます。"
@@ -725,8 +798,10 @@ class MailWatcher:
         lines.append("期日: " + self._deadline_phrase(item, today))
         attached = f"　添付{item['attachments']}件" if item.get("attachments") else ""
         lines.append(f"受信: {self._when(item['received_at'])}{attached}")
-        lines.append(f"メール: {message_url(self._room_id(), item['id'])}")
-        if item.get("cut_off"):
+        lines += self._link_lines("メール", self._item_link(item))
+        if item.get("cut_off") and item.get("source") == IMAP:
+            lines.append("※本文が長いため、先頭の部分だけで判断しています。メール本体もご確認ください。")
+        elif item.get("cut_off"):
             lines.append("※本文の後半が通知に表示されていないため、先頭の部分だけで判断しています。メール本体もご確認ください。")
         if item.get("follow_of") and not item.get("number"):
             earlier = circled(int(item["follow_of"]))
@@ -738,7 +813,8 @@ class MailWatcher:
 
     def _to_phrase(self, item: dict) -> str:
         if item.get("staff"):
-            return "→ " + "・".join(f"{n}さん" for n in item["staff"])
+            via = f"（{item['via']}）" if item.get("via") and item["via"] != "宛名" else ""
+            return "→ " + "・".join(f"{n}さん" for n in item["staff"]) + via
         everyone = "・".join(f"{s['name']}さん" for s in self._staff())
         addressee = f"宛名が「{item['addressee']}」の" if item.get("addressee") else "宛名の記載が無い"
         return f"→ {addressee}ため、{everyone}へ"
@@ -841,7 +917,8 @@ class MailWatcher:
             lines.append(f"{self._mark(item)}{self._status_label(item, today)} {self._who(item)}　{self._to_phrase(item)}")
             lines.append(f"　件名: {item['subject']}")
             lines.append(f"　先方の求め: {item.get('ask') or item.get('summary', '')}")
-            lines.append(f"　{self._when(item['received_at'])} 受信　メール: {message_url(self._room_id(), item['id'])}")
+            link = self._item_link(item)
+            lines.append(f"　{self._when(item['received_at'])} 受信" + (f"　メール: {message_url(self._room_id(), link)}" if link else ""))
             for reply in (item.get("replies") or [])[-1:]:
                 note = f"　※{self._when(reply['at'])}に{reply['by']}の返信を確認しましたが、まだ残っていそうな点があります"
                 lines.append(note + (f"（{reply['remaining']}）" if reply.get("remaining") else ""))
@@ -1106,14 +1183,249 @@ class MailWatcher:
         tag = f"[rp aid={_account_of(message)} to={self._room_id()}-{message.get('message_id')}]"
         return self._send(f"{tag}\n{text}")
 
-    def _report_unread(self, message: dict, mail: dict) -> None:
+    def _report_unread(self, mail: dict) -> None:
         """何度やっても読めなかったメール。種類を決めつけず、To 無しで置く。"""
-        self._send(
-            "次のメールは、こちらで内容を確認できませんでした。メールをご確認ください。\n"
-            f"差出人: {mail.get('sender', '')}\n件名: {mail.get('subject', '')}\n"
-            f"メール: {message_url(self._room_id(), message.get('message_id'))}"
-        )
-        self._audit({"type": "mail_unread", "message_id": str(message.get("message_id"))})
+        if self._is_ours(mail):
+            return  # 当社が送ったメールは知らせる対象ではない（返信の確認だけに使う）
+        lines = [
+            "次のメールは、こちらで内容を確認できませんでした。メールをご確認ください。",
+            f"差出人: {mail.get('sender', '')}",
+            f"件名: {mail.get('subject', '')}",
+        ]
+        lines += self._link_lines("メール", str(mail.get("link_id") or "") or self._find_notice(mail))
+        self._send("\n".join(lines))
+        self._audit({"type": "mail_unread", "message_id": str(mail.get("ref"))})
+
+    # --- メールの出どころ（サーバー／通知ルーム）にまたがる部品 ---
+
+    def _is_ours(self, mail: dict) -> bool:
+        """当社が送ったメールか（送信済みフォルダのメール、または当社のドメインからのメール）。"""
+        return mail.get("folder") == "sent" or matches_sender(mail.get("sender", ""), self._settings().get("own_domains"))
+
+    def _seen_before(self, state: dict, mail: dict, key: str) -> bool:
+        """同じメールをもう読んだか。
+
+        メールサーバー同士は Message-ID で、通知ルーム同士は差出人・件名・受信日時の一致で、
+        サーバーと通知ルームの間は差出人・件名が同じで受信が近いことで見分ける。
+        """
+        message_id = str(mail.get("message_id") or "")
+        if message_id and message_id in (state.get("seen_ids") or []):
+            return True
+        source = mail.get("source", CHATWORK)
+        for entry in state.get("recent") or []:
+            if isinstance(entry, str):  # 前の版の控え（"差出人|件名|日時"）
+                sender, _, rest = entry.partition("|")
+                entry_key, _, when = rest.rpartition("|")
+                entry = {"s": sender, "k": entry_key, "t": when, "src": CHATWORK}
+            if entry.get("s") != mail["sender"] or entry.get("k") != key:
+                continue
+            at = _parse_iso(entry.get("t"))
+            if at is None:
+                continue
+            gap = abs((mail["received"] - at).total_seconds())
+            if entry.get("src") == source:
+                if source == CHATWORK and gap == 0:
+                    return True
+            elif gap <= CROSS_SOURCE_SECONDS:
+                return True
+        return False
+
+    def _remember(self, state: dict, mail: dict, key: str) -> None:
+        recent = state.setdefault("recent", [])
+        recent.append({"s": mail["sender"], "k": key, "t": mail["received"].isoformat(),
+                       "src": mail.get("source", CHATWORK)})
+        del recent[:-MAX_RECENT]
+        if mail.get("message_id"):
+            seen = state.setdefault("seen_ids", [])
+            seen.append(str(mail["message_id"]))
+            del seen[:-MAX_SEEN_IDS]
+
+    def _staff_by_headers(self, mail: dict) -> tuple[list[str], str]:
+        """メールの宛先（To）→ CC → 届いた受信箱の持ち主、の順で担当者を決める。"""
+        staff = self._staff()
+        for field, label in (("to", "メールの宛先"), ("cc", "CC")):
+            addresses = set(mail.get(field) or [])
+            names = [s["name"] for s in staff if addresses & set(s["addresses"])]
+            if names:
+                return names, label
+        owner = str(mail.get("owner") or "")
+        if owner and any(s["name"] == owner for s in staff):
+            return [owner], "受信箱"
+        return [], ""
+
+    @staticmethod
+    def _index_notices(messages: list[dict], notifier: int) -> list[dict]:
+        """通知ルームに流れている「新着メール」通知の索引（サーバーで読んだメールに通知へのリンクを添えるため）。"""
+        index = []
+        for message in messages:
+            if _account_of(message) != notifier:
+                continue
+            notice = parse_mail_notice(message.get("body", ""))
+            if notice is None:
+                continue
+            at = notice["received"] or datetime.fromtimestamp(int(message.get("send_time", 0)), JST)
+            index.append({"sender": notice["sender"], "key": thread_key(notice["subject"]), "at": at,
+                          "id": str(message.get("message_id"))})
+        return index
+
+    def _find_notice(self, mail: dict) -> str:
+        """このメールの通知が通知ルームにあれば、その投稿ID。無ければ空。"""
+        key = thread_key(mail.get("subject", ""))
+        for notice in getattr(self, "_notices", []):
+            if notice["sender"] == mail.get("sender") and notice["key"] == key:
+                if abs((notice["at"] - mail["received"]).total_seconds()) <= CROSS_SOURCE_SECONDS:
+                    return notice["id"]
+        return ""
+
+    def _backfill_links(self, state: dict) -> None:
+        """知らせた時点では通知がまだ流れていなかったメールに、後からリンクを結び付ける。"""
+        for item in state["open"]:
+            if item.get("source") == IMAP and not item.get("link_id"):
+                at = _parse_iso(item.get("received_at"))
+                if at is not None:
+                    item["link_id"] = self._find_notice({"sender": item.get("sender"), "subject": item.get("subject", ""),
+                                                         "received": at})
+
+    @staticmethod
+    def _item_link(item: dict) -> str:
+        """メールの通知（通知ルームの投稿）のID。前の版の控えは id がそのまま投稿ID。"""
+        if item.get("link_id"):
+            return str(item["link_id"])
+        return str(item["id"]) if "source" not in item and str(item.get("id", "")).isdigit() else ""
+
+    @staticmethod
+    def _reply_link(reply: dict) -> str:
+        if reply.get("link_id"):
+            return str(reply["link_id"])
+        return str(reply["id"]) if "link_id" not in reply and str(reply.get("id", "")).isdigit() else ""
+
+    def _link_lines(self, label: str, message_id: str) -> list[str]:
+        return [f"{label}: {message_url(self._room_id(), message_id)}"] if message_id else []
+
+    # --- メールサーバーを直接読む ---
+
+    def _active_mailboxes(self) -> list[dict]:
+        """読む受信箱。パスワードの環境変数が入っている箱だけ（入っていない箱は通知ルームの通知で見る）。"""
+        settings = self._settings()
+        if not (settings.get("imap") or {}).get("enabled", True):
+            return []
+        return [
+            box for box in settings.get("mailboxes") or []
+            if box.get("address") and box.get("host") and os.environ.get(str(box.get("password_env") or ""))
+        ]
+
+    def _open_reader(self, box: dict) -> Any:
+        if self._reader_factory is not None:
+            return self._reader_factory(box)
+        from .mailbox import MailboxReader
+
+        return MailboxReader(box)
+
+    def _collect_imap(self, state: dict, now: datetime, last: int = 0) -> list[dict]:
+        """各受信箱・送信済みの新しいメールを取ってくる（既読にしない）。
+
+        初めて開くフォルダは、いまあるメールを既読として控えるだけ（過去分を流さない）。
+        """
+        from .mailbox import MailboxError
+
+        imap = self._settings().get("imap") or {}
+        body_chars = int(imap.get("max_body_chars", 4000))
+        quoted_chars = int(imap.get("max_quoted_chars", 2000))
+        fetch_limit = int(imap.get("max_fetch_per_folder", 30))
+        self._imap_new = {}
+        mails: list[dict] = []
+        for box in self._active_mailboxes():
+            name = str(box.get("name") or box["address"])
+            try:
+                with self._open_reader(box) as reader:
+                    for kind, folder in (("inbox", reader.inbox()), ("sent", reader.sent())):
+                        if folder is None:
+                            continue
+                        info = reader.open(folder)
+                        place = state.setdefault("imap", {}).setdefault(name, {}).setdefault(kind, {})
+                        if last:
+                            uids = reader.last_uids(last)
+                        elif "last_uid" not in place or place.get("uidvalidity") != info["uidvalidity"]:
+                            newest = (reader.last_uids(1) or [0])[-1]
+                            place.clear()
+                            place.update(uidvalidity=info["uidvalidity"], last_uid=newest, done=[])
+                            continue
+                        else:
+                            done = set(place.get("done") or [])
+                            uids = [u for u in reader.uids_after(int(place["last_uid"])) if u not in done]
+                            self._imap_new[(name, kind)] = uids
+                        for uid in uids[:fetch_limit]:
+                            mail = reader.fetch(uid)
+                            if mail is None or not mail.get("sender") or mail.get("received") is None:
+                                if not last:
+                                    place.setdefault("done", []).append(uid)
+                                continue
+                            text = str(mail.get("text") or "")
+                            mail.update(
+                                source=IMAP, box=name, folder=kind, owner=name, ref=f"imap:{name}:{kind}:{uid}",
+                                text=text[:body_chars], quoted=str(mail.get("quoted") or "")[:quoted_chars],
+                                truncated=bool(mail.get("truncated")) or len(text) > body_chars,
+                            )
+                            mails.append(mail)
+                self._mailbox_ok(state, name)
+            except MailboxError as exc:
+                self._mailbox_failed(state, name, exc, now)
+        return mails
+
+    def _imap_done(self, state: dict, mail: dict) -> None:
+        if self._dry_run:
+            return
+        place = state.setdefault("imap", {}).setdefault(mail["box"], {}).setdefault(mail["folder"], {})
+        done = place.setdefault("done", [])
+        if mail["uid"] not in done:
+            done.append(mail["uid"])
+
+    def _imap_compact(self, state: dict) -> None:
+        """済んだUIDを、続いている分だけ既読位置へ繰り入れる（順番どおりに済むとは限らないため）。"""
+        for (name, kind), uids in getattr(self, "_imap_new", {}).items():
+            place = state.get("imap", {}).get(name, {}).get(kind)
+            if not place:
+                continue
+            done = set(place.get("done") or [])
+            for uid in sorted(uids):
+                if uid not in done:
+                    break
+                place["last_uid"] = uid
+            place["done"] = sorted(u for u in done if u > int(place["last_uid"]))
+
+    def _mailbox_failed(self, state: dict, name: str, exc: Exception, now: datetime) -> None:
+        """読めなかった受信箱。続いたら管理者ルームへ1日1回知らせる（その間は通知ルームの通知で見張る）。"""
+        print(f"[warn] {name} のメールサーバーを読めませんでした: {exc}", flush=True)
+        if self._dry_run:
+            return
+        errors = state.setdefault("imap_errors", {})
+        entry = errors.setdefault(name, {"since": now.isoformat(), "count": 0})
+        entry["count"] = int(entry.get("count", 0)) + 1
+        after = int((self._settings().get("imap") or {}).get("alert_after_failures", 3))
+        if entry["count"] < after or entry.get("alerted") == now.date().isoformat():
+            return
+        if self._tell_admin(
+            f"【営業メール】{name}さんのメールサーバーを読めていません（{exc}）。\n"
+            "その間は、通知ルームに流れる通知（本文の先頭のみ）で見張りを続けます。"
+        ):
+            entry["alerted"] = now.date().isoformat()
+
+    def _mailbox_ok(self, state: dict, name: str) -> None:
+        entry = (state.get("imap_errors") or {}).pop(name, None)
+        if entry and entry.get("alerted") and not self._dry_run:
+            self._tell_admin(f"【営業メール】{name}さんのメールサーバーを、また読めるようになりました。")
+
+    def _tell_admin(self, text: str) -> bool:
+        room = getattr(self._config, "admin_room_id", None)
+        if not room:
+            return False
+        heads = " ".join(f"[To:{int(a)}]" for a in (getattr(self._config, "admin_account_ids", None) or []))
+        try:
+            self._chatwork.send_message(int(room), (heads + "\n" if heads else "") + text)
+            return True
+        except Exception:
+            print("[warn] 管理者ルームへの知らせに失敗: " + traceback.format_exc(), flush=True)
+            return False
 
     # --- モデル ---
 
@@ -1202,7 +1514,7 @@ class MailWatcher:
     @staticmethod
     def _blank_state() -> dict:
         return {"last_seen": None, "open": [], "closed_log": [], "numbering": {"next": 1}, "lists": {},
-                "retries": {}, "post_log": [], "recent": []}
+                "retries": {}, "post_log": [], "recent": [], "seen_ids": [], "imap": {}, "imap_errors": {}}
 
     def _load_state(self) -> dict:
         try:
@@ -1265,6 +1577,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="営業メールの見張り")
     parser.add_argument("--dry-run", action="store_true", help="投稿も記録もせず、直近のメールでの動きを表示する")
     parser.add_argument("--last", type=int, default=30, help="--dry-run で見る直近の発言数")
+    parser.add_argument("--imap-last", type=int, default=0,
+                        help="--dry-run で、メールサーバーの各フォルダの直近この通数も読んで試す")
     args = parser.parse_args(argv)
     config = Config.load()
     chatwork = ChatworkClient(config.chatwork_api_token or "")
@@ -1274,7 +1588,7 @@ def main(argv: list[str] | None = None) -> None:
     recorder = _Recorder(chatwork)
     watcher = MailWatcher(config, recorder, dry_run=True)
     messages = recorder.get_recent_messages(int(config.mail_watch.get("room_id", 0)), limit=100)[-args.last:]
-    count = watcher.replay(messages)
+    count = watcher.replay(messages, imap_last=args.imap_last)
     for body in recorder.sent:
         print("=" * 60)
         print(body)
