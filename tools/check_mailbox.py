@@ -65,15 +65,16 @@ def check(box: dict) -> bool:
                 print("  【注意】受信箱に新しいメールが残っていません。Thunderbird が POP で受信して"
                       "サーバーから消している可能性があります（その場合、直接は読めません）。")
             sent = reader.sent()
-            if sent is None:
+            if not sent:
                 print("  【注意】送信済みフォルダが見つかりません。送ったメールがサーバーに残らない設定だと、"
                       "返信の確認は通知ルームの通知に頼ることになります。フォルダ名が上の一覧にあれば、"
                       "設定の sent_folder に書けば読めます。")
             else:
-                sent_newest = describe(reader, sent, "送信済み")
-                if sent_newest is None or (now - sent_newest).days >= STALE_DAYS * 3:
+                dates = [d for d in (describe(reader, folder, "送信済み") for folder in sent) if d]
+                if not dates or (now - max(dates)).days >= STALE_DAYS * 3:
                     print("  【注意】送信済みに最近のメールがありません。送ったメールが PC にだけ保存されている"
                           "可能性があります。")
+            print(f"  振り分け先として読むフォルダ: {len(reader.others())}個")
         return True
     except MailboxError as exc:
         print(f"  できませんでした: {exc}")

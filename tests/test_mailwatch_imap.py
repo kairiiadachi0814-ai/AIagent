@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from raizuinu.config import Config
-from raizuinu.mailbox import AUTH, MailboxError, parse_message
+from raizuinu.mailbox import AUTH, FOLDER, MailboxError, parse_message
 from raizuinu.mailwatch import ANSWERED, JST, MailWatcher
 
 from test_mailbox import build
@@ -35,6 +35,10 @@ from test_mailwatch import (
 ADMIN_ROOM, ADACHI = 444945031, 6945415
 INBOX = {"raw": "INBOX", "name": "INBOX", "flags": [], "sep": ""}
 SENT = {"raw": "INBOX.Sent", "name": "INBOX.Sent", "flags": ["\\Sent"], "sep": "."}
+SENT_JP = {"raw": "INBOX.&kAFP4W4IMH8-", "name": "INBOX.送信済み", "flags": [], "sep": "."}
+SORTED = {"raw": "INBOX.JR", "name": "INBOX.ジェイアール西日本", "flags": [], "sep": "."}
+BROKEN = {"raw": "INBOX.mailfilter-like", "name": "INBOX.開けないフォルダ", "flags": [], "sep": "."}
+KEYS = {"INBOX": "inbox", "INBOX.Sent": "sent", SENT_JP["raw"]: "sent2", "INBOX.JR": "sorted"}
 
 
 class FakeServer:
@@ -45,7 +49,8 @@ class FakeServer:
 
     def put(self, name, folder, raw, at=None):
         self.next_uid += 1
-        self.boxes.setdefault(name, {"inbox": {}, "sent": {}})[folder][self.next_uid] = (raw, at or THU_1000)
+        self.boxes.setdefault(name, {})
+        self.boxes[name].setdefault(folder, {})[self.next_uid] = (raw, at or THU_1000)
         return self.next_uid
 
     def reader(self, box):
@@ -60,7 +65,7 @@ class FakeReader:
         self.server.opened.append(self.name)
         if self.server.fail.get(self.name):
             raise MailboxError(AUTH, f"{self.name} のメールにログインできませんでした")
-        self.server.boxes.setdefault(self.name, {"inbox": {}, "sent": {}})
+        self.server.boxes.setdefault(self.name, {})
         return self
 
     def __exit__(self, *exc_info):
@@ -70,11 +75,16 @@ class FakeReader:
         return INBOX
 
     def sent(self):
-        return SENT
+        return [SENT_JP, SENT]
+
+    def others(self):
+        return [SORTED, BROKEN]
 
     def open(self, folder):
-        self.folder = "sent" if folder is SENT else "inbox"
-        mails = self.server.boxes[self.name][self.folder]
+        if folder is BROKEN:
+            raise MailboxError(FOLDER, "開けませんでした")
+        self.folder = KEYS[folder["raw"]]
+        mails = self.server.boxes[self.name].setdefault(self.folder, {})
         return {"messages": len(mails), "uidvalidity": 7, "uidnext": max(mails, default=0) + 1}
 
     def uids_after(self, after):
@@ -240,6 +250,50 @@ def test_ads_on_the_server_are_dropped_without_reading_them(env):
     env.server.put("森", "inbox", build(sender="support@superdelivery.com", subject="【特集】", message_id="<ad@x>"))
     assert env.watcher.run_once() == 0 and env.model.calls == []
     assert state_of(env)["imap"]["森"]["inbox"]["last_uid"] == 102  # 既読位置は進む
+
+
+# --- 振り分け先のフォルダ ---
+
+
+def test_a_mail_sorted_straight_into_a_folder_is_still_announced(env):
+    # 実例（2026-11-24）: 森さんの箱では、一部の差出人のメールが届くとすぐ取引先別のフォルダへ振り分けられていた
+    env.model.reads["売上見込"] = read(staff=[], addressee="お取引先様 各位", needs_reply=False, ask="",
+                                   partner="ジェイアール西日本デイリーサービスネット 榎並様")
+    env.server.put("森", "sorted", build(subject="【情報共有】売上見込について", body="お取引先様 各位\n共有します。",
+                                        to="list@dailyservice.co.jp", message_id="<jr@x>"))
+    assert env.watcher.run_once() == 1
+    assert "→ 森さん（受信箱）" in room_posts(env)[0]
+    assert state_of(env)["imap"]["森"]["folder:INBOX.JR"]["last_uid"] == env.server.next_uid
+
+
+def test_a_mail_moved_to_a_folder_after_it_was_announced_is_not_announced_again(env):
+    incoming(env)
+    env.watcher.run_once()
+    env.server.put("森", "sorted", build(subject="休業日のご確認", body="森様\n11月27日(金)までにご返信ください。",
+                                        message_id=REQUEST_ID))
+    env.clock.now = datetime(2026, 11, 19, 14, 0, tzinfo=JST)
+    assert env.watcher.run_once() == 0
+    assert len(room_posts(env)) == 1 and len(state_of(env)["open"]) == 1
+
+
+def test_an_old_mail_filed_into_a_folder_later_is_left_alone(env):
+    env.clock.now = datetime(2026, 12, 7, 10, 0, tzinfo=JST)   # 2週間以上あとに、古いメールをフォルダへ整理した
+    env.server.put("森", "sorted", build(subject="古いメール", message_id="<filed@x>"), datetime(2026, 12, 7, 9, 55, tzinfo=JST))
+    assert env.watcher.run_once() == 0 and env.model.calls == []
+    assert state_of(env)["imap"]["森"]["folder:INBOX.JR"]["last_uid"] == env.server.next_uid  # 既読位置は進める
+
+
+def test_a_reply_saved_in_the_other_sent_folder_is_found_too(env):
+    incoming(env)
+    env.watcher.run_once()
+    env.model.checks["休業日のご確認"] = check(ANSWERED, "休業日を記入したリストを送付しました。")
+    env.server.put("森", "sent2", build(sender="ymori@rakutenken.co.jp", to="yamaki@ad.takashimaya.co.jp",
+                                       subject="Re: 休業日のご確認", body="山木様\n別添のとおりです。",
+                                       message_id="<r2@rakutenken>", refs=REQUEST_ID),
+                   datetime(2026, 11, 19, 11, 0, tzinfo=JST))
+    env.clock.now = datetime(2026, 11, 19, 11, 5, tzinfo=JST)
+    env.watcher.run_once()
+    assert "への返信を確認しました（森さん・" in room_posts(env)[1] and state_of(env)["open"] == []
 
 
 # --- 当社の返信 ---

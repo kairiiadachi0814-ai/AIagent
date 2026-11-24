@@ -332,9 +332,10 @@
       "max_body_chars": 4000,
       "max_quoted_chars": 2000,
       "max_fetch_per_folder": 30,
+      "max_age_days": 7,
       "alert_after_failures": 3
     },
-    "_mailboxes_note": "name は持ち主の苗字（staff の name と同じなら、その受信箱に届いたメールの担当者になる）。user を書かなければ address でログインする。sent_folder を書かなければ送信済みフォルダを自動で探す。tls.pin_sha256 は、証明書を検証できないサーバーにつなぐときだけ書く（その指紋と一致するときだけつなぐ）",
+    "_mailboxes_note": "name は持ち主の苗字（staff の name と同じなら、その受信箱に届いたメールの担当者になる）。user を書かなければ address でログインする。sent_folder を書かなければ送信済みフォルダを自動で探す。tls.pin_sha256 は、証明書を検証できないサーバーにつなぐときだけ書く（その指紋と一致するときだけつなぐ）。読むのは受信箱・送信済み（候補すべて）・振り分け先のフォルダ。読ませたくないフォルダは skip_folders に名前を書く",
     "mailboxes": [
       { "name": "森", "address": "ymori@rakutenken.co.jp", "host": "sv1151.wpx.ne.jp", "port": 993, "password_env": "MAIL_PASSWORD_MORI" },
       { "name": "藤田", "address": "fujita@rakutenken.jp", "host": "mail.rakutenken.jp", "port": 993, "password_env": "MAIL_PASSWORD_FUJITA" },

@@ -376,10 +376,12 @@ _DEFAULTS: dict[str, Any] = {
             "max_body_chars": 4000,
             "max_quoted_chars": 2000,
             "max_fetch_per_folder": 30,
+            # これより前に送られたメールは読まない（後からフォルダへ整理されただけの古いメール）
+            "max_age_days": 7,
             # 続けてこの回数読めなかったら、管理者ルームへ知らせる（1日1回）
             "alert_after_failures": 3,
         },
-        # 受信箱（name・address・host・port・password_env。任意で user・sent_folder・tls.pin_sha256）
+        # 受信箱（name・address・host・port・password_env。任意で user・sent_folder・skip_folders・tls.pin_sha256）
         "mailboxes": [],
     },
     # 議論ウォッチャー（5分ごとのタイマーで実行。modeは shadow=管理者へ内報のみ / live=ルームへ投稿）

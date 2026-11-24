@@ -4,6 +4,7 @@
 読むだけで、既読にしない・印を付けない・移さない・消さない・送らない。
 """
 
+import base64
 import imaplib
 import inspect
 import re
@@ -23,9 +24,11 @@ from raizuinu.mailbox import (
     decode_folder,
     fingerprint_sha256,
     html_to_text,
+    other_folders,
     parse_list_line,
     parse_message,
     pick_sent_folder,
+    sent_folders,
     split_quoted,
     tls_context,
 )
@@ -114,6 +117,26 @@ def test_a_mail_with_only_html_is_read_as_text():
 # --- フォルダ ---
 
 
+def encode_folder(name):
+    """読める名前 → サーバー上の名前（IMAPの修正UTF-7）。テスト用。"""
+    out, run = "", ""
+
+    def flush():
+        nonlocal out, run
+        if run:
+            out += "&" + base64.b64encode(run.encode("utf-16-be")).decode().rstrip("=").replace("/", ",") + "-"
+            run = ""
+
+    for ch in name:
+        if 0x20 <= ord(ch) <= 0x7E:
+            flush()
+            out += "&-" if ch == "&" else ch
+        else:
+            run += ch
+    flush()
+    return out
+
+
 def test_folder_names_in_japanese_are_decoded():
     assert decode_folder("INBOX.&kAFP4W4IMH8-") == "INBOX.送信済み"
     assert decode_folder("INBOX.Sent") == "INBOX.Sent" and decode_folder("A&-B") == "A&B"
@@ -128,6 +151,26 @@ def test_the_sent_folder_is_found_by_flag_then_by_name():
     assert pick_sent_folder(folders[:2]) is None
     assert pick_sent_folder(folders, configured="INBOX.送信済み")["raw"] == "INBOX.&kAFP4W4IMH8-"
     assert pick_sent_folder(folders, configured="無いフォルダ") is None
+
+
+def test_every_sent_folder_is_read_not_just_the_first_one_found():
+    # 実例（2026-11-24）: 森さんの箱には「INBOX.送信済み」（空）と「INBOX.Sent」（実際に使用）の両方があった
+    lines = [b'(\\HasNoChildren) "." "INBOX.&kAFP4W4IMH8-"', b'(\\HasNoChildren) "." "INBOX.Sent"',
+             b'(\\HasNoChildren) "." "INBOX"']
+    folders = [parse_list_line(line) for line in lines]
+    assert [f["name"] for f in sent_folders(folders)] == ["INBOX.送信済み", "INBOX.Sent"]
+    assert [f["name"] for f in sent_folders(folders, configured="INBOX.Sent")] == ["INBOX.Sent"]
+
+
+def test_folders_mail_gets_sorted_into_are_read_but_not_trash_or_drafts():
+    names = ["INBOX", "INBOX.Sent", "INBOX.スーパーデリバリー", "INBOX.Trash", "INBOX.Junk", "INBOX.下書き",
+             "INBOX.autoreply", "INBOX.mailfilter", "INBOX.高島屋.泉北店"]
+    assert decode_folder(encode_folder("INBOX.高島屋.泉北店")) == "INBOX.高島屋.泉北店"
+    folders = [parse_list_line(f'(\\HasNoChildren) "." "{encode_folder(name)}"'.encode()) for name in names]
+    folders.append(parse_list_line(b'(\\Noselect) "." "INBOX.parent"'))
+    kept = [f["name"] for f in other_folders(folders)]
+    assert kept == ["INBOX.スーパーデリバリー", "INBOX.高島屋.泉北店"]
+    assert [f["name"] for f in other_folders(folders, skip=["INBOX.高島屋.泉北店"])] == ["INBOX.スーパーデリバリー"]
 
 
 # --- 接続（読み取り専用）---
@@ -178,7 +221,7 @@ def reader_with(conn, password="ok"):
 def test_new_mails_are_fetched_without_marking_them_read():
     conn = FakeConn()
     with reader_with(conn) as reader:
-        assert reader.sent()["raw"] == "INBOX.Sent"
+        assert [f["raw"] for f in reader.sent()] == ["INBOX.Sent"] and reader.others() == []
         info = reader.open(reader.inbox())
         assert info == {"messages": 2, "uidvalidity": 77, "uidnext": 13}
         assert reader.uids_after(11) == [12] and reader.uids_after(12) == [] and reader.last_uids(1) == [12]
@@ -196,7 +239,8 @@ def test_only_reading_commands_are_ever_sent():
     with reader_with(conn) as reader:
         reader.folders()
         reader.open(reader.inbox())
-        reader.open(reader.sent())
+        reader.open(reader.sent()[0])
+        reader.others()
         reader.uids_after(0)
         reader.last_uids(5)
         reader.fetch(11)
@@ -216,7 +260,8 @@ def test_the_code_has_no_way_to_change_or_send_mail():
         assert forbidden not in source, forbidden
     assert "readonly=True" in source and "BODY.PEEK" in source
     public = {name for name, _ in inspect.getmembers(MailboxReader, inspect.isfunction) if not name.startswith("_")}
-    assert public == {"configured", "folders", "inbox", "sent", "open", "uids_after", "last_uids", "fetch", "newest_date"}
+    assert public == {"configured", "folders", "inbox", "sent", "others", "open", "uids_after", "last_uids", "fetch",
+                      "newest_date"}
 
 
 def test_a_wrong_password_is_reported_without_the_password():

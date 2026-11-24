@@ -34,6 +34,12 @@ AUTH, NETWORK, TLS, FOLDER = "auth", "network", "tls", "folder"
 # 送信済みフォルダの名前の候補（サーバーが「送信済み」の印 \\Sent を付けていなければ名前で探す）
 SENT_NAMES = ("sent", "sent messages", "sent items", "送信済み", "送信済みトレイ", "送信済みアイテム", "送信済メール")
 
+# 届いたメールが入らないフォルダ（読まない）。最後の4つはサーバーが設定用に持つフォルダ
+SKIP_NAMES = (
+    "trash", "ごみ箱", "ゴミ箱", "deleted items", "junk", "spam", "迷惑メール", "drafts", "draft", "下書き",
+    "templates", "テンプレート", "outbox", "送信トレイ", "autoreply", "trigger", "alias", "mailfilter",
+)
+
 MAX_FULL_BYTES = 15 * 1024 * 1024   # これより大きいメールは、先頭の一部だけ取る
 PARTIAL_BYTES = 400 * 1024
 
@@ -80,21 +86,45 @@ def parse_list_line(line: bytes | str) -> dict[str, Any] | None:
     return {"raw": raw, "name": decode_folder(raw), "flags": match.group("flags").split(), "sep": match.group("sep") or ""}
 
 
-def pick_sent_folder(folders: list[dict], configured: str = "") -> dict | None:
-    """送信済みフォルダを選ぶ。設定の名前 → サーバーの印（\\Sent）→ よくある名前の順。"""
+def _leaf(folder: dict) -> str:
+    name = folder["name"].split(folder["sep"])[-1] if folder["sep"] else folder["name"]
+    return name.strip().lower()
+
+
+def _flagged(folder: dict, *flags: str) -> bool:
+    return any(flag.lower() in flags for flag in folder["flags"])
+
+
+def sent_folders(folders: list[dict], configured: str = "") -> list[dict]:
+    """送信済みフォルダ。設定の名前があればそれだけ。無ければ、サーバーの印（\\Sent）か、よくある名前のものすべて。
+
+    1つに絞らない（実例 2026-11-24: 「INBOX.送信済み」は空で、使われていたのは「INBOX.Sent」だった）。
+    """
     if configured:
-        for folder in folders:
-            if configured in (folder["raw"], folder["name"]):
-                return folder
-        return None
-    for folder in folders:
-        if any(flag.lower() == "\\sent" for flag in folder["flags"]):
-            return folder
-    for folder in folders:
-        leaf = folder["name"].split(folder["sep"])[-1] if folder["sep"] else folder["name"]
-        if leaf.strip().lower() in SENT_NAMES:
-            return folder
-    return None
+        return [f for f in folders if configured in (f["raw"], f["name"])]
+    return [f for f in folders if _flagged(f, "\\sent") or _leaf(f) in SENT_NAMES]
+
+
+def pick_sent_folder(folders: list[dict], configured: str = "") -> dict | None:
+    """送信済みフォルダを1つ選ぶ（印のあるものを優先）。複数を読むときは sent_folders を使う。"""
+    found = sent_folders(folders, configured)
+    flagged = [f for f in found if _flagged(f, "\\sent")]
+    return (flagged or found or [None])[0]
+
+
+def other_folders(folders: list[dict], configured_sent: str = "", skip: Any = ()) -> list[dict]:
+    """受信箱・送信済み以外で、届いたメールが振り分けられ得るフォルダ。
+
+    メールソフトの振り分けで、届いたメールが受信箱から取引先別のフォルダへ移ることがある。
+    ごみ箱・迷惑メール・下書きなどと、開けない印（\\Noselect）のフォルダは除く。
+    """
+    sent = {f["raw"] for f in sent_folders(folders, configured_sent)}
+    skipped = set(SKIP_NAMES) | {str(name).strip().lower() for name in skip or ()}
+    return [
+        f for f in folders
+        if f["raw"].upper() != "INBOX" and f["raw"] not in sent and not _flagged(f, "\\noselect", "\\drafts", "\\trash", "\\junk")
+        and _leaf(f) not in skipped and f["name"].strip().lower() not in skipped
+    ]
 
 
 # --- メールの解釈 ---
@@ -171,6 +201,11 @@ def parse_message(raw: bytes, received: datetime | None = None, partial: bool = 
             received = parsedate_to_datetime(str(message.get("Date", "")))
         except (TypeError, ValueError):
             received = None
+    try:
+        written = parsedate_to_datetime(str(message.get("Date", "")))
+        written = (written if written.tzinfo else written.replace(tzinfo=JST)).astimezone(JST)
+    except (TypeError, ValueError):
+        written = None
     if received is not None:
         received = (received if received.tzinfo else received.replace(tzinfo=JST)).astimezone(JST)
 
@@ -198,6 +233,7 @@ def parse_message(raw: bytes, received: datetime | None = None, partial: bool = 
         "to": _addresses(message, "To"),
         "cc": _addresses(message, "Cc"),
         "received": received,
+        "written": written,  # 差出人が送った日時（フォルダを移しても変わらない）
         "subject": re.sub(r"\s+", " ", str(message.get("Subject", "") or "")).strip(),
         "attachments": names,
         "text": fresh,
@@ -316,8 +352,13 @@ class MailboxReader:
     def inbox(self) -> dict:
         return {"raw": "INBOX", "name": "INBOX", "flags": [], "sep": ""}
 
-    def sent(self) -> dict | None:
-        return pick_sent_folder(self.folders(), str(self._box.get("sent_folder") or ""))
+    def sent(self) -> list[dict]:
+        """送信済みフォルダ（候補すべて）。"""
+        return sent_folders(self.folders(), str(self._box.get("sent_folder") or ""))
+
+    def others(self) -> list[dict]:
+        """受信箱・送信済み以外で、届いたメールが振り分けられ得るフォルダ。"""
+        return other_folders(self.folders(), str(self._box.get("sent_folder") or ""), self._box.get("skip_folders"))
 
     def open(self, folder: dict) -> dict[str, int]:
         """フォルダを読み取り専用で開く。→ {messages, uidvalidity, uidnext}"""

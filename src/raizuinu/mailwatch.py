@@ -76,7 +76,7 @@ VERDICTS = [ANSWERED, PARTIAL, ACK_ONLY, UNRELATED]
 SHORT_REPORT_CHARS = 30
 MAX_CLOSED_LOG = 300
 MAX_RECENT = 60  # 再送の見分けに覚えておくメールの数
-MAX_SEEN_IDS = 400  # 同じメールが複数の受信箱に届いたときの見分け（Message-ID）
+MAX_SEEN_IDS = 1500  # 同じメールが複数の受信箱に届いたときの見分け（Message-ID）
 CROSS_SOURCE_SECONDS = 15 * 60  # サーバーで読んだメールと通知ルームの通知を同じメールと見る時間差
 CHATWORK, IMAP = "chatwork", "imap"
 
@@ -457,13 +457,19 @@ class MailWatcher:
             return 0
         return self._run(state, messages, now)
 
-    def replay(self, messages: list[dict], imap_last: int = 0) -> int:
+    def replay(self, messages: list[dict], imap_last: int = 0, last: int | None = None) -> int:
         """渡された発言を「いま届いた」ものとして処理する（--dry-run 用。状態は白紙から）。
 
-        imap_last を渡すと、メールサーバーの各フォルダの直近 imap_last 通も同じように処理する。
+        last を渡すと、発言のうち直近 last 件だけを新着として扱う（0 なら通知ルームの分は処理しない。
+        それより前の発言は、メールへのリンクを探すためだけに使う）。
+        imap_last を渡すと、メールサーバーの受信箱・送信済みの直近 imap_last 通も同じように処理する。
         """
         state = self._blank_state()
-        state["last_seen"] = min((int(m.get("message_id", 0)) for m in messages), default=1) - 1
+        ids = sorted(int(m.get("message_id", 0)) for m in messages)
+        if last is None:
+            state["last_seen"] = (ids[0] if ids else 1) - 1
+        else:
+            state["last_seen"] = ids[-last - 1] if last < len(ids) else (ids[0] if ids else 1) - 1
         return self._run(state, messages, self._now(), imap_last=imap_last)
 
     def open_items(self) -> list[dict]:
@@ -1324,27 +1330,38 @@ class MailWatcher:
     def _collect_imap(self, state: dict, now: datetime, last: int = 0) -> list[dict]:
         """各受信箱・送信済みの新しいメールを取ってくる（既読にしない）。
 
+        読むのは、受信箱（INBOX）・送信済み・振り分け先のフォルダ（届いたメールがメールソフトの
+        振り分けで取引先別のフォルダへ移ることがある。実例 2026-11-24: 森さんの箱で、一部の差出人の
+        メールが届いた時刻のままサブフォルダに入っていた）。
         初めて開くフォルダは、いまあるメールを既読として控えるだけ（過去分を流さない）。
+        古いメール（`max_age_days` より前に送られたもの）は、後からフォルダへ整理されただけなので読まない。
         """
-        from .mailbox import MailboxError
+        from .mailbox import FOLDER, MailboxError
 
         imap = self._settings().get("imap") or {}
         body_chars = int(imap.get("max_body_chars", 4000))
         quoted_chars = int(imap.get("max_quoted_chars", 2000))
         fetch_limit = int(imap.get("max_fetch_per_folder", 30))
+        oldest = now - timedelta(days=int(imap.get("max_age_days", 7)))
         self._imap_new = {}
         mails: list[dict] = []
         for box in self._active_mailboxes():
             name = str(box.get("name") or box["address"])
             try:
                 with self._open_reader(box) as reader:
-                    for kind, folder in (("inbox", reader.inbox()), ("sent", reader.sent())):
-                        if folder is None:
-                            continue
-                        info = reader.open(folder)
-                        place = state.setdefault("imap", {}).setdefault(name, {}).setdefault(kind, {})
+                    targets = [("inbox", "inbox", reader.inbox())]
+                    targets += [("sent", "sent:" + f["raw"], f) for f in reader.sent()]
+                    targets += [("inbox", "folder:" + f["raw"], f) for f in reader.others()]
+                    for kind, key, folder in targets:
+                        try:
+                            info = reader.open(folder)
+                        except MailboxError as exc:
+                            if exc.kind != FOLDER or key == "inbox":
+                                raise
+                            continue  # 開けないフォルダ（サーバーの設定用など）は飛ばす
+                        place = state.setdefault("imap", {}).setdefault(name, {}).setdefault(key, {})
                         if last:
-                            uids = reader.last_uids(last)
+                            uids = reader.last_uids(last) if key == "inbox" or kind == "sent" else []
                         elif "last_uid" not in place or place.get("uidvalidity") != info["uidvalidity"]:
                             newest = (reader.last_uids(1) or [0])[-1]
                             place.clear()
@@ -1353,16 +1370,20 @@ class MailWatcher:
                         else:
                             done = set(place.get("done") or [])
                             uids = [u for u in reader.uids_after(int(place["last_uid"])) if u not in done]
-                            self._imap_new[(name, kind)] = uids
+                            self._imap_new[(name, key)] = uids
                         for uid in uids[:fetch_limit]:
                             mail = reader.fetch(uid)
-                            if mail is None or not mail.get("sender") or mail.get("received") is None:
+                            stale = False
+                            if mail is not None and mail.get("received") is not None and not last:
+                                stale = min(mail["received"], mail.get("written") or mail["received"]) < oldest
+                            if mail is None or not mail.get("sender") or mail.get("received") is None or stale:
                                 if not last:
                                     place.setdefault("done", []).append(uid)
                                 continue
                             text = str(mail.get("text") or "")
                             mail.update(
-                                source=IMAP, box=name, folder=kind, owner=name, ref=f"imap:{name}:{kind}:{uid}",
+                                source=IMAP, box=name, folder=kind, place=key, owner=name,
+                                ref=f"imap:{name}:{key}:{uid}",
                                 text=text[:body_chars], quoted=str(mail.get("quoted") or "")[:quoted_chars],
                                 truncated=bool(mail.get("truncated")) or len(text) > body_chars,
                             )
@@ -1375,7 +1396,7 @@ class MailWatcher:
     def _imap_done(self, state: dict, mail: dict) -> None:
         if self._dry_run:
             return
-        place = state.setdefault("imap", {}).setdefault(mail["box"], {}).setdefault(mail["folder"], {})
+        place = state.setdefault("imap", {}).setdefault(mail["box"], {}).setdefault(mail["place"], {})
         done = place.setdefault("done", [])
         if mail["uid"] not in done:
             done.append(mail["uid"])
@@ -1587,13 +1608,14 @@ def main(argv: list[str] | None = None) -> None:
         return
     recorder = _Recorder(chatwork)
     watcher = MailWatcher(config, recorder, dry_run=True)
-    messages = recorder.get_recent_messages(int(config.mail_watch.get("room_id", 0)), limit=100)[-args.last:]
-    count = watcher.replay(messages, imap_last=args.imap_last)
+    messages = recorder.get_recent_messages(int(config.mail_watch.get("room_id", 0)), limit=100)
+    count = watcher.replay(messages, imap_last=args.imap_last, last=args.last)
     for body in recorder.sent:
         print("=" * 60)
         print(body)
     print("=" * 60)
-    print(f"対象の発言 {len(messages)}件／知らせるメール {count}件／モデルの使用量 {watcher._usage}")
+    print(f"通知ルームの発言 直近{args.last}件／メールサーバー 各フォルダ直近{args.imap_last}通／"
+          f"知らせるメール {count}件／モデルの使用量 {watcher._usage}")
 
 
 if __name__ == "__main__":
